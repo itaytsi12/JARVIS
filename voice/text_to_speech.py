@@ -16,12 +16,22 @@ _pyttsx3 = None
 _engine = None
 _kokoro_available = False
 _pyttsx3_available = False
+_chatterbox_provider = None
+_chatterbox_available = False
 
 try:
 	_kokoro = importlib.import_module("kokoro")
 	_kokoro_available = True
 except Exception:
 	_kokoro = None
+
+# Try chatterbox provider module under voice/tts
+try:
+	_chb_mod = importlib.import_module('voice.tts.chatterbox_tts')
+	_chatterbox_provider = _chb_mod
+	_chatterbox_available = True
+except Exception:
+	_chatterbox_provider = None
 
 if not _kokoro_available:
 	try:
@@ -116,6 +126,14 @@ def speak(text: str, max_speech_chars: int = 300) -> None:
 		to_speak = short
 	else:
 		to_speak = text
+
+	# Try Chatterbox provider first (preferred)
+	if _chatterbox_available and _chatterbox_provider is not None:
+		try:
+			_chatterbox_provider.speak(to_speak)
+			return
+		except Exception as e:
+			print(f"Chatterbox TTS failed: {e} -- falling back to other TTS providers")
 
 	# Try Kokoro
 	if _kokoro_available:

@@ -12,6 +12,8 @@ from .listener import listen_push_to_talk, is_available as listener_available
 from .speech_to_text import transcribe_audio, is_available as stt_available
 from .text_to_speech import speak
 from .response_formatter import format_spoken_response
+from .text_normalizer import normalize_transcript
+from .language_utils import detect_dominant_language
 
 
 def _run_with_interruptible_thread(func: Callable[..., Any], *args, **kwargs) -> Tuple[Optional[Any], Optional[Exception]]:
@@ -81,9 +83,17 @@ def one_round_push_to_talk():
 
     print(f"You said: {text}")
 
-    # Run agent (synchronous, small/fast). If this is slow, user can Ctrl+C.
+    # Normalize transcript: remove wake prefixes and common aliases
+    cleaned, wake_removed = normalize_transcript(text)
+    if not cleaned:
+        print("No command after wake-word removal.")
+        return
+
+    print(f"Interpreting as: {cleaned}")
+
+    # Run agent (synchronous, small/fast) using cleaned text
     try:
-        response = run_agent(text)
+        response = run_agent(cleaned)
     except KeyboardInterrupt:
         print("Agent interrupted by user.")
         return
@@ -100,11 +110,14 @@ def one_round_push_to_talk():
 
     # Generate a deterministic, short spoken response using the route
     try:
-        route = route_command(text)
+        route = route_command(cleaned)
     except Exception:
         route = None
 
-    spoken = format_spoken_response(text, route, resp_text)
+    # Detect dominant language for spoken replies
+    lang = detect_dominant_language(text)
+
+    spoken = format_spoken_response(cleaned, route, resp_text, lang=lang)
 
     # Speak in background so Ctrl+C can stop further loops quickly
     print("Speaking... (Ctrl+C to interrupt)")

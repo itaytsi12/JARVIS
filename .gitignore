@@ -1,28 +1,64 @@
-# Python / Windows general
+# =========================
+# Secrets / environment
+# =========================
 .env
-__pycache__/
-*.pyc
-.venv/
-venv/
-.vscode/
-screenshots/
-*.log
+.env.*
+!.env.example
 
-# Virtual environment artifacts
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+.venv-chatterbox/
+venv/
+env/
+ENV/
+
+# =========================
+# VS Code
+# =========================
+.vscode/
+
+# =========================
+# PyCharm / JetBrains
+# =========================
+.idea/
+
+# =========================
+# Type checking / caches
+# =========================
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# =========================
+# Logs
+# =========================
+*.log
 pip-log.txt
 pip-delete-this-directory.txt
 
-# Pyenv
+# =========================
+# Project generated files
+# =========================
+screenshots/
+*.wav
+
+# =========================
+# Python version managers
+# =========================
 .python-version
 
-# Installer logs
-pip-log.txt
-
-# mypy
-.mypy_cache/
-
-# PyCharm
-.idea/
-
-# VS Code settings
-.vscode/
+# =========================
+# OS files
+# =========================
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -54,7 +54,7 @@ def _sanitize_for_speech(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
-def format_spoken_response(command: str, route: dict, response_text: str) -> str:
+def format_spoken_response(command: str, route: dict, response_text: str, lang: str | None = None) -> str:
     """Return a short spoken response for the given command/route/result.
 
     - `command`: original user text
@@ -70,6 +70,15 @@ def format_spoken_response(command: str, route: dict, response_text: str) -> str
     except Exception:
         rtype = None
 
+    # If language not provided, attempt to detect from command
+    if lang is None:
+        try:
+            from .language_utils import detect_dominant_language
+
+            lang = detect_dominant_language(command)
+        except Exception:
+            lang = 'en'
+
     # Tool-level routes
     if rtype == "tool":
         tool = route.get("tool")
@@ -78,32 +87,72 @@ def format_spoken_response(command: str, route: dict, response_text: str) -> str
         if tool == "open_website":
             url = args.get("url") or response_text
             site = _pretty_site_name(url)
+            # If this is a search URL with a query, make the spoken reply a search phrase
+            q = _extract_search_query(url)
+            # Prefer extracting query from the original command (preserve case)
+            query_text = None
+            if q:
+                # try to extract original-case query from `command` using simple patterns
+                try:
+                    patterns = [r'(?i)search youtube for (.+)', r'(?i)youtube search (.+)', r'(?i)youtube (.+)',
+                                r'(?i)search google for (.+)', r'(?i)google (.+)']
+                    for pat in patterns:
+                        m = re.search(pat, command)
+                        if m:
+                            query_text = m.group(1).strip()
+                            break
+                except Exception:
+                    query_text = None
+
+                if not query_text:
+                    # fallback to URL-decoded q
+                    try:
+                        query_text = urllib.parse.unquote_plus(q)
+                    except Exception:
+                        query_text = q
+
+            if query_text:
+                if 'youtube' in url:
+                    if lang == 'he':
+                        return f"אוקיי, מחפש ביוטיוב את {query_text}."
+                    return f"Searching YouTube for {query_text}."
+                if 'google' in url:
+                    if lang == 'he':
+                        return f"אוקיי, מחפש בגוגל את {query_text}."
+                    return f"Searching Google for {query_text}."
+
+            if lang == 'he':
+                return f"אוקיי, פותח את {site}."
             return f"Okay, opening {site}."
 
         if tool == "open_application":
             app = args.get("app_name") or "application"
+            if lang == 'he':
+                return f"אוקיי, פותח את {app.capitalize()}."
             return f"Okay, opening {app.capitalize()}."
 
         if tool in ("volume_up",):
-            return "Turning it up."
+            return "Turning it up." if lang != 'he' else "מגביר."
 
         if tool in ("volume_down",):
-            return "Turning it down."
+            return "Turning it down." if lang != 'he' else "מנמיך."
 
         if tool == "mute_volume":
-            return "Muted."
+            return "Muted." if lang != 'he' else "השתקתי."
 
         if tool == "take_screenshot":
-            return "Screenshot taken."
+            return "Screenshot taken." if lang != 'he' else "תצלום מסך נלקח."
 
         if tool == "type_text":
-            return default_done
+            return default_done if lang != 'he' else "בוצע."
 
         if tool == "press_key":
             key = args.get("key")
             if key:
+                if lang == 'he':
+                    return f"הוקש {key}."
                 return f"Pressed {key}."
-            return default_ok
+            return default_ok if lang != 'he' else "בסדר."
 
         # Generic open/close responses
         if response_text and response_text.lower().startswith("opened"):
@@ -111,6 +160,8 @@ def format_spoken_response(command: str, route: dict, response_text: str) -> str
             m = re.match(r'Opened\s+(https?://\S+|\S+)\s+in', response_text)
             if m:
                 site = _pretty_site_name(m.group(1))
+                if lang == 'he':
+                    return f"אוקיי, פותח את {site}."
                 return f"Okay, opening {site}."
             return default_ok
 
@@ -125,8 +176,8 @@ def format_spoken_response(command: str, route: dict, response_text: str) -> str
     if rtype in ("local_plan", "plan", "tools"):
         # If the response_text indicates failure, speak a short failure
         if "error" in (response_text or "").lower():
-            return "Something failed while performing the actions."
-        return default_done
+            return "Something failed while performing the actions." if lang != 'he' else "שגיאה בביצוע הפעולות."
+        return default_done if lang != 'he' else "בוצע."
 
     # AI responses: speak a short summary (first sentence)
     if rtype == "ai" or (not rtype and response_text):
