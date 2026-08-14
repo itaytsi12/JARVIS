@@ -1,0 +1,1 @@
+"""Mouse tool placeholder."""

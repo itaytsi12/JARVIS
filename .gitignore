@@ -1,0 +1,28 @@
+# Python / Windows general
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vscode/
+screenshots/
+*.log
+
+# Virtual environment artifacts
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Pyenv
+.python-version
+
+# Installer logs
+pip-log.txt
+
+# mypy
+.mypy_cache/
+
+# PyCharm
+.idea/
+
+# VS Code settings
+.vscode/
