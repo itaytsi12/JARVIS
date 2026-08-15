@@ -24,7 +24,7 @@ def _pretty_site_name(url: str) -> str:
         host = re.sub(r'^www\.', '', host)
         # pick first part before dot
         name = host.split('.')[0]
-        return name.capitalize()
+        return _natural_name(name)
     except Exception:
         return url
 
@@ -42,6 +42,18 @@ def _extract_search_query(url: str) -> Optional[str]:
         return None
 
 
+def _natural_name(value: str) -> str:
+    names = {
+        "youtube": "YouTube",
+        "google": "Google",
+        "github": "GitHub",
+        "reddit": "Reddit",
+        "notepad": "Notepad",
+        "calculator": "Calculator",
+    }
+    return names.get(value.strip().lower(), value.strip())
+
+
 def _sanitize_for_speech(text: str) -> str:
     # remove URLs
     text = re.sub(r'https?://\S+', '', text)
@@ -52,6 +64,57 @@ def _sanitize_for_speech(text: str) -> str:
     text = re.sub(r'[{}\[\]]', '', text)
     # collapse extra whitespace
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def _action_parts(action) -> tuple[Optional[str], dict]:
+    if isinstance(action, dict):
+        return action.get("tool"), action.get("arguments") or action.get("args") or {}
+    return getattr(action, "tool", None), getattr(action, "args", {}) or {}
+
+
+def _describe_action(action, lang: str) -> Optional[str]:
+    tool, args = _action_parts(action)
+    if tool == "open_website":
+        url = args.get("url", "")
+        query = _extract_search_query(url)
+        site = _pretty_site_name(url)
+        if query:
+            query = urllib.parse.unquote_plus(query)
+            return f"חיפשתי ב{site} את {query}" if lang == "he" else f"searched {site} for {query}"
+        return f"פתחתי את {site}" if lang == "he" else f"opened {site}"
+    if tool == "youtube_search":
+        query = args.get("query", "")
+        return f"חיפשתי ביוטיוב את {query}" if lang == "he" else f"searched YouTube for {query}"
+    if tool == "open_application":
+        app = _natural_name(str(args.get("app_name") or "the application"))
+        return f"פתחתי את {app}" if lang == "he" else f"opened {app}"
+    if tool == "close_application":
+        app = _natural_name(str(args.get("app_name") or "the application"))
+        return f"סגרתי את {app}" if lang == "he" else f"closed {app}"
+    if tool == "type_text":
+        typed = str(args.get("text") or "the text")
+        return f"הקלדתי {typed}" if lang == "he" else f"typed {typed}"
+    if tool == "press_key":
+        key = str(args.get("key") or "the key")
+        return f"לחצתי על {key}" if lang == "he" else f"pressed {key}"
+    if tool == "volume_up":
+        return "הגברתי את עוצמת הקול" if lang == "he" else "turned the volume up"
+    if tool == "volume_down":
+        return "הנמכתי את עוצמת הקול" if lang == "he" else "turned the volume down"
+    if tool == "mute_volume":
+        return "השתקתי את הקול" if lang == "he" else "muted the volume"
+    return None
+
+
+def _join_descriptions(descriptions: list[str], lang: str) -> str:
+    if len(descriptions) == 1:
+        joined = descriptions[0]
+    elif len(descriptions) == 2:
+        joined = f"{descriptions[0]} {'ו' if lang == 'he' else 'and '}{descriptions[1]}"
+    else:
+        conjunction = "ו" if lang == "he" else "and "
+        joined = ", ".join(descriptions[:-1]) + f", {conjunction}{descriptions[-1]}"
+    return f"{joined}." if lang == "he" else f"I {joined}."
 
 
 def format_spoken_response(command: str, route: dict, response_text: str, lang: str | None = None) -> str:
@@ -114,22 +177,22 @@ def format_spoken_response(command: str, route: dict, response_text: str, lang: 
             if query_text:
                 if 'youtube' in url:
                     if lang == 'he':
-                        return f"אוקיי, מחפש ביוטיוב את {query_text}."
-                    return f"Searching YouTube for {query_text}."
+                        return f"פתחתי את יוטיוב וחיפשתי את {query_text}."
+                    return f"I opened YouTube and searched for {query_text}."
                 if 'google' in url:
                     if lang == 'he':
-                        return f"אוקיי, מחפש בגוגל את {query_text}."
-                    return f"Searching Google for {query_text}."
+                        return f"פתחתי את גוגל וחיפשתי את {query_text}."
+                    return f"I opened Google and searched for {query_text}."
 
             if lang == 'he':
-                return f"אוקיי, פותח את {site}."
-            return f"Okay, opening {site}."
+                return f"פתחתי את {site}."
+            return f"I opened {site}."
 
         if tool == "open_application":
             app = args.get("app_name") or "application"
             if lang == 'he':
-                return f"אוקיי, פותח את {app.capitalize()}."
-            return f"Okay, opening {app.capitalize()}."
+                return f"פתחתי את {_natural_name(app)}."
+            return f"I opened {_natural_name(app)}."
 
         if tool in ("volume_up",):
             return "Turning it up." if lang != 'he' else "מגביר."
@@ -177,6 +240,16 @@ def format_spoken_response(command: str, route: dict, response_text: str, lang: 
         # If the response_text indicates failure, speak a short failure
         if "error" in (response_text or "").lower():
             return "Something failed while performing the actions." if lang != 'he' else "שגיאה בביצוע הפעולות."
+        descriptions = [
+            description
+            for action in (route.get("actions", []) if route else [])
+            if (description := _describe_action(action, lang))
+        ]
+        if descriptions:
+            return _join_descriptions(descriptions, lang)
+        sanitized = _sanitize_for_speech(response_text or "")
+        if sanitized:
+            return sanitized[:240]
         return default_done if lang != 'he' else "בוצע."
 
     # AI responses: speak a short summary (first sentence)

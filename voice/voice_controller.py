@@ -10,7 +10,7 @@ from brain.router import route_command
 
 from .listener import listen_push_to_talk, is_available as listener_available
 from .speech_to_text import transcribe_audio, is_available as stt_available
-from .text_to_speech import speak
+from .text_to_speech import speak, start_background
 from .response_formatter import format_spoken_response
 from .text_normalizer import normalize_transcript
 from .language_utils import detect_dominant_language
@@ -121,7 +121,7 @@ def one_round_push_to_talk():
 
     # Speak in background so Ctrl+C can stop further loops quickly
     print("Speaking... (Ctrl+C to interrupt)")
-    _, speak_err = _run_with_interruptible_thread(speak, spoken)
+    _, speak_err = _run_with_interruptible_thread(speak, spoken, lang=lang)
     if isinstance(speak_err, KeyboardInterrupt):
         return
     if speak_err:
@@ -129,6 +129,7 @@ def one_round_push_to_talk():
 
 
 def run_voice_loop():
+    start_background()
     print("Voice mode: push-to-talk. Press Ctrl+C to stop.")
     try:
         while True:

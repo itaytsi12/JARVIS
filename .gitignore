@@ -16,10 +16,19 @@ __pycache__/
 # Virtual environments
 # =========================
 .venv/
-.venv-chatterbox/
+.venv-*/
 venv/
 env/
 ENV/
+
+**/.venv/
+**/.venv-*/
+**/venv/
+
+# Specific project venvs
+.venv-intent/
+.venv-chatterbox/
+work/.venv-audio-debug/
 
 # =========================
 # VS Code
@@ -46,10 +55,36 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # =========================
-# Project generated files
+# Generated audio / screenshots
 # =========================
 screenshots/
 *.wav
+
+# =========================
+# Intent / ML generated files
+# =========================
+
+# Old SetFit model and huge checkpoints
+models/intent/
+
+# Any training checkpoints anywhere
+**/checkpoint-*/
+
+# Downloaded Hugging Face / embedding model cache
+models/embedding_cache/
+
+# =========================
+# Keep the new lightweight classifier
+# =========================
+!models/intent_classifier/
+!models/intent_classifier/classifier.joblib
+!models/intent_classifier/config.json
+
+# =========================
+# Hugging Face / ML caches
+# =========================
+.cache/
+**/.cache/
 
 # =========================
 # Python version managers

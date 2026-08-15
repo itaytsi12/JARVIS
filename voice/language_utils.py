@@ -8,17 +8,9 @@ import re
 
 
 def detect_dominant_language(text: str) -> str:
-    """Return 'he' if text is mostly Hebrew letters, otherwise 'en'.
+    """Force English-only language detection: always returns 'en'.
 
-This is a simple heuristic sufficient for choosing spoken response language.
+This keeps downstream TTS and response formatting consistent with
+an English-only STT pipeline.
 """
-    if not text:
-        return 'en'
-
-    heb = len(re.findall(r'[\u0590-\u05FF]', text))
-    lat = len(re.findall(r'[A-Za-z]', text))
-
-    # If more Hebrew characters than Latin, consider Hebrew dominant.
-    if heb > lat:
-        return 'he'
     return 'en'

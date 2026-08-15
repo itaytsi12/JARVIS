@@ -16,16 +16,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import tempfile
+import threading
 import time
 import traceback
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 _SERVICE_MODEL = None
+_SERVICE_STATE = "loading"
+_SERVICE_ERROR = None
+_SERVICE_DEVICE = None
+_MODEL_LOCK = threading.Lock()
 
-PORT_DEFAULT = 5001
+PORT_DEFAULT = 5002
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -38,10 +42,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            status = "ready" if _SERVICE_MODEL is not None else "loading"
-            code = 200 if _SERVICE_MODEL is not None else 503
+            status = _SERVICE_STATE
+            code = 200 if status == "ready" else 503
             self._set_json(code)
-            self.wfile.write(json.dumps({"status": status}).encode("utf-8"))
+            payload = {"status": status, "pid": os.getpid()}
+            if _SERVICE_DEVICE:
+                payload["device"] = _SERVICE_DEVICE
+            if _SERVICE_ERROR:
+                payload["error"] = _SERVICE_ERROR
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
             return
         self._set_json(404)
         self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
@@ -104,7 +113,8 @@ def synth_and_play(text: str, language_id: Optional[str] = None) -> None:
         print(f"[CHATTERBOX] Generating language={lang}")
         t0 = time.perf_counter()
         try:
-            wav = _SERVICE_MODEL.generate(text, language_id=lang)
+            with _MODEL_LOCK:
+                wav = _SERVICE_MODEL.generate(text, language_id=lang)
         except Exception:
             # surface exact exception
             traceback.print_exc()
@@ -121,23 +131,18 @@ def synth_and_play(text: str, language_id: Optional[str] = None) -> None:
             traceback.print_exc()
             raise
 
-        # Play the wav (prefer sounddevice/soundfile, else OS player)
-        try:
+        # Keep playback synchronous so the WAV still exists until it finishes.
+        if os.name == "nt":
+            import winsound
+
+            winsound.PlaySound(out_path, winsound.SND_FILENAME)
+        else:
             import soundfile as sf
             import sounddevice as sd
 
             data, sr = sf.read(out_path)
             sd.play(data, sr)
             sd.wait()
-        except Exception:
-            if os.name == "nt":
-                import subprocess
-
-                subprocess.Popen(["powershell", "-Command", "Start-Process", out_path])
-            else:
-                import subprocess
-
-                subprocess.Popen(["xdg-open", out_path])
 
     finally:
         # cleanup
@@ -147,9 +152,32 @@ def synth_and_play(text: str, language_id: Optional[str] = None) -> None:
             pass
 
 
+def _load_model() -> None:
+    """Load exactly one model while the HTTP health endpoint stays responsive."""
+    global _SERVICE_MODEL, _SERVICE_STATE, _SERVICE_ERROR, _SERVICE_DEVICE
+
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _SERVICE_DEVICE = device
+        print(f"Using device: {device}", flush=True)
+        print("Loading Chatterbox Multilingual...", flush=True)
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+        _SERVICE_MODEL = ChatterboxMultilingualTTS.from_pretrained(device=device)
+        _SERVICE_STATE = "ready"
+        print("Model loaded.", flush=True)
+    except Exception as exc:
+        _SERVICE_ERROR = str(exc)
+        _SERVICE_STATE = "error"
+        traceback.print_exc()
+        print("Failed to load Chatterbox model", flush=True)
+
+
 def run_server(port: int) -> None:
-    server = HTTPServer(("127.0.0.1", port), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"Chatterbox service listening on http://127.0.0.1:{port}")
+    threading.Thread(target=_load_model, name="chatterbox-model-loader", daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -157,31 +185,9 @@ def run_server(port: int) -> None:
 
 
 def main() -> None:
-    global _SERVICE_MODEL
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", "-p", type=int, default=PORT_DEFAULT)
     args = parser.parse_args()
-
-    # Load model exactly like test_chatterbox.py
-    try:
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
-        device = "cpu"
-
-    print(f"Using device: {device}")
-    print("Loading Chatterbox Multilingual...")
-    try:
-        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-
-        _SERVICE_MODEL = ChatterboxMultilingualTTS.from_pretrained(device=device)
-        print("Model loaded.")
-    except Exception:
-        # Print full traceback and exit; caller (client) should fallback to pyttsx3
-        traceback.print_exc()
-        print("Failed to load Chatterbox model at startup; exiting")
-        sys.exit(1)
 
     run_server(args.port)
 

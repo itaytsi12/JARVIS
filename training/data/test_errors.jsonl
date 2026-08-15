@@ -1,0 +1,78 @@
+{"text": "uh אני לא שומע כלום please", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9936550855636597}
+{"text": "uh אני לא שומע כלום עכשיו", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9935274720191956}
+{"text": "uh אני לא שומע כלום בבקשה", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9934675097465515}
+{"text": "uh אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9934535026550293}
+{"text": "please אני לא שומע כלום עכשיו", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9934509992599487}
+{"text": "אני לא שומע כלום please", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9934078454971313}
+{"text": "בבקשה אני לא שומע כלום please", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9933910369873047}
+{"text": "אממ אני לא שומע כלום עכשיו", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.993370532989502}
+{"text": "please אני לא שומע כלום בבקשה", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9933670163154602}
+{"text": "אממ please אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9933509230613708}
+{"text": "uh hey jarvis אני לא שומע כלום עכשיו", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9933068156242371}
+{"text": "hey אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9932970404624939}
+{"text": "רגע please אחי זה חזק עכשיו", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9932681918144226}
+{"text": "uh jarvis אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9932612776756287}
+{"text": "please אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9932587146759033}
+{"text": "uh hey jarvis אני לא שומע כלום בבקשה", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9932571649551392}
+{"text": "רגע אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9932524561882019}
+{"text": "אממ אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9932392835617065}
+{"text": "אחי זה חזק עכשיו", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9932071566581726}
+{"text": "hey jarvis אחי זה חזק עכשיו", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9931290149688721}
+{"text": "אני לא שומע כלום בבקשה", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9931286573410034}
+{"text": "please אני לא שומע כלום for me", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9931221604347229}
+{"text": "can you אני לא שומע כלום עכשיו", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9931120276451111}
+{"text": "אחי זה חזק בבקשה", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9931087493896484}
+{"text": "אני לא שומע כלום עכשיו", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.993098795413971}
+{"text": "בבקשה אני לא שומע כלום עכשיו", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9930917024612427}
+{"text": "רגע can you אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9930850267410278}
+{"text": "אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9930550456047058}
+{"text": "can you אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9930225014686584}
+{"text": "hey hey jarvis אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9929942488670349}
+{"text": "hey jarvis אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9929906129837036}
+{"text": "רגע אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.992976725101471}
+{"text": "hey אחי זה חזק for me", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9929735660552979}
+{"text": "אממ היי ג'רוויס אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9929673671722412}
+{"text": "בבקשה אחי זה חזק for me", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9929401874542236}
+{"text": "ג'רוויס אני לא שומע כלום עכשיו", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9929258823394775}
+{"text": "היי ג'רוויס אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9928895235061646}
+{"text": "בבקשה אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9928635954856873}
+{"text": "אממ hey jarvis אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9928625226020813}
+{"text": "אני לא שומע כלום for me", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.992849588394165}
+{"text": "ג'רוויס אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9928426742553711}
+{"text": "hey ג'רוויס אני לא שומע כלום for me", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9928353428840637}
+{"text": "hey jarvis אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9928319454193115}
+{"text": "ג'רוויס אחי זה חזק for me", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9927911758422852}
+{"text": "אחי זה חזק for me", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.992787778377533}
+{"text": "אממ jarvis אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9927842617034912}
+{"text": "please אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9927835464477539}
+{"text": "בבקשה אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9927815794944763}
+{"text": "can you אני לא שומע כלום for me", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9927773475646973}
+{"text": "אחי זה חזק please", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9927719235420227}
+{"text": "היי ג'רוויס אני לא שומע כלום for me", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9927465319633484}
+{"text": "אממ ג'רוויס אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9927409291267395}
+{"text": "אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9926869869232178}
+{"text": "uh אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9926861524581909}
+{"text": "היי ג'רוויס אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9926608800888062}
+{"text": "hey אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9926441311836243}
+{"text": "jarvis אני לא שומע כלום", "expected": "volume_up", "predicted": "volume_down", "confidence": 0.9926440119743347}
+{"text": "can you אחי זה חזק for me", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9926274418830872}
+{"text": "ג'רוויס אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9926119446754456}
+{"text": "אממ אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9925886392593384}
+{"text": "can you אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9925292134284973}
+{"text": "jarvis אחי זה חזק", "expected": "volume_down", "predicted": "volume_up", "confidence": 0.9925199747085571}
+{"text": "ג'רוויס I feel like watching Jude Law", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.971788227558136}
+{"text": "אממ I feel like watching Jude Law for me", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.9536070823669434}
+{"text": "רגע I feel like watching Iron Man", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.9240965247154236}
+{"text": "I feel like watching Jude Law for me", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.9194951057434082}
+{"text": "jarvis I feel like watching Cristiano Ronaldo", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.9190650582313538}
+{"text": "I feel like watching Jude Law", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.9062684178352356}
+{"text": "I feel like watching Cristiano Ronaldo for me", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.88605135679245}
+{"text": "hey jarvis I feel like watching Veritasium", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.8668529391288757}
+{"text": "I feel like watching Iron Man", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.8575946092605591}
+{"text": "I feel like watching Cristiano Ronaldo", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.8101997375488281}
+{"text": "I feel like watching Jude Law please", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.7979357242584229}
+{"text": "אממ I feel like watching Cristiano Ronaldo", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.7836400270462036}
+{"text": "היי ג'רוויס I feel like watching AI news for me", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.7812895178794861}
+{"text": "I feel like watching Veritasium", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.724306583404541}
+{"text": "please I feel like watching Veritasium", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.647912323474884}
+{"text": "I feel like watching Marvel", "expected": "youtube_search", "predicted": "volume_up", "confidence": 0.6231468319892883}

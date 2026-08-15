@@ -4,7 +4,7 @@ from brain.intent_router import classify_intent
 from brain.local_planner import create_local_plan
 from tools.registry import WEBSITE_ALIASES, APP_ALIASES
 import urllib.parse
-
+from brain.local_intent_model import route_with_local_model
 
 def looks_like_math(text: str) -> bool:
     math_pattern = r"^[\d\s\.\+\-\*\/\%\(\)]+$"
@@ -377,6 +377,16 @@ def route_command(command: str) -> dict:
                     "app_name": match.group(2).strip()
                 }
             }
+
+        # -------------------------
+    # Local trained intent model
+    # -------------------------
+
+    local_model_action = route_with_local_model(command)
+
+    if local_model_action is not None:
+        return local_model_action
+        
 
     # -------------------------
     # AI / Intent fallback

@@ -1,0 +1,49 @@
+{
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "classifier_type": "sklearn.linear_model.LogisticRegression",
+  "labels": [
+    "close_application",
+    "close_window",
+    "hotkey",
+    "maximize_window",
+    "minimize_window",
+    "mute_volume",
+    "open_application",
+    "open_file",
+    "open_folder",
+    "open_website",
+    "press_key",
+    "run_command",
+    "switch_window",
+    "take_screenshot",
+    "type_text",
+    "unmute_volume",
+    "volume_down",
+    "volume_up",
+    "web_search",
+    "youtube_search"
+  ],
+  "normalize_embeddings": true,
+  "confidence_threshold": 0.8,
+  "validation_accuracy": 0.998630605956864,
+  "validation_macro_f1": 0.9986665848825098,
+  "test_accuracy": 0.99775,
+  "train_size": 19697,
+  "validation_size": 2921,
+  "test_size": 4000,
+  "logistic_regression": {
+    "C": 4.0,
+    "max_iter": 1000,
+    "solver": "lbfgs"
+  },
+  "scikit_learn_version": "1.9.0",
+  "trained_at_utc": "2026-08-15T13:31:15.398085+00:00",
+  "test_macro_f1": 0.9977433745887471,
+  "test_threshold_metrics": {
+    "threshold": 0.8,
+    "accepted_accuracy": 0.999476850640858,
+    "rejection_rate": 0.04425000000000001,
+    "accepted_count": 3823,
+    "error_rate_accepted": 0.0005231493591419945
+  }
+}

@@ -1,29 +1,21 @@
-"""TTS wrapper.
-
-Attempt to use `kokoro` TTS if available; otherwise fall back to `pyttsx3`.
-This module keeps a single model/engine instance for reuse and exposes
-`speak(text)`.
-"""
+"""Configurable JARVIS TTS providers with deterministic fallback order."""
 
 from __future__ import annotations
 import importlib
-import sys
+import os
 from typing import Optional
 
-# Try Kokoro (best-effort). If unavailable, fall back to pyttsx3.
-_kokoro = None
 _pyttsx3 = None
 _engine = None
-_kokoro_available = False
 _pyttsx3_available = False
 _chatterbox_provider = None
 _chatterbox_available = False
+_openai_provider = None
 
 try:
-	_kokoro = importlib.import_module("kokoro")
-	_kokoro_available = True
+	_openai_provider = importlib.import_module('voice.tts.openai_tts')
 except Exception:
-	_kokoro = None
+	_openai_provider = None
 
 # Try chatterbox provider module under voice/tts
 try:
@@ -33,12 +25,11 @@ try:
 except Exception:
 	_chatterbox_provider = None
 
-if not _kokoro_available:
-	try:
-		_pyttsx3 = importlib.import_module("pyttsx3")
-		_pyttsx3_available = True
-	except Exception:
-		_pyttsx3 = None
+try:
+	_pyttsx3 = importlib.import_module("pyttsx3")
+	_pyttsx3_available = True
+except Exception:
+	_pyttsx3 = None
 
 
 def _init_pyttsx3():
@@ -53,67 +44,72 @@ def _init_pyttsx3():
 	return _engine
 
 
-class KokoroWrapper:
-	"""Thin wrapper around kokoro if present.
-
-	This is intentionally defensive: kokoro may not be installed in the
-	user's environment. If installed, users should ensure the model files
-	are downloaded beforehand (see README). The wrapper loads the model
-	once and reuses it.
-	"""
-	def __init__(self):
-		self.model = None
-
-	def _ensure_model(self):
-		if self.model is None:
-			# kokoro API is not standardized here; attempt common patterns.
-			# If kokoro is installed and provides a `TTS` class or `load_model` function,
-			# try to use them. This is defensive; if it fails, we raise ImportError
-			# and fall back to pyttsx3.
-			if hasattr(_kokoro, 'load_model'):
-				self.model = _kokoro.load_model()
-			elif hasattr(_kokoro, 'TTS'):
-				self.model = _kokoro.TTS()
-			else:
-				raise ImportError("Kokoro appears installed but no known loader found")
-
-	def speak(self, text: str) -> None:
-		self._ensure_model()
-		# Try common synthesize API
-		if hasattr(self.model, 'synthesize'):
-			audio = self.model.synthesize(text)
-			# If audio is a numpy array or bytes, attempt playback via simple player
-			try:
-				import sounddevice as sd
-				import numpy as np
-				if isinstance(audio, bytes):
-					# unknown bytes format — fallback to writing temp wav
-					import tempfile, wave
-					with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as f:
-						f.write(audio)
-						tmp = f.name
-					import subprocess
-					if sys.platform.startswith('win'):
-						subprocess.Popen(['powershell', 'Start-Process', tmp])
-					else:
-						subprocess.Popen(['xdg-open', tmp])
-				else:
-					sd.play(audio, samplerate=22050)
-					sd.wait()
-				return
-			except Exception:
-				pass
-		# If model has speak/play API
-		if hasattr(self.model, 'speak'):
-			return self.model.speak(text)
-		raise RuntimeError("Kokoro model loaded but no known speak API")
+def _configured_provider() -> str:
+	value = os.getenv("TTS_PROVIDER", "auto").strip().lower()
+	if value not in {"auto", "openai", "chatterbox", "pyttsx3"}:
+		print(f"Unknown TTS_PROVIDER={value!r}; using auto")
+		return "auto"
+	return value
 
 
-_kokoro_wrapper: Optional[KokoroWrapper] = None
+def _openai_is_available() -> bool:
+	return bool(
+		_openai_provider is not None
+		and _openai_provider.is_available()
+	)
 
 
-def speak(text: str, max_speech_chars: int = 300) -> None:
-	"""Speak `text` locally. Prefer Kokoro if available, otherwise pyttsx3.
+def _provider_order() -> list[str]:
+	configured = _configured_provider()
+	if configured == "openai":
+		return ["openai", "pyttsx3"]
+	if configured == "chatterbox":
+		return ["chatterbox", "pyttsx3"]
+	if configured == "pyttsx3":
+		return ["pyttsx3"]
+
+	providers = []
+	if (
+		_chatterbox_available
+		and _chatterbox_provider is not None
+		and _chatterbox_provider.is_low_latency_ready()
+	):
+		providers.append("chatterbox")
+	if _openai_is_available():
+		providers.append("openai")
+	providers.append("pyttsx3")
+	return providers
+
+
+def _active_provider() -> str:
+	for provider in _provider_order():
+		if provider == "openai" and _openai_is_available():
+			return provider
+		if provider == "chatterbox" and _chatterbox_available:
+			return provider
+		if provider == "pyttsx3" and _pyttsx3_available:
+			return provider
+	return "pyttsx3"
+
+
+def _provider_label(provider: str) -> str:
+	return {
+		"openai": "OpenAI cedar",
+		"chatterbox": "Chatterbox local",
+		"pyttsx3": "pyttsx3 fallback",
+	}[provider]
+
+
+def start_background() -> None:
+	"""Warm local TTS when appropriate and announce the selected provider."""
+	configured = _configured_provider()
+	if configured in {"auto", "chatterbox"} and _chatterbox_available and _chatterbox_provider is not None:
+		_chatterbox_provider.start_service_background()
+	print(f"TTS provider: {_provider_label(_active_provider())}")
+
+
+def speak(text: str, max_speech_chars: int = 300, lang: Optional[str] = None) -> None:
+	"""Speak locally with Chatterbox, using pyttsx3 only on failure.
 
 	For long texts, speak a short summary and leave full text for the terminal.
 	"""
@@ -127,34 +123,25 @@ def speak(text: str, max_speech_chars: int = 300) -> None:
 	else:
 		to_speak = text
 
-	# Try Chatterbox provider first (preferred)
-	if _chatterbox_available and _chatterbox_provider is not None:
-		try:
-			_chatterbox_provider.speak(to_speak)
-			return
-		except Exception as e:
-			print(f"Chatterbox TTS failed: {e} -- falling back to other TTS providers")
-
-	# Try Kokoro
-	if _kokoro_available:
-		global _kokoro_wrapper
-		if _kokoro_wrapper is None:
-			_kokoro_wrapper = KokoroWrapper()
-		try:
-			_kokoro_wrapper.speak(to_speak)
-			return
-		except Exception as e:
-			print(f"Kokoro TTS failed: {e} -- falling back to pyttsx3 if available")
-
-	# Fallback to pyttsx3
-	if _pyttsx3_available:
-		engine = _init_pyttsx3()
-		if engine is None:
-			print(f"(TTS unavailable) Jarvis: {text}")
-			return
-		engine.say(to_speak)
-		engine.runAndWait()
-		return
+	for provider in _provider_order():
+		if provider == "chatterbox" and _chatterbox_available and _chatterbox_provider is not None:
+			try:
+				_chatterbox_provider.speak(to_speak, lang=lang or 'en')
+				return
+			except Exception as e:
+				print(f"Chatterbox TTS failed: {e} -- falling back to pyttsx3")
+		elif provider == "openai" and _openai_is_available():
+			try:
+				_openai_provider.speak(to_speak)
+				return
+			except Exception as e:
+				print(f"OpenAI TTS failed: {e} -- trying local speech")
+		elif provider == "pyttsx3" and _pyttsx3_available:
+			engine = _init_pyttsx3()
+			if engine is not None:
+				engine.say(to_speak)
+				engine.runAndWait()
+				return
 
 	# Last resort: print
 	print(f"(TTS unavailable) Jarvis: {text}")

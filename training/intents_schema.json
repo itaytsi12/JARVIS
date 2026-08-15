@@ -1,0 +1,22 @@
+{
+  "open_application": { "arguments": ["app_name"] },
+  "close_application": { "arguments": ["app_name"] },
+  "open_website": { "arguments": ["url_or_site"] },
+  "web_search": { "arguments": ["query"] },
+  "youtube_search": { "arguments": ["query"] },
+  "volume_up": { "arguments": ["amount"] },
+  "volume_down": { "arguments": ["amount"] },
+  "mute_volume": { "arguments": [] },
+  "unmute_volume": { "arguments": [] },
+  "type_text": { "arguments": ["text"] },
+  "press_key": { "arguments": ["key"] },
+  "hotkey": { "arguments": ["keys"] },
+  "switch_window": { "arguments": ["app_name"] },
+  "minimize_window": { "arguments": [] },
+  "maximize_window": { "arguments": [] },
+  "close_window": { "arguments": [] },
+  "take_screenshot": { "arguments": [] },
+  "open_file": { "arguments": ["path_or_name"] },
+  "open_folder": { "arguments": ["path_or_name"] },
+  "run_command": { "arguments": ["command"] }
+}
