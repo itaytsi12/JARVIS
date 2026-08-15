@@ -72,10 +72,11 @@ class Executor:
                 # If the tool returned structured data (dict), preserve it in ToolResult.data
                 if isinstance(raw_result, dict):
                     return ToolResult(
-                        success=True,
+                        success=raw_result.get("success", True),
                         tool=action.tool,
                         message=str(raw_result.get("message") or raw_result),
                         data=raw_result,
+                        error=raw_result.get("error"),
                     )
 
                 return ToolResult(
@@ -121,10 +122,11 @@ class Executor:
 
                 if isinstance(raw_result, dict):
                     return ToolResult(
-                        success=True,
+                        success=raw_result.get("success", True),
                         tool=action.tool,
                         message=str(raw_result.get("message") or raw_result),
                         data=raw_result,
+                        error=raw_result.get("error"),
                     )
 
                 return ToolResult(
@@ -142,10 +144,11 @@ class Executor:
 
             if isinstance(raw_result, dict):
                 return ToolResult(
-                    success=True,
+                    success=raw_result.get("success", True),
                     tool=action.tool,
                     message=str(raw_result.get("message") or raw_result),
                     data=raw_result,
+                    error=raw_result.get("error"),
                 )
 
             return ToolResult(

@@ -15,8 +15,8 @@ ALIASES = {}
 
 # Variants for Jarvis wake words (English-only)
 WAKE_WORDS = [
-    r"^\s*jarvis\b",
-    r"^\s*hey\s+jarvis\b",
+    r"^\s*hey[\s,]+jarvis\b[\s,.:;!?-]*",
+    r"^\s*jarvis\b[\s,.:;!?-]*",
 ]
 
 

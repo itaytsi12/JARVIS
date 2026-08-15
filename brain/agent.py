@@ -8,6 +8,8 @@ from brain.tool_router import execute_tool
 from brain.planner import create_plan
 from brain.executor import Executor
 from brain.models import Action
+from brain.agent_runtime import AgentRuntime
+from brain.task_planner import create_task_plan, should_use_task_planner
 
 
 load_dotenv()
@@ -19,6 +21,7 @@ client = OpenAI(
 
 
 executor = Executor()
+agent_runtime = AgentRuntime()
 
 
 def ask_ai(message: str) -> str:
@@ -31,6 +34,13 @@ def ask_ai(message: str) -> str:
 
 
 def run_agent(command: str) -> str:
+    if should_use_task_planner(command):
+        plan = create_task_plan(command, agent_runtime.context)
+        if plan and plan.actions:
+            results = agent_runtime.execute(plan)
+            return format_results(results)
+        return "I couldn't create a safe local plan for that task."
+
     route = route_command(
         command
     )

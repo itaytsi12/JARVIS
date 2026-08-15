@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>JARVIS Agent Test</title></head>
+<body>
+  <nav><a href="#home">Home</a> <a href="#login" id="login-link">Login</a> <a href="#signup">Sign Up</a></nav>
+  <main>
+    <h1>Local Agent Test Site</h1>
+    <label>Search <input placeholder="Search" name="search"></label>
+    <button id="dynamic-button">Show dynamic element</button>
+    <p id="dynamic" hidden>Dynamic content is ready.</p>
+    <section id="login">
+      <h2>Login</h2>
+      <label>Username <input name="username"></label>
+      <label>Password <input name="password" type="password"></label>
+      <button id="login-submit">Log in</button>
+    </section>
+    <section id="signup">
+      <h2>Sign Up</h2>
+      <label><input type="checkbox" name="updates"> Receive updates</label>
+      <label>Options <select name="options"><option>A</option><option>B</option></select></label>
+      <button id="continue">Continue</button>
+    </section>
+    <div id="verification" hidden><h2>Manual Verification</h2><p>SMS verification is required.</p></div>
+  </main>
+  <script>
+    document.querySelector('#dynamic-button').onclick=()=>document.querySelector('#dynamic').hidden=false;
+    document.querySelector('#continue').onclick=()=>document.querySelector('#verification').hidden=false;
+  </script>
+</body>
+</html>

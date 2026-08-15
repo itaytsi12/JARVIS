@@ -39,9 +39,19 @@ def voice_mode():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--voice", action="store_true", help="Start push-to-talk voice mode")
+    parser.add_argument("--dry-run", metavar="GOAL", help="Print a local agent plan without executing it")
+    parser.add_argument("--tray", action="store_true", help="Run the always-on system tray assistant")
     args = parser.parse_args()
 
-    if args.voice:
+    if args.tray:
+        from voice.tray_app import run_tray
+        raise SystemExit(run_tray())
+    elif args.dry_run:
+        from brain.task_planner import create_task_plan, format_plan
+
+        plan = create_task_plan(args.dry_run)
+        print(format_plan(plan) if plan else "No deterministic plan could be created.")
+    elif args.voice:
         voice_mode()
     else:
         typed_mode()

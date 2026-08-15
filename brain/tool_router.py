@@ -16,6 +16,16 @@ from tools.files import (
     open_known_folder,
     list_files,
     exists,
+    append_text_file,
+    copy_path,
+    create_text_file,
+    find_file,
+    move_path,
+    read_text_file,
+    rename_path,
+    search_text,
+    verify_file,
+    write_text_file,
 )
 from tools.misc import (
     get_time,
@@ -121,6 +131,21 @@ def execute_tool(
         result = exists(arguments.get("path"))
         
         return result
+
+    file_tools = {
+        "create_text_file": lambda: create_text_file(arguments["path"], arguments["contents"], arguments.get("overwrite", False)),
+        "read_text_file": lambda: read_text_file(arguments["path"]),
+        "write_text_file": lambda: write_text_file(arguments["path"], arguments["contents"], arguments.get("overwrite", False)),
+        "append_text_file": lambda: append_text_file(arguments["path"], arguments["contents"]),
+        "verify_file": lambda: verify_file(arguments["path"], arguments.get("expected_content")),
+        "rename_path": lambda: rename_path(arguments["path"], arguments["new_name"]),
+        "copy_path": lambda: copy_path(arguments["source"], arguments["destination"]),
+        "move_path": lambda: move_path(arguments["source"], arguments["destination"]),
+        "find_file": lambda: find_file(arguments["path"], arguments["name"]),
+        "search_text": lambda: search_text(arguments["path"], arguments["query"]),
+    }
+    if tool_name in file_tools:
+        return file_tools[tool_name]()
 
     if tool_name == "lock_computer":
         result = lock_computer()

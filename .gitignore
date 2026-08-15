@@ -28,6 +28,7 @@ ENV/
 # Specific project venvs
 .venv-intent/
 .venv-chatterbox/
+.venv-agent/
 work/.venv-audio-debug/
 
 # =========================
@@ -51,6 +52,7 @@ work/.venv-audio-debug/
 # Logs
 # =========================
 *.log
+logs/
 pip-log.txt
 pip-delete-this-directory.txt
 
@@ -72,6 +74,8 @@ models/intent/
 
 # Downloaded Hugging Face / embedding model cache
 models/embedding_cache/
+models/wake_word/*.tflite
+models/wake_word/silero_vad.onnx
 
 # =========================
 # Keep the new lightweight classifier

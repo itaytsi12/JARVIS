@@ -22,6 +22,8 @@ APP_PROCESSES = {
     "discord": ["discord.exe"],
     "vscode": ["code.exe"],
     "vs code": ["code.exe"],
+    "visual studio code": ["code.exe"],
+    "code": ["code.exe"],
 }
 
 

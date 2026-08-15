@@ -35,6 +35,7 @@ APP_ALIASES: Dict[str, str] = {
     "vscode": "vscode",
     "vs code": "vscode",
     "visual studio code": "vscode",
+    "code": "vscode",
     "chrome": "chrome",
     "edge": "edge",
     "spotify": "spotify",

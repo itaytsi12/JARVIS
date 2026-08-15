@@ -19,12 +19,14 @@ from pathlib import Path
 from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+from tools.windows_process import hidden_process_kwargs
 
 # Configuration: service port and venv location
 _SERVICE_PORT = int(os.environ.get('JARVIS_CHATTERBOX_PORT', '5002'))
 _SERVICE_URL = f'http://127.0.0.1:{_SERVICE_PORT}'
 _VENV_DIR = Path(__file__).resolve().parents[2] / '.venv-chatterbox'
 _VENV_PY = _VENV_DIR / 'Scripts' / 'python.exe'
+_VENV_PYW = _VENV_DIR / 'Scripts' / 'pythonw.exe'
 _SERVICE_PROC = None
 _SERVICE_LOG_HANDLE = None
 _SERVICE_START_LOCK = threading.Lock()
@@ -113,7 +115,7 @@ def _start_service_locked(timeout: float) -> bool:
         return False
 
     # status is None -> no service responding on port, start it
-    python_exe = str(_VENV_PY)
+    python_exe = str(_VENV_PYW if os.name == 'nt' and _VENV_PYW.exists() else _VENV_PY)
     service_script = str(Path(__file__).resolve().parents[1] / 'chatterbox_service.py')
     if not Path(python_exe).exists():
         raise FileNotFoundError(f'Venv python not found: {python_exe}')
@@ -139,17 +141,14 @@ def _start_service_locked(timeout: float) -> bool:
     except Exception:
         logfile = subprocess.DEVNULL
 
-    creationflags = 0
-    if os.name == 'nt':
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     _SERVICE_PROC = subprocess.Popen(
         [python_exe, '-u', service_script, '--port', str(_SERVICE_PORT)],
         cwd=str(Path(__file__).resolve().parents[2]),
         stdin=subprocess.DEVNULL,
         stdout=logfile,
         stderr=logfile,
-        creationflags=creationflags,
         close_fds=True,
+        **hidden_process_kwargs(),
     )
 
     # Poll until ready or timeout
