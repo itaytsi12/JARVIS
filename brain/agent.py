@@ -60,6 +60,7 @@ def ask_ai(message: str) -> str:
 
 
 def run_agent(command: str, route: dict | None = None, interaction_id: str | None = None, original_user_text: str | None = None, cancellation_token=None, execution_outcome: dict | None = None) -> str:
+    request_started = time.perf_counter()
     recorder = get_recorder()
     created_interaction = interaction_id is None
     iid = interaction_id or recorder.begin(original_user_text or command, agent_runtime.session_id)
@@ -89,20 +90,30 @@ def run_agent(command: str, route: dict | None = None, interaction_id: str | Non
         recorded_response=f"<PRIVATE_RESPONSE_REDACTED; length={len(response)}>" if execution_meta.get("private_response") else response
         recorder.finalize(iid, success=not failed, verified=verified, response=recorded_response)
         agent_runtime.context.last_assistant_response = response
+        outcome=_build_execution_outcome(execution_meta, overall_success=not failed)
         if execution_outcome is not None:
             execution_outcome.clear()
-            execution_outcome.update(_build_execution_outcome(execution_meta, overall_success=not failed))
+            execution_outcome.update(outcome)
+        _log_request_performance(execution_meta, request_started, failed)
+        _observe_for_improvement(command,route,outcome,original_user_text,iid,execution_meta,request_started)
         return response
     except Exception as exc:
         recorder.record(EventType.TASK_FAILED, {"error": f"{type(exc).__name__}: {exc}"}, iid)
         recorder.finalize(iid, success=False, response="Command failed")
+        _log_request_performance(execution_meta, request_started, True)
+        outcome={
+            "executed": False, "success": False, "verified": False, "partial": False,
+            "route_type": execution_meta.get("route_type"), "actions": [],
+            "error": f"{type(exc).__name__}: {exc}",
+            "exception_type": type(exc).__name__,
+            "exception_message": sanitize_text(str(exc))[:500],
+            "block_reason": execution_meta.get("block_reason"),
+            "block_errors": list(execution_meta.get("block_errors") or []),
+        }
         if execution_outcome is not None:
             execution_outcome.clear()
-            execution_outcome.update({
-                "executed": False, "success": False, "verified": False, "partial": False,
-                "route_type": execution_meta.get("route_type"), "actions": [],
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+            execution_outcome.update(outcome)
+        _observe_for_improvement(command,route,outcome,original_user_text,iid,execution_meta,request_started)
         raise
 
 
@@ -118,7 +129,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         execution_meta["model_calls"] = 0
         if re.search(r"\b(it|that|earlier|previous|the browser|the file|the project|the task)\b", command, re.I):
             recorder.record(EventType.RESOLVED_REFERENCES, {"request": sanitize_user_request(command), "context": _bounded_context(agent_runtime.context)}, iid)
-        plan = create_task_plan(command, agent_runtime.context)
+        plan = _timed(execution_meta,"planning_ms",lambda: create_task_plan(command, agent_runtime.context))
         if plan and plan.actions:
             completeness=assess_plan_completeness(command,plan)
             runtime_log.info("Local planner result: tools=%r clauses=%r represented=%r",[action.tool for action in plan.actions],completeness.get("clauses"),completeness.get("represented_clause_count"))
@@ -128,13 +139,14 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                 recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"deterministic_planner","complete":False,"reason":"incomplete_local_plan","clauses":completeness["clauses"],"actions":[{"tool":a.tool,"arguments":_safe_action_arguments(a)} for a in plan.actions]},iid)
                 if "app_identification_uncertain" in local_fidelity:
                     recorder.record(EventType.TASK_BLOCKED,{"reason":"app_identification_uncertain"},iid);execution_meta["success"]=False
+                    execution_meta["block_reason"]="app_identification_uncertain";execution_meta["block_errors"]=["app_identification_uncertain"]
                     runtime_log.info("Cloud planner invoked: false; app identification is uncertain")
                     return "I couldn't confidently identify the music application. Please say its exact name."
                 cloud_goal=original_user_text or command
                 runtime_log.info("Cloud planner invoked: true; full_goal=%r",_command_for_log(cloud_goal))
                 execution_meta["route_type"]="plan";execution_meta["route_source"]="cloud_planner";execution_meta["model_calls"]+=1
                 recorder.record(EventType.REASONING_REQUEST,{"operation":"cloud_planner","model_calls":1,"request":sanitize_user_request(cloud_goal),"fallback_reason":"incomplete_local_plan"},iid)
-                proposed=create_plan(cloud_goal);safe_proposal=privacy_safe_event("PLAN_CREATED",{"actions":proposed or []})["actions"]
+                proposed=_timed(execution_meta,"cloud_ms",lambda: create_plan(cloud_goal));safe_proposal=privacy_safe_event("PLAN_CREATED",{"actions":proposed or []})["actions"]
                 recorder.record(EventType.REASONING_RESPONSE,{"operation":"cloud_planner","actions":safe_proposal},iid)
                 cloud_actions,validation_errors=validate_generated_actions(proposed)
                 coverage_errors=validate_goal_coverage(command,cloud_actions) if cloud_actions else ["missing_complete_cloud_plan"]
@@ -142,10 +154,11 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                 runtime_log.info("Final cloud plan validation: valid=%s tools=%r errors=%r",not errors,[action.tool for action in cloud_actions],errors)
                 if errors:
                     recorder.record(EventType.TASK_BLOCKED,{"reason":"cloud_plan_incomplete_or_invalid","errors":errors},iid);execution_meta["success"]=False
+                    execution_meta["block_reason"]="cloud_plan_incomplete_or_invalid";execution_meta["block_errors"]=list(errors)
                     return "I identified the application request, but I don't have a complete validated UI plan to play that item, so I didn't open anything."
                 cloud_plan=Plan(command,cloud_actions,context={"planning_trace":{"segments":completeness["clauses"]},"represented_clause_count":len(completeness["clauses"]),"fallback_from":"incomplete_local_plan"})
                 recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"cloud_planner","goal":cloud_plan.safe_goal(),"actions":[{"tool":a.tool,"arguments":_safe_action_arguments(a)} for a in cloud_actions]},iid)
-                results=_execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token)
+                results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token,execution_meta))
                 execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(cloud_actions,results)
                 execution_meta["success"]=len(results)==len(cloud_actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(cloud_actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
                 return format_results(results)
@@ -163,7 +176,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
             if plan.context.get("resolved_references"):
                 recorder.record(EventType.RESOLVED_REFERENCES, _safe_reference_payload(plan.context["resolved_references"]), iid)
             recorder.record(EventType.PLAN_CREATED, {"route_type":"task_plan","route_source":"deterministic_planner","goal": plan.safe_goal(), "actions": [{"tool": a.tool, "arguments": _safe_action_arguments(a)} for a in plan.actions]}, iid)
-            results = _execute_recorded_plan(recorder,iid,plan,agent_runtime,cancellation_token)
+            results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,plan,agent_runtime,cancellation_token,execution_meta))
             execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(plan.actions,results)
             execution_meta["success"]=len(results)==len(plan.actions) and all(result.success for result in results)
             execution_meta["verified"]=_results_verified(plan.actions,results)
@@ -175,26 +188,30 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
             fidelity=validate_goal_coverage(command,[])
             if "app_identification_uncertain" in fidelity:
                 recorder.record(EventType.TASK_BLOCKED,{"reason":"app_identification_uncertain"},iid);execution_meta["success"]=False
+                execution_meta["block_reason"]="app_identification_uncertain";execution_meta["block_errors"]=["app_identification_uncertain"]
                 runtime_log.info("Completeness decision: incomplete; cloud planner invoked: false; app identification uncertain")
                 return "I couldn't confidently identify the music application. Please say its exact name."
             cloud_goal=original_user_text or command;runtime_log.info("Completeness decision: incomplete; cloud planner invoked: true; full_goal=%r",_command_for_log(cloud_goal))
             execution_meta["route_type"]="plan";execution_meta["route_source"]="cloud_planner";execution_meta["model_calls"]+=1
-            proposed=create_plan(cloud_goal);cloud_actions,validation_errors=validate_generated_actions(proposed)
+            proposed=_timed(execution_meta,"cloud_ms",lambda: create_plan(cloud_goal));cloud_actions,validation_errors=validate_generated_actions(proposed)
             coverage_errors=validate_goal_coverage(command,cloud_actions) if cloud_actions else ["missing_complete_cloud_plan"];errors=validation_errors+coverage_errors
             runtime_log.info("Final cloud plan validation: valid=%s tools=%r errors=%r",not errors,[action.tool for action in cloud_actions],errors)
             if errors:
                 recorder.record(EventType.TASK_BLOCKED,{"reason":"cloud_plan_incomplete_or_invalid","errors":errors},iid);execution_meta["success"]=False
+                execution_meta["block_reason"]="cloud_plan_incomplete_or_invalid";execution_meta["block_errors"]=list(errors)
                 return "I couldn't build a complete validated plan for every part of that request, so I didn't execute anything."
             cloud_plan=Plan(command,cloud_actions,context={"planning_trace":{"segments":missing_completeness["clauses"]},"represented_clause_count":len(missing_completeness["clauses"]),"fallback_from":"missing_local_plan"})
             recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"cloud_planner","goal":cloud_plan.safe_goal(),"actions":[{"tool":a.tool,"arguments":_safe_action_arguments(a)} for a in cloud_actions]},iid)
-            results=_execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token)
+            results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token,execution_meta))
             execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(cloud_actions,results)
             execution_meta["success"]=len(results)==len(cloud_actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(cloud_actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
             return format_results(results)
         if plan and plan.context.get("clarification"):
             execution_meta["success"]=False;execution_meta["verified"]=False
+            execution_meta["block_reason"]="clarification_required";execution_meta["block_errors"]=["clarification_required"]
             recorder.record(EventType.TASK_BLOCKED,{"reason":"clarification_required"},iid)
             return plan.context["clarification"]
+        execution_meta["block_reason"]="missing_local_plan";execution_meta["block_errors"]=["missing_local_plan"]
         return "I couldn't create a safe local plan for that task."
 
     if route is None:
@@ -272,7 +289,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         cancel_read_only_tasks();wait_for_interactive_tasks()
         if context.messaging_committed:return "The previous WhatsApp message was already sent, so I didn't send another one."
         plan=Plan(command,[Action("send_whatsapp_message",{"recipient":route["recipient"],"message":message},risk=ActionRisk.CAUTION,max_attempts=1,sensitive_fields={"message"})])
-        results=_execute_recorded_plan(recorder,iid,plan,agent_runtime)
+        results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,plan,agent_runtime,execution_meta=execution_meta))
         execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(plan.actions,results)
         successful=bool(results and results[0].success);recorder.correction(iid,{"recipient":original_recipient},{"recipient":route["recipient"]},successful=successful)
         execution_meta["success"]=successful;execution_meta["verified"]=_results_verified(plan.actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
@@ -350,7 +367,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
 
     if route["type"] == "local_plan":
         execution_meta["private_response"]=_has_private_response(route["actions"])
-        results = _execute_recorded_plan(recorder,iid,Plan(command,route["actions"]),agent_runtime,cancellation_token)
+        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,route["actions"]),agent_runtime,cancellation_token,execution_meta))
         execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(route["actions"],results)
         execution_meta["success"]=len(results)==len(route["actions"]) and all(result.success for result in results);execution_meta["verified"]=_results_verified(route["actions"],results);execution_meta["model_calls"]+=_result_model_calls(results)
 
@@ -365,9 +382,9 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
     if route["type"] == "plan":
         execution_meta["model_calls"]+=1
         recorder.record(EventType.REASONING_REQUEST,{"operation":"cloud_planner","model_calls":1,"request":sanitize_user_request(route["message"])},iid)
-        planned_actions = create_plan(
+        planned_actions = _timed(execution_meta,"cloud_ms",lambda: create_plan(
             route["message"]
-        )
+        ))
         safe_proposal=privacy_safe_event("PLAN_CREATED",{"actions":planned_actions or []})["actions"]
         recorder.record(EventType.REASONING_RESPONSE,{"operation":"cloud_planner","actions":safe_proposal},iid)
 
@@ -378,11 +395,12 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         validation_errors+=validate_goal_coverage(route["message"],actions) if actions else ["missing_complete_cloud_plan"]
         if validation_errors:
             recorder.record(EventType.TASK_BLOCKED,{"reason":"generated_plan_validation_failed","errors":validation_errors},iid);execution_meta["success"]=False
+            execution_meta["block_reason"]="generated_plan_validation_failed";execution_meta["block_errors"]=list(validation_errors)
             return "I rejected an unsafe or malformed generated plan."
 
         execution_meta["private_response"]=_has_private_response(actions)
 
-        results = _execute_recorded_plan(recorder,iid,Plan(command,actions),agent_runtime,cancellation_token)
+        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,actions),agent_runtime,cancellation_token,execution_meta))
         execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(actions,results)
         execution_meta["success"]=len(results)==len(actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
 
@@ -399,11 +417,12 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         validation_errors+=validate_goal_coverage(command,actions) if actions else ["missing_complete_cloud_plan"]
         if validation_errors:
             recorder.record(EventType.TASK_BLOCKED,{"reason":"generated_route_validation_failed","errors":validation_errors},iid);execution_meta["success"]=False
+            execution_meta["block_reason"]="generated_route_validation_failed";execution_meta["block_errors"]=list(validation_errors)
             return "I rejected an unsafe or malformed generated action."
 
         execution_meta["private_response"]=_has_private_response(actions)
 
-        results = _execute_recorded_plan(recorder,iid,Plan(command,actions),agent_runtime,cancellation_token)
+        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,actions),agent_runtime,cancellation_token,execution_meta))
         execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(actions,results)
         execution_meta["success"]=len(results)==len(actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
 
@@ -426,6 +445,52 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
     return "I couldn't understand what to do."
 
 
+def _observe_for_improvement(command,route,outcome,original_user_text,interaction_id,execution_meta,request_started) -> None:
+    """Feed real execution evidence to the self-improvement observer.
+
+    This must never affect the user-visible outcome of a request: any
+    failure here is logged and swallowed, never raised. It runs after the
+    response/execution_outcome are already finalized, using the exact same
+    `outcome` dict handed to the response formatter -- never route/plan
+    intent -- so a stale route can no longer contaminate improvement
+    evidence than it can contaminate the spoken response.
+    """
+    try:
+        from brain.improvement_observer import observe
+        observe(
+            command=command,
+            route=route,
+            execution_outcome=outcome,
+            original_user_text=original_user_text,
+            interaction_id=interaction_id,
+            duration_ms=(time.perf_counter()-request_started)*1000,
+            resource_wait_ms=_resource_wait_ms(execution_meta),
+        )
+    except Exception:
+        runtime_log.exception("Improvement observation failed; continuing without it")
+
+
+def _resource_wait_ms(execution_meta: dict) -> float:
+    results=execution_meta.get("executed_results") or []
+    return next((float(_result_data(r).get("plan_resource_wait_ms",0.0) or 0.0) for r in results),0.0)
+
+
+def _log_request_performance(execution_meta: dict, request_started: float, failed: bool) -> None:
+    """One consolidated per-request timing line -- not one line per stage,
+    to avoid log spam. Fields follow the stage names requested for latency
+    profiling; a stage not exercised by this request's route stays at 0.0
+    rather than being fabricated."""
+    total_ms=(time.perf_counter()-request_started)*1000
+    resource_wait_ms=_resource_wait_ms(execution_meta)
+    runtime_log.info(
+        "Request performance: route_type=%s route_source=%s planning_ms=%.1f cloud_ms=%.1f tool_execution_ms=%.1f resource_wait_ms=%.1f model_calls=%s total_request_ms=%.1f success=%s",
+        execution_meta.get("route_type"),execution_meta.get("route_source"),
+        execution_meta.get("planning_ms",0.0),execution_meta.get("cloud_ms",0.0),
+        execution_meta.get("tool_execution_ms",0.0),resource_wait_ms,
+        execution_meta.get("model_calls",0),total_ms,not failed,
+    )
+
+
 def _bounded_context(context):
     return {"active_app":context.active_app,"last_opened_app":context.last_opened_app,"browser_active":context.browser_active,"has_last_assistant_response":bool(context.last_assistant_response),"has_last_spoken_response":bool(context.last_spoken_response),"has_pending_message":bool(context.pending_messaging_message)}
 
@@ -439,13 +504,14 @@ def _record_prepared_actions(recorder,iid,actions,context):
     return prepared
 
 
-def _execute_recorded_plan(recorder,iid,plan,runtime,cancellation_token=None):
+def _execute_recorded_plan(recorder,iid,plan,runtime,cancellation_token=None,execution_meta=None):
     errors=validate_plan_preflight(plan,runtime.context)
     runtime_log.info("Complete plan before execution: %r",[(action.tool,_safe_action_arguments(action)) for action in plan.actions])
     for index,action in enumerate(plan.actions):runtime_log.info("Tool registry lookup: action=%d tool=%s registered=%s",index,action.tool,action.tool in RUNTIME_TOOLS)
     runtime_log.info("Plan validation result: valid=%s errors=%r context_id=%s",not errors,errors,id(runtime.context))
     if errors:
         recorder.record(EventType.TASK_BLOCKED,{"reason":"plan_preflight_failed","errors":errors},iid)
+        if execution_meta is not None:execution_meta["block_reason"]="plan_preflight_failed";execution_meta["block_errors"]=list(errors)
         return [ToolResult(False,"plan_preflight","I couldn't safely validate the complete plan, so I didn't execute any part of it.",{"verified":True,"validation_errors":errors},"plan_preflight_failed")]
     prepared={};terminal=set()
     def observe(stage,index,action,result,context):
@@ -485,6 +551,17 @@ def _results_verified(actions,results):
     return bool(results) and len(results)==len(actions) and all(result.success and bool(_result_data(result).get("verified")) for result in results)
 
 
+def _timed(execution_meta: dict, key: str, fn):
+    """Time `fn()` and accumulate the elapsed milliseconds into
+    execution_meta[key], forwarding fn's return value unchanged. A thin
+    wrapper rather than inlining perf_counter() at each of the several call
+    sites that need this -- fewer places for a copy-paste timing bug to hide."""
+    started=time.perf_counter()
+    result=fn()
+    execution_meta[key]=execution_meta.get(key,0.0)+(time.perf_counter()-started)*1000
+    return result
+
+
 def _paired_execution(planned_actions, results):
     """Pair each real ToolResult with the Action that actually produced it.
 
@@ -518,11 +595,15 @@ def _build_execution_outcome(execution_meta, overall_success):
     described = []
     for action, result in zip(actions, results):
         data = _result_data(result)
+        error = getattr(result, "error", None)
+        message = _safe_result_message(action, result)
         described.append({
             "tool": getattr(action, "tool", None),
             "arguments": action.safe_args(),
             "success": bool(getattr(result, "success", False)),
             "verified": bool(data.get("verified", False)),
+            "error": sanitize_text(str(error))[:300] if error else None,
+            "message": sanitize_text(str(message))[:300] if message else None,
         })
     any_success = any(item["success"] for item in described)
     full_success = bool(overall_success)
@@ -535,6 +616,12 @@ def _build_execution_outcome(execution_meta, overall_success):
         "partial": executed and any_success and not full_success,
         "action_count": len(actions),
         "actions": described,
+        "block_reason": execution_meta.get("block_reason"),
+        "block_errors": list(execution_meta.get("block_errors") or []),
+        "planning_ms": execution_meta.get("planning_ms", 0.0),
+        "cloud_ms": execution_meta.get("cloud_ms", 0.0),
+        "tool_execution_ms": execution_meta.get("tool_execution_ms", 0.0),
+        "model_calls": execution_meta.get("model_calls", 0),
     }
 
 

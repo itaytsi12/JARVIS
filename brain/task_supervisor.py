@@ -309,11 +309,12 @@ def prepare_coding_workspace(repository,task_id):
     if status.returncode: raise RuntimeError(status.stderr.strip())
     return {"repository":str(repo),"dirty":bool(status.stdout.strip()),"suggested_branch":f"jarvis/task-{task_id[:8]}","safe":True}
 
-def create_isolated_workspace(repository,destination,task_id):
+def create_isolated_workspace(repository,destination,task_id,branch=None,base_commit=None):
     repo,dest=Path(repository).resolve(),Path(destination).resolve()
     if dest.exists(): raise FileExistsError(dest)
     inspection=prepare_coding_workspace(repo,task_id)
-    branch=inspection["suggested_branch"]
-    result=subprocess.run(["git","worktree","add","-b",branch,str(dest)],cwd=repo,text=True,capture_output=True,**hidden_process_kwargs())
+    branch=branch or inspection["suggested_branch"]
+    args=["git","worktree","add","-b",branch,str(dest)]+([base_commit] if base_commit else [])
+    result=subprocess.run(args,cwd=repo,text=True,capture_output=True,**hidden_process_kwargs())
     if result.returncode: raise RuntimeError(redact(result.stderr.strip()))
     return {**inspection,"workspace":str(dest),"branch":branch}

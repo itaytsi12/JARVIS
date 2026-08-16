@@ -3,9 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from brain import agent
-from brain.models import Action,Plan
+from brain.models import Action,Plan,ToolResult
 from brain.plan_validator import validate_generated_actions,validate_plan_preflight
 from brain.session_context import SessionContext
+from brain.task_planner import assess_plan_completeness,create_task_plan
 
 
 class GeneratedPlanValidationTests(unittest.TestCase):
@@ -34,6 +35,50 @@ class GeneratedPlanValidationTests(unittest.TestCase):
         with patch.object(agent,"create_plan") as cloud,patch.object(agent,"_execute_recorded_plan") as execute:
             response=agent.run_agent("open up a music and play I Love It")
         cloud.assert_not_called();execute.assert_not_called();self.assertIn("exact name",response)
+
+    def test_compound_browser_search_and_first_result_completes_locally_regardless_of_provider(self):
+        # Generalization check: the local planner must recognize a complete
+        # compound browser goal (open browser, navigate/search, click first
+        # result) semantically -- via clause coverage, not by matching this
+        # one reported sentence -- so it works the same for YouTube, Google,
+        # and phrasings without an explicit "open <browser>" clause.
+        cases=[
+            "Open Chrome, go to YouTube, search for Minecraft redstone tutorial, and open the first result.",
+            "Open Chrome, search Google for cute cats, and open the first result.",
+            "search youtube for minecraft and open the first video",
+        ]
+        for command in cases:
+            with self.subTest(command=command):
+                plan=create_task_plan(command,SessionContext())
+                self.assertIsNotNone(plan)
+                self.assertEqual([a.tool for a in plan.actions],["browser_open_url","browser_click_first_result"])
+                completeness=assess_plan_completeness(command,plan)
+                self.assertTrue(completeness["complete"],completeness)
+                self.assertEqual(completeness["represented_clause_count"],len(completeness["clauses"]))
+
+    def test_compound_browser_search_runs_locally_without_cloud_planner_or_stale_route(self):
+        command="Open Chrome, go to YouTube, search for Minecraft redstone tutorial, and open the first result."
+        results=[
+            ToolResult(True,"browser_open_url","Opened YouTube search.",{"verified":True}),
+            ToolResult(True,"browser_click_first_result","Opened the first result.",{"verified":True}),
+        ]
+        with patch.object(agent,"create_plan") as cloud,patch.object(agent,"_execute_recorded_plan",return_value=results):
+            execution_outcome={}
+            response=agent.run_agent(command,execution_outcome=execution_outcome)
+        cloud.assert_not_called()
+        self.assertTrue(execution_outcome["executed"]);self.assertTrue(execution_outcome["success"])
+        self.assertEqual(response,"Opened YouTube search.\nOpened the first result.")
+
+    def test_unrelated_trailing_clause_still_escalates_to_cloud_planner(self):
+        # A clause the browser-goal branch genuinely doesn't act on (muting
+        # the volume) must not be silently claimed as covered just because it
+        # got merged onto the tail of "open the first result" by the coarser
+        # sequential-command segmenter.
+        command="Open Chrome, go to YouTube, search for Minecraft redstone tutorial, open the first result, and mute the volume."
+        plan=create_task_plan(command,SessionContext())
+        completeness=assess_plan_completeness(command,plan)
+        self.assertFalse(completeness["complete"])
+        self.assertLess(completeness["represented_clause_count"],len(completeness["clauses"]))
 
     def test_complete_plan_preflight_accepts_real_multistep_shape(self):
         plan=Plan("open notepad, type hello, then open youtube",[

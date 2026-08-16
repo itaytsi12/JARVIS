@@ -222,7 +222,16 @@ class AgentRuntime:
         return result
 
     def _browser_action(self, tool: str, args: dict) -> ToolResult:
-        before_state = self.browser.get_page_state() if self.browser.page else None
+        # This "before" snapshot is a diagnostic aid for the verification
+        # comparison below, not the action itself -- a page that's already
+        # dead (or dies while reading it) degrades to no prior URL rather
+        # than failing the whole action before the real operation even gets
+        # a chance to recover the session.
+        try:
+            is_live = self.browser.is_session_live() if hasattr(self.browser, "is_session_live") else bool(self.browser.page)
+            before_state = self.browser.get_page_state() if is_live else None
+        except Exception:
+            before_state = None
         before = before_state.url if before_state else None
         verified=False
         if tool == "browser_open_url": state = self.browser.open_url(args["url"])

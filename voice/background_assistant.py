@@ -308,9 +308,11 @@ class AlwaysOnAssistant:
             self.log.info("Final action result: %s", _redact_for_log(response_text))
             lang = detect_dominant_language(transcript)
             spoken = format_spoken_response(command, route, response_text, lang=lang, execution=execution_outcome)
+            self._perf("formatter_completed")
             self.log.info("Formatter result / final spoken response: %s",_redact_for_log(spoken))
             if not self.muted and spoken:
                 self._start_speech_task(spoken,lang,interaction_id)
+                self._perf("tts_dispatched")
         finally:
             if not self.debug_audio:
                 path.unlink(missing_ok=True)

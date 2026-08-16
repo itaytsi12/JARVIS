@@ -246,6 +246,65 @@ def _app_mentions(text: str) -> list[tuple[int, str]]:
     return unique
 
 
+_BROWSER_CAPABLE_APPS = {"chrome", "edge"}
+_SEARCH_CLAUSE_START = re.compile(
+    r"^(?:search(?:\s+(?:google|youtube|chrome))?\s+(?:for\s+)?|look\s+up\s+|look\s+for\s+|find\s+|play\s+|watch\s+)",
+    re.I,
+)
+# fullmatch, not match: the sequential-command segmenter only splits before a
+# recognized command-start verb (see _COMMAND_START), so an unhandled clause
+# like "mute the volume" that follows a comma can end up merged onto the tail
+# of "open the first result" as one clause. Anchoring both ends keeps that
+# merged clause from being falsely counted as covered by the click action.
+_FIRST_RESULT_CLAUSE = re.compile(r"(?:open|choose)\s+the\s+first\s+(?:result|video|one)[.,!?]*", re.I)
+_FULLSCREEN_CLAUSE = re.compile(r"(?:go\s+)?(?:fullscreen|full\s+screen)[.,!?]*", re.I)
+
+
+def _browser_goal_represented_clauses(clauses: list[str], provider: str, has_first_result: bool, has_fullscreen: bool) -> int:
+    """Count how many of the original command's clauses a browser-goal plan
+    (browser_open_url [+ browser_click_first_result] [+ browser_fullscreen])
+    genuinely accounts for.
+
+    That branch folds "open <browser>", "go to <site>", and "search ... for
+    ..." into a single semantic browser_open_url action, so it never produces
+    the 1:1 clause-to-action mapping assess_plan_completeness normally
+    expects from a plan. This walks the same clauses assess_plan_completeness
+    will independently re-derive and classifies each one against what the
+    browser plan actually does -- opens a browser-capable app, navigates to
+    the site the search itself targets, performs the search, optionally
+    clicks the first result, optionally goes fullscreen -- so a genuinely
+    complete compound browser command isn't discarded as incomplete merely
+    because its representation isn't one-action-per-clause. A clause that
+    doesn't fit any of those categories is left uncovered on purpose, so an
+    unrelated trailing instruction (e.g. "...and take a screenshot") still
+    correctly falls back to the cloud planner instead of being silently
+    dropped.
+    """
+    covered = 0
+    search_clause_claimed = False
+    for clause in clauses:
+        stripped = clause.lower().strip()
+        if has_first_result and _FIRST_RESULT_CLAUSE.fullmatch(stripped):
+            covered += 1
+            continue
+        open_match = re.match(r"^(?:open|launch|start|go\s+to)\s+(.+)$", clause, re.I)
+        if open_match:
+            target = _clean(open_match.group(1)).lower()
+            resolved_app = APP_ALIASES.get(target, target)
+            resolved_site = WEBSITE_ALIASES.get(target, "")
+            if resolved_app in _BROWSER_CAPABLE_APPS or (provider and (provider in target or provider in resolved_site)):
+                covered += 1
+            continue
+        if has_fullscreen and _FULLSCREEN_CLAUSE.fullmatch(stripped):
+            covered += 1
+            continue
+        if not search_clause_claimed and _SEARCH_CLAUSE_START.match(stripped):
+            covered += 1
+            search_clause_claimed = True
+            continue
+    return covered
+
+
 def should_use_task_planner(command: str) -> bool:
     lowered = command.lower()
     signals = (",", " then ", " and then ", "after that", "afterwards", "finally", "once that opens")
@@ -373,11 +432,19 @@ def create_task_plan(command: str, context: SessionContext | None = None) -> Pla
         actions.extend([
             Action("browser_open_url", {"url": SEARCH_URLS[provider].format(quote_plus(query))}, verify="url_loaded"),
         ])
-        if re.search(r"(?:open|choose)\s+the\s+first\s+(?:result|video)", lowered):
+        has_first_result = bool(re.search(r"(?:open|choose)\s+the\s+first\s+(?:result|video)", lowered))
+        if has_first_result:
             actions.append(Action("browser_click_first_result", {}, depends_on=[len(actions)-1], verify="url_changed"))
-        if "fullscreen" in lowered or "full screen" in lowered:
+        has_fullscreen = "fullscreen" in lowered or "full screen" in lowered
+        if has_fullscreen:
             actions.append(Action("browser_fullscreen", {}, depends_on=[len(actions)-1]))
-        return Plan(text, actions)
+        clauses = segment_sequential_commands(command)
+        represented = _browser_goal_represented_clauses(clauses, provider, has_first_result, has_fullscreen)
+        return Plan(text, actions, context={
+            "represented_clause_count": represented,
+            "planning_trace": {"segments": clauses},
+            "model_calls": 0,
+        })
 
     typed = _extract_type_text(text)
     if typed:
