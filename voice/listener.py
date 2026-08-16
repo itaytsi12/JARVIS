@@ -11,6 +11,7 @@ from __future__ import annotations
 import tempfile
 import time
 import os
+import threading
 from typing import Optional
 
 _SD_AVAILABLE = True
@@ -42,20 +43,37 @@ def listen_push_to_talk(samplerate: int = 16000, channels: int = 1, dtype="int16
 	input("Press Enter to start recording...")
 
 	frames = []
-	recording = True
+	stop_capture = threading.Event()
+	capture_error = []
+	frame_samples = max(1, int(samplerate * 0.08))
 
-	def callback(indata, frames_count, time_info, status):
-		# copy to avoid referencing same buffer
-		frames.append(indata.copy())
+	def capture(stream):
+		try:
+			while not stop_capture.is_set():
+				raw, _overflowed = stream.read(frame_samples)
+				frames.append(np.frombuffer(raw, dtype=np.int16).copy())
+		except Exception as exc:
+			capture_error.append(exc)
+			stop_capture.set()
 
+	worker = None
 	try:
-		with sd.InputStream(samplerate=samplerate, channels=channels, dtype=dtype, callback=callback):
-			print("Recording... press Enter to stop.")
-			input()
-			# stream context manager ends here
+		from .audio_input import open_jarvis_microphone
+		with open_jarvis_microphone(samplerate, frame_samples) as stream:
+			worker = threading.Thread(target=capture, args=(stream,), name="jarvis-push-to-talk-capture", daemon=True)
+			worker.start()
+			try:
+				print("Recording... press Enter to stop.")
+				input()
+			finally:
+				stop_capture.set()
+				worker.join(timeout=2)
 
 	except Exception as e:
 		print(f"Recording failed: {e}")
+		return None
+	if capture_error:
+		print(f"Recording failed: {capture_error[0]}")
 		return None
 
 	if not frames:

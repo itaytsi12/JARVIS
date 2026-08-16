@@ -44,6 +44,23 @@ class ChatterboxServiceTests(unittest.TestCase):
         self.assertIsInstance(payload["pid"], int)
         self.assertEqual(payload["device"], "cpu")
 
+    def test_windows_singleton_rejects_duplicate_service_before_model_load(self):
+        class Kernel:
+            def __init__(self,error):self.error=error;self.closed=[]
+            def CreateMutexW(self,*_):return 99
+            def GetLastError(self):return self.error
+            def CloseHandle(self,handle):self.closed.append(handle)
+        duplicate=Kernel(183)
+        with patch.object(chatterbox_service.os,"name","nt"):
+            self.assertFalse(chatterbox_service._acquire_service_singleton(5002,duplicate))
+        self.assertEqual(duplicate.closed,[99])
+        first=Kernel(0);old=chatterbox_service._SERVICE_MUTEX_HANDLE
+        try:
+            with patch.object(chatterbox_service.os,"name","nt"):
+                self.assertTrue(chatterbox_service._acquire_service_singleton(5002,first))
+            self.assertEqual(chatterbox_service._SERVICE_MUTEX_HANDLE,99)
+        finally:chatterbox_service._SERVICE_MUTEX_HANDLE=old
+
     def test_synthesize_forwards_english_and_hebrew(self):
         def record(text, language_id=None):
             self.calls.append((text, language_id))
@@ -111,17 +128,22 @@ class NaturalVoiceTests(unittest.TestCase):
             "Opened YouTube search in Google Chrome.",
             lang="en",
         )
-        self.assertEqual(spoken, "I opened YouTube and searched for Jude Law.")
+        self.assertEqual(spoken, "I opened YouTube and searched for Jude Law, sir.")
 
     def test_multistep_reply_says_what_was_done(self):
         actions = create_local_plan("open youtube and search youtube for Jude Law")
+        execution = {
+            "executed": True, "success": True, "verified": False, "partial": False,
+            "actions": [{"tool": a.tool, "arguments": a.args, "success": True, "verified": False} for a in actions],
+        }
         spoken = format_spoken_response(
             "open youtube and search youtube for Jude Law",
             {"type": "local_plan", "actions": actions},
             "Opened YouTube.\nOpened a YouTube search.",
             lang="en",
+            execution=execution,
         )
-        self.assertEqual(spoken, "I opened YouTube and searched YouTube for Jude Law.")
+        self.assertEqual(spoken, "I opened YouTube and searched YouTube for Jude Law, sir.")
 
     def test_neural_tts_request_uses_agent_voice_prompt_and_wav(self):
         class Response:
@@ -151,6 +173,22 @@ class NaturalVoiceTests(unittest.TestCase):
         ) as popen:
             self.assertTrue(chatterbox_tts._start_service(timeout=0.1))
         popen.assert_not_called()
+
+    def test_service_output_uses_bounded_rotation(self):
+        import logging
+        import tempfile
+        from pathlib import Path
+        from voice import chatterbox_service
+        with tempfile.TemporaryDirectory() as folder:
+            old_out,old_err=chatterbox_service.sys.stdout,chatterbox_service.sys.stderr
+            try:
+                chatterbox_service._configure_rotating_output(str(Path(folder)/"service.log"))
+                handler=logging.getLogger("jarvis.chatterbox_service").handlers[0]
+                self.assertEqual(handler.maxBytes,2_000_000);self.assertEqual(handler.backupCount,3)
+            finally:
+                chatterbox_service.sys.stdout, chatterbox_service.sys.stderr=old_out,old_err
+                for handler in logging.getLogger("jarvis.chatterbox_service").handlers[:]:handler.close()
+                logging.getLogger("jarvis.chatterbox_service").handlers.clear()
 
     def test_background_start_returns_without_waiting_for_model(self):
         started = threading.Event()
@@ -218,10 +256,17 @@ class TTSProviderSelectionTests(unittest.TestCase):
         self.chatterbox.speak.assert_called_once_with("Local only", lang="en")
         self.openai.speak.assert_not_called()
 
+    def test_fallback_provenance_is_returned_without_crossing_explicit_provider_policy(self):
+        self.chatterbox.speak.side_effect=RuntimeError("local failure");captured=[]
+        self.run_with_patches("chatterbox",lambda:captured.append(text_to_speech.speak("Local first",lang="en")))
+        self.openai.speak.assert_not_called();self.engine.say.assert_called_once_with("Local first")
+        self.assertEqual(captured[0]["provider"],"pyttsx3");self.assertEqual(captured[0]["attempted_providers"],["chatterbox","pyttsx3"]);self.assertEqual(captured[0]["fallback_from"],["chatterbox"])
+
     def test_explicit_openai_uses_cedar_provider(self):
-        self.run_with_patches("openai", lambda: text_to_speech.speak("Natural voice"))
+        captured=[];self.run_with_patches("openai", lambda: captured.append(text_to_speech.speak("Natural voice")))
         self.openai.speak.assert_called_once_with("Natural voice")
         self.chatterbox.speak.assert_not_called()
+        self.assertEqual(captured[0]["provider"],"openai");self.assertEqual(captured[0]["resource"],"speaker")
 
     def test_explicit_pyttsx3_uses_only_fallback_engine(self):
         self.run_with_patches("pyttsx3", lambda: text_to_speech.speak("Offline"))
@@ -242,6 +287,20 @@ class TTSProviderSelectionTests(unittest.TestCase):
         self.openai.speak.assert_called_once_with("Natural fallback")
         self.chatterbox.speak.assert_not_called()
 
+    def test_concurrent_speech_is_serialized_on_shared_speaker_resource(self):
+        state={"active":0,"maximum":0};guard=threading.Lock()
+        def playback(_text):
+            with guard:state["active"]+=1;state["maximum"]=max(state["maximum"],state["active"])
+            time.sleep(.03)
+            with guard:state["active"]-=1
+        self.openai.speak.side_effect=playback
+        patches=self.provider_patches()
+        with patch.dict(os.environ,{"TTS_PROVIDER":"openai"}),patches[0],patches[1],patches[2],patches[3],patches[4]:
+            threads=[threading.Thread(target=text_to_speech.speak,args=(f"speech {index}",)) for index in range(2)]
+            for thread in threads:thread.start()
+            for thread in threads:thread.join(1)
+        self.assertEqual(state["maximum"],1);self.assertEqual(self.openai.speak.call_count,2)
+
     def test_startup_labels_are_exact(self):
         expected = {
             "openai": "TTS provider: OpenAI cedar",
@@ -257,6 +316,13 @@ class TTSProviderSelectionTests(unittest.TestCase):
                         with redirect_stdout(output):
                             text_to_speech.start_background()
                 self.assertIn(label, output.getvalue())
+
+    def test_auto_does_not_warm_slow_local_model_unless_opted_in(self):
+        self.chatterbox.is_low_latency_ready.return_value=False;patches=self.provider_patches()
+        with patch.dict(os.environ,{"TTS_PROVIDER":"auto","JARVIS_CHATTERBOX_WARM_AUTO":"false"}),patches[0],patches[1],patches[2],patches[3],patches[4]:text_to_speech.start_background()
+        self.chatterbox.start_service_background.assert_not_called()
+        with patch.dict(os.environ,{"TTS_PROVIDER":"auto","JARVIS_CHATTERBOX_WARM_AUTO":"true"}),patches[0],patches[1],patches[2],patches[3],patches[4]:text_to_speech.start_background()
+        self.chatterbox.start_service_background.assert_called_once()
 
 
 if __name__ == "__main__":

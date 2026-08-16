@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from typing import Optional
 from urllib.parse import quote_plus, urlparse
@@ -7,6 +8,7 @@ from urllib.error import URLError
 
 
 INTENT_SERVICE_URL = "http://127.0.0.1:5050/predict"
+INTENT_SERVICE_TIMEOUT = float(os.getenv("JARVIS_INTENT_SERVICE_TIMEOUT", "0.35"))
 
 MIN_CONFIDENCE = 0.70
 
@@ -102,7 +104,7 @@ def predict_local_intent(text: str) -> Optional[dict]:
     try:
         with urlopen(
             request,
-            timeout=3,
+            timeout=INTENT_SERVICE_TIMEOUT,
         ) as response:
 
             data = json.loads(
@@ -544,4 +546,5 @@ def route_with_local_model(
 
         return None
 
+    action["route_source"] = "local_learned_classifier"
     return action

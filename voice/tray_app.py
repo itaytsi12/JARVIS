@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -150,6 +151,10 @@ def run_tray() -> int:
     from dotenv import load_dotenv
     load_dotenv(PROJECT_ROOT / ".env")
     configure_logging()
+    logging.getLogger("jarvis.background").info(
+        "Runtime entrypoint: pid=%s ppid=%s executable=%r argv=%r cwd=%r main=%r project_root=%r",
+        os.getpid(),os.getppid(),sys.executable,sys.argv,os.getcwd(),str(Path(sys.argv[0]).resolve()),str(PROJECT_ROOT),
+    )
     instance = SingleInstance()
     if not instance.acquire():
         return 0

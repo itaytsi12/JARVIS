@@ -1,5 +1,6 @@
 import ctypes
 import time
+from ctypes import wintypes
 
 import psutil
 
@@ -24,6 +25,11 @@ APP_PROCESSES = {
     "vs code": ["code.exe"],
     "visual studio code": ["code.exe"],
     "code": ["code.exe"],
+    "whatsapp": ["whatsapp.exe"],
+    "apple music": ["applemusic.exe"],
+    "settings": ["systemsettings.exe"],
+    "task manager": ["taskmgr.exe"],
+    "control panel": ["control.exe"],
 }
 
 
@@ -48,17 +54,32 @@ def _get_process_name(pid: int) -> str:
         return ""
 
 
+def _window_rank(hwnd:int) -> tuple[int,int]:
+    """Prefer real application frames over same-process overlay/helper HWNDs."""
+    title_length=max(0,int(user32.GetWindowTextLengthW(hwnd)))
+    rect=wintypes.RECT()
+    area=0
+    if user32.GetWindowRect(hwnd,ctypes.byref(rect)):
+        area=max(0,rect.right-rect.left)*max(0,rect.bottom-rect.top)
+    return (1 if title_length else 0,area)
+
+
 def find_application_window(
     app_name: str,
 ) -> int | None:
+    windows=find_application_windows(app_name)
+    return windows[0] if windows else None
+
+
+def find_application_windows(app_name: str) -> list[int]:
     app_name = app_name.lower().strip()
 
     process_names = APP_PROCESSES.get(
         app_name,
-        [f"{app_name}.exe"],
+        [f"{app_name}.exe",f"{app_name.replace(' ','')}.exe"],
     )
 
-    found_hwnd = None
+    found_hwnds = []
 
     EnumWindowsProc = ctypes.WINFUNCTYPE(
         ctypes.c_bool,
@@ -67,8 +88,6 @@ def find_application_window(
     )
 
     def callback(hwnd, _):
-        nonlocal found_hwnd
-
         if not user32.IsWindowVisible(hwnd):
             return True
 
@@ -77,8 +96,7 @@ def find_application_window(
         process_name = _get_process_name(pid)
 
         if process_name in process_names:
-            found_hwnd = hwnd
-            return False
+            found_hwnds.append(hwnd)
 
         return True
 
@@ -91,7 +109,7 @@ def find_application_window(
         0,
     )
 
-    return found_hwnd
+    return sorted((hwnd for hwnd in found_hwnds if _window_rank(hwnd)[0]),key=_window_rank,reverse=True)
 
 
 def focus_window(hwnd: int) -> bool:
@@ -165,11 +183,9 @@ def find_top_window_for_pid(pid: int, timeout: float = 1.0) -> int | None:
     )
 
     def enum_once():
-        found = None
+        found = []
 
         def callback(hwnd, _):
-            nonlocal found
-
             # Accept windows that either are visible or have a non-empty title.
             try:
                 visible = bool(user32.IsWindowVisible(hwnd))
@@ -184,15 +200,14 @@ def find_top_window_for_pid(pid: int, timeout: float = 1.0) -> int | None:
             win_pid = _get_window_pid(hwnd)
 
             if win_pid == pid:
-                found = hwnd
-                return False
+                if _window_rank(hwnd)[0]:found.append(hwnd)
 
             return True
 
         cb = EnumWindowsProc(callback)
         user32.EnumWindows(cb, 0)
 
-        return found
+        return max(found,key=_window_rank) if found else None
 
     while time.perf_counter() < deadline:
         hwnd = enum_once()

@@ -27,6 +27,7 @@ class Action:
     stop_condition: str | None = None
     risk: ActionRisk = ActionRisk.SAFE
     sensitive_fields: set[str] = field(default_factory=set, repr=False)
+    max_attempts: int | None = None
 
     def safe_args(self) -> dict[str, Any]:
         return {

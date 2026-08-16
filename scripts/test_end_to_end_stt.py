@@ -3,10 +3,15 @@ import time
 import json
 from pathlib import Path
 import sys
+import argparse
 
 # Ensure project root is on sys.path so local packages import correctly
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+parser=argparse.ArgumentParser(description="Synthetic STT pipeline test; desktop actions are opt-in.")
+parser.add_argument("--execute-actions",action="store_true",help="allow recognized test phrases to execute through JARVIS")
+args=parser.parse_args()
 
 phrases = [
     "Open YouTube",
@@ -94,14 +99,17 @@ for phrase, wav in zip(phrases, wav_paths):
         route = {"error": str(e)}
     item['route'] = route
 
-    # Execute via agent.run_agent but only if route indicates a tool/local_plan/plan or similar
+    # Real desktop/browser/audio side effects require explicit opt-in.
     exec_result = None
     exec_error = None
-    try:
-        res = run_agent(normalized or "")
-        exec_result = res
-    except Exception as e:
-        exec_error = str(e)
+    if args.execute_actions:
+        try:
+            res = run_agent(normalized or "")
+            exec_result = res
+        except Exception as e:
+            exec_error = str(e)
+    else:
+        exec_result = "SKIPPED: pass --execute-actions to run desktop actions"
 
     item['execution_result'] = exec_result
     item['execution_error'] = exec_error

@@ -133,16 +133,12 @@ def _start_service_locked(timeout: float) -> bool:
                 time.sleep(poll_interval)
             return False
 
-    # Start subprocess and redirect output to log file
-    try:
-        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        logfile = open(_LOG_PATH, 'ab')
-        _SERVICE_LOG_HANDLE = logfile
-    except Exception:
-        logfile = subprocess.DEVNULL
+    # The child rotates its own output, including model-library stdout/stderr.
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logfile = subprocess.DEVNULL
 
     _SERVICE_PROC = subprocess.Popen(
-        [python_exe, '-u', service_script, '--port', str(_SERVICE_PORT)],
+        [python_exe, '-u', service_script, '--port', str(_SERVICE_PORT), '--log-path', str(_LOG_PATH)],
         cwd=str(Path(__file__).resolve().parents[2]),
         stdin=subprocess.DEVNULL,
         stdout=logfile,
@@ -232,3 +228,11 @@ def speak(text: str, lang: Optional[str] = None) -> None:
     resp = _call_service_synthesize(text, lang=lang)
     if resp.get('status') != 'ok':
         raise RuntimeError('Chatterbox service failed: %s' % resp.get('error'))
+
+
+def stop() -> None:
+    try:
+        req=Request(f'{_SERVICE_URL}/stop',data=b'{}',headers={'Content-Type':'application/json'})
+        urlopen(req,timeout=.5).read()
+    except Exception:
+        pass

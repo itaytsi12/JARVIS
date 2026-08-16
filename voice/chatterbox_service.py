@@ -14,13 +14,17 @@ worked in `test_chatterbox.py` and uses `model.generate(...)` and
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import logging
 import os
+import sys
 import tempfile
 import threading
 import time
 import traceback
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 _SERVICE_MODEL = None
@@ -28,8 +32,36 @@ _SERVICE_STATE = "loading"
 _SERVICE_ERROR = None
 _SERVICE_DEVICE = None
 _MODEL_LOCK = threading.Lock()
+_SERVICE_MUTEX_HANDLE = None
 
 PORT_DEFAULT = 5002
+
+
+class _LoggerStream:
+    def __init__(self,logger,level):self.logger=logger;self.level=level
+    def write(self,message):
+        value=str(message).rstrip()
+        if value:self.logger.log(self.level,value)
+    def flush(self):pass
+
+
+def _configure_rotating_output(path: str) -> None:
+    target=os.path.abspath(path);os.makedirs(os.path.dirname(target),exist_ok=True)
+    logger=logging.getLogger("jarvis.chatterbox_service");logger.setLevel(logging.INFO);logger.propagate=False
+    handler=RotatingFileHandler(target,maxBytes=2_000_000,backupCount=3,encoding="utf-8");handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"));logger.handlers[:]=[handler]
+    sys.stdout=_LoggerStream(logger,logging.INFO);sys.stderr=_LoggerStream(logger,logging.ERROR)
+
+
+def _acquire_service_singleton(port: int,kernel32=None) -> bool:
+    """Hold one Windows named mutex per service port for this process lifetime."""
+    global _SERVICE_MUTEX_HANDLE
+    if os.name!="nt":return True
+    kernel32=kernel32 or ctypes.windll.kernel32
+    handle=kernel32.CreateMutexW(None,False,f"Local\\JARVIS_Chatterbox_TTS_{port}")
+    if not handle:raise ctypes.WinError()
+    if kernel32.GetLastError()==183:
+        kernel32.CloseHandle(handle);return False
+    _SERVICE_MUTEX_HANDLE=handle;return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -56,6 +88,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
 
     def do_POST(self) -> None:
+        if self.path == "/stop":
+            try:
+                if os.name == "nt":
+                    import winsound
+                    winsound.PlaySound(None, 0)
+                else:
+                    import sounddevice as sd
+                    sd.stop()
+                self._set_json(200)
+                self.wfile.write(json.dumps({"status":"ok"}).encode("utf-8"))
+            except Exception as exc:
+                self._set_json(500)
+                self.wfile.write(json.dumps({"status":"error","error":str(exc)}).encode("utf-8"))
+            return
         if self.path != "/synthesize":
             self._set_json(404)
             self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
@@ -187,8 +233,14 @@ def run_server(port: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", "-p", type=int, default=PORT_DEFAULT)
+    parser.add_argument("--log-path")
     args = parser.parse_args()
 
+    if args.log_path:_configure_rotating_output(args.log_path)
+
+    if not _acquire_service_singleton(args.port):
+        print(f"Chatterbox service already starting or running on port {args.port}.",flush=True)
+        return
     run_server(args.port)
 
 

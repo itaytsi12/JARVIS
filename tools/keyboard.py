@@ -127,7 +127,7 @@ def type_text(
         )
 
     if not text:
-        return "Nothing to type."
+        return {"success":False,"message":"Nothing to type.","error":"empty_text"}
 
     for char in text:
         _send_unicode_char(char)
@@ -135,4 +135,4 @@ def type_text(
         if delay > 0:
             time.sleep(delay)
 
-    return "Text typed successfully."
+    return {"success":True,"message":"Text typed successfully.","characters":len(text)}

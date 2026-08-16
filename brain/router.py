@@ -1,10 +1,12 @@
 import re
+import time
 
 from brain.intent_router import classify_intent
 from brain.local_planner import create_local_plan
 from tools.registry import WEBSITE_ALIASES, APP_ALIASES
 import urllib.parse
 from brain.local_intent_model import route_with_local_model
+from brain.request_intent import RequestKind, classify_request_kind
 
 def looks_like_math(text: str) -> bool:
     math_pattern = r"^[\d\s\.\+\-\*\/\%\(\)]+$"
@@ -44,6 +46,57 @@ def clean_math_command(text: str) -> str:
 def route_command(command: str) -> dict:
     text = command.lower().strip()
 
+    if text.rstrip(".?!,;:") in {
+        "what are you doing",
+        "what tasks are running",
+        "are any tasks running",
+        "what is running",
+    }:
+        return {"type":"task_status"}
+
+    # Highest-priority deterministic control command. This must never reach an
+    # intent model because it exists specifically to interrupt active work.
+    if text.rstrip(".?!,;:") in {
+        "cancel",
+        "cancel that",
+        "stop that",
+        "stop the current task",
+        "stop",
+        "never mind",
+    }:
+        return {"type": "cancel_read_only_task"}
+    if text.rstrip(".?!,;:") == "continue":
+        return {"type":"resume_interrupted_response"}
+    if re.fullmatch(r"(?:make it (?:much )?shorter|shorten that|only (?:tell|give) me (?:the )?(?:top )?\d+)",text.rstrip(".?!,;:")):
+        return {"type":"correct_interrupted_response","instruction":text.rstrip(".?!,;:")}
+    recipient_correction=re.fullmatch(r"(?:don't send it to \S+,\s*)?send it to (.+?) instead",text.rstrip(".?!;:"))
+    if recipient_correction:return {"type":"revise_whatsapp_recipient","recipient":recipient_correction.group(1).strip()}
+
+    # Polite wrappers do not change a concrete computer-control request into
+    # a question. Strip them only when followed by a known action verb so the
+    # existing deterministic routes remain in control.
+    text = re.sub(
+        r"^(?:can|could|would) you(?: please)?\s+(?=(?:open|launch|start|close|mute|turn|increase|decrease)\b)",
+        "",
+        text,
+    )
+    text = re.sub(r"^please\s+(?=(?:open|launch|start|close|mute|turn|increase|decrease)\b)","",text)
+    if re.match(r"^(?:open|launch|start|close|mute|turn|increase|decrease)\b",text):
+        text = re.sub(r"\s+(?:please|for me|if possible)[.?!,;:]*$","",text).strip()
+
+    # Natural browser phrasing sometimes produced by voice transcription.
+    website_on_browser = re.fullmatch(
+        r"open\s+(youtube|tiktok)(?:\s+(?:on|in)\s+(?:google|google chrome|chrome))?[.?!,;:]*",
+        text,
+    )
+    if website_on_browser:
+        website = website_on_browser.group(1)
+        return {
+            "type": "tool",
+            "tool": "open_website",
+            "arguments": {"url": WEBSITE_ALIASES[website]},
+        }
+
     # -------------------------
     # Calculator
     # -------------------------
@@ -79,6 +132,7 @@ def route_command(command: str) -> dict:
     if text in [
         "volume up",
         "turn volume up",
+        "turn the volume up",
         "increase volume",
         "תגביר",
         "תגביר ווליום"
@@ -94,6 +148,7 @@ def route_command(command: str) -> dict:
     if text in [
         "volume down",
         "turn volume down",
+        "turn the volume down",
         "decrease volume",
         "תנמיך",
         "תנמיך ווליום"
@@ -286,6 +341,26 @@ def route_command(command: str) -> dict:
         key = m_press.group(1).strip()
         return {"type": "tool", "tool": "press_key", "arguments": {"key": key}}
 
+    inspect_match=re.fullmatch(r"(?:inspect|list (?:the )?controls in|what controls are in)\s+(.+?)[.?!]?",text,re.I)
+    if inspect_match:
+        app=inspect_match.group(1).strip().lower();app=APP_ALIASES.get(app,app)
+        return {"type":"tool","tool":"inspect_window","arguments":{"app_name":app,"limit":50}}
+
+    click_match=re.fullmatch(r"click\s+(?:the\s+)?(.+?)(?:\s+(button|link|menu item))?\s+(?:in|on)\s+(.+?)[.?!]?",command.strip(),re.I)
+    if click_match:
+        name,control_type,app=click_match.groups();app=APP_ALIASES.get(app.strip().lower(),app.strip().lower())
+        arguments={"app_name":app,"name":name.strip()}
+        if control_type:arguments["control_type"]={"button":"Button","link":"Hyperlink","menu item":"MenuItem"}[control_type.lower()]
+        return {"type":"tool","tool":"click_ui_element","arguments":arguments}
+
+    # Literal typing is data, not a recursively routable command. References
+    # to prior assistant output are handled earlier by the task planner.
+    m_type = re.match(r"^(?:type|write)\s+(.+)$", command.strip(), flags=re.IGNORECASE)
+    if m_type:
+        payload=m_type.group(1).strip().rstrip(".?!")
+        if len(payload)>=2 and payload[0]==payload[-1] and payload[0] in {'"',"'"}:payload=payload[1:-1]
+        return {"type":"tool","tool":"type_text","arguments":{"text":payload,"delay":.02}}
+
     # Switch/focus to application
     m_switch = re.match(r"^(?:switch to|focus)\s+(.+)$", text, flags=re.IGNORECASE)
     if m_switch:
@@ -299,9 +374,7 @@ def route_command(command: str) -> dict:
     # Local multi-step plan
     # -------------------------
 
-    local_plan = create_local_plan(
-        command
-    )
+    local_plan = create_local_plan(text)
 
     if local_plan:
         return {
@@ -379,6 +452,25 @@ def route_command(command: str) -> dict:
             }
 
         # -------------------------
+    # Existing local time/date queries remain local and never need web search.
+    if text in ["what time is it", "what is the time", "time", "what time"]:
+        return {"type": "tool", "tool": "get_time", "arguments": {}}
+    if text in ["what is today's date", "what is the date", "what day is it", "date"]:
+        return {"type": "tool", "tool": "get_date", "arguments": {}}
+
+    # Read-only informational question path. Action-like polite requests stay
+    # with the existing local intent/action router below.
+    classification_started = time.perf_counter()
+    request_kind = classify_request_kind(command)
+    classification_ms = (time.perf_counter() - classification_started) * 1000
+    if request_kind.kind is RequestKind.QUESTION:
+        return {
+            "type": "question",
+            "message": command,
+            "confidence": request_kind.confidence,
+            "intent_classification_ms": classification_ms,
+        }
+
     # Local trained intent model
     # -------------------------
 
@@ -392,26 +484,10 @@ def route_command(command: str) -> dict:
     # AI / Intent fallback
     # -------------------------
 
-    # -------------------------
-    # Time / Date local queries
-    # -------------------------
-    if text in [
-        "what time is it",
-        "what is the time",
-        "time",
-        "what time",
-    ]:
-        return {"type": "tool", "tool": "get_time", "arguments": {}}
-
-    if text in [
-        "what is today's date",
-        "what is the date",
-        "what day is it",
-        "date",
-    ]:
-        return {"type": "tool", "tool": "get_date", "arguments": {}}
-
-
-    return classify_intent(
-        command
-    )
+    fallback=classify_intent(command)
+    fallback.setdefault("route_source","cloud_intent_router")
+    fallback.setdefault("model","gpt-5-mini")
+    fallback.setdefault("model_calls",1)
+    fallback.setdefault("fallback_from",["local_learned_classifier"])
+    fallback.setdefault("fallback_reason","no_confident_local_route")
+    return fallback

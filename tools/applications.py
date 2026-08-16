@@ -4,9 +4,11 @@ import ctypes
 import os
 import shutil
 import logging
+import json
+import threading
 from pathlib import Path
 
-from tools.window import find_application_window
+from tools.window import find_application_window,find_top_window_for_pid
 from tools.windows_process import hidden_process_kwargs
 
 
@@ -14,6 +16,33 @@ log = logging.getLogger("jarvis.applications")
 
 
 VS_CODE_ALIASES = {"vscode", "vs code", "visual studio code", "code"}
+_START_APPS_CACHE=None
+_START_APPS_CACHE_AT=0.0
+_START_APPS_LOCK=threading.Lock()
+
+
+def _start_apps_catalog() -> list[dict]:
+    global _START_APPS_CACHE,_START_APPS_CACHE_AT
+    ttl=max(0.0,float(os.getenv("JARVIS_START_APPS_CACHE_TTL","300")));now=time.monotonic()
+    with _START_APPS_LOCK:
+        if _START_APPS_CACHE is not None and now-_START_APPS_CACHE_AT<ttl:return list(_START_APPS_CACHE)
+        script="Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress"
+        result=subprocess.run(["powershell.exe","-NoProfile","-NonInteractive","-Command",script],text=True,capture_output=True,timeout=4,**hidden_process_kwargs())
+        if result.returncode or not result.stdout.strip():items=[]
+        else:
+            payload=json.loads(result.stdout);items=payload if isinstance(payload,list) else [payload]
+            items=[item for item in items if isinstance(item,dict) and item.get("Name") and item.get("AppID")]
+        _START_APPS_CACHE=list(items);_START_APPS_CACHE_AT=now;return list(items)
+
+
+def _resolve_start_app_command(app_name: str) -> list[str] | None:
+    """Resolve one exact Windows Start Apps display name without guessing."""
+    try:
+        items=_start_apps_catalog()
+        normalized=" ".join(app_name.casefold().split())
+        matches=[item for item in items if isinstance(item,dict) and " ".join(str(item.get("Name","")).casefold().split())==normalized and item.get("AppID")]
+        return ["explorer.exe",f"shell:AppsFolder\\{matches[0]['AppID']}"] if len(matches)==1 else None
+    except (OSError,subprocess.SubprocessError,ValueError,json.JSONDecodeError):return None
 
 
 def _resolve_vscode_command() -> list[str] | None:
@@ -47,6 +76,26 @@ def _resolve_vscode_command() -> list[str] | None:
     return None
 
 
+def _resolve_whatsapp_command() -> list[str] | None:
+    configured=os.getenv("JARVIS_WHATSAPP_EXE")
+    candidates=[Path(configured)] if configured else []
+    found=shutil.which("whatsapp")
+    if found:candidates.append(Path(found))
+    local=os.getenv("LOCALAPPDATA")
+    if local:candidates.extend([Path(local)/"WhatsApp"/"WhatsApp.exe",Path(local)/"Programs"/"WhatsApp"/"WhatsApp.exe"])
+    return [str(next((path for path in candidates if path.is_file()),""))] if any(path.is_file() for path in candidates) else None
+
+
+def _wait_for_visible_window(app_name,pid,timeout=6.0):
+    deadline=time.perf_counter()+timeout
+    while time.perf_counter()<deadline:
+        hwnd=find_top_window_for_pid(pid,timeout=.1) if pid else None
+        hwnd=hwnd or find_application_window(app_name)
+        if hwnd and ctypes.windll.user32.IsWindowVisible(hwnd) and not ctypes.windll.user32.IsHungAppWindow(hwnd):return hwnd
+        time.sleep(.05)
+    return None
+
+
 def open_application(app_name: str) -> dict:
     app_name = app_name.lower().strip()
 
@@ -62,15 +111,20 @@ def open_application(app_name: str) -> dict:
         "chrome": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         "edge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         "explorer": "explorer.exe",
+        "task manager": "taskmgr.exe",
+        "control panel": "control.exe",
     }
 
-    command = _resolve_vscode_command() if app_name == "vscode" else apps.get(app_name)
+    command = _resolve_vscode_command() if app_name == "vscode" else _resolve_whatsapp_command() if app_name=="whatsapp" else apps.get(app_name)
+    if not command:
+        executable=shutil.which(app_name) or shutil.which(f"{app_name}.exe")
+        command=executable or _resolve_start_app_command(app_name)
 
     if command:
         try:
             log.info("Application requested: %s; executable resolved: %s", app_name, command[0] if isinstance(command, list) else command)
             helper_kwargs = {}
-            if app_name == "vscode" and isinstance(command, list) and Path(command[0]).name.lower() in {"cmd.exe", "cmd"}:
+            if isinstance(command, list) and Path(command[0]).name.lower() in {"cmd.exe", "cmd", "powershell.exe", "powershell", "pwsh.exe", "pwsh"}:
                 helper_kwargs = hidden_process_kwargs()
             proc = subprocess.Popen(command, **helper_kwargs)
             pid = None
@@ -80,13 +134,23 @@ def open_application(app_name: str) -> dict:
             except Exception:
                 pid = None
 
+            shell_activation=isinstance(command,list) and len(command)>1 and str(command[0]).lower().endswith("explorer.exe") and str(command[1]).lower().startswith("shell:appsfolder\\")
+            if shell_activation:pid=None
+
             
 
-            # Return both a human message and the pid so callers can identify the launched process.
+            hwnd=_wait_for_visible_window(app_name,pid)
+            if not hwnd:
+                return {"success":False,"verified":False,"message":f"Started {app_name}, but no responsive window appeared.","error":"application_window_unverified","pid":pid}
+
+            # Return both a human message and the process/window identity so
+            # later steps can focus the verified application instance.
             result = {
                 "success": True,
+                "verified": True,
                 "message": f"Opened {app_name} successfully.",
                 "pid": pid,
+                "hwnd": hwnd,
             }
             log.info("Application subprocess started: app=%s pid=%s", app_name, pid)
             return result
@@ -97,18 +161,21 @@ def open_application(app_name: str) -> dict:
     return {"success": False, "message": f"I don't know how to open '{app_name}' yet.", "error": "unknown_application"}
 
 
-def close_application(app_name: str) -> dict:
+def close_application(app_name: str, hwnd: int | None = None) -> dict:
     app_name = app_name.lower().strip()
 
     try:
-        hwnd = find_application_window(app_name)
+        expected_hwnd=hwnd is not None
+        hwnd = hwnd or find_application_window(app_name)
         if not hwnd:
             return {"success": False, "message": f"Could not find {app_name}.", "error": "window_not_found"}
+        if expected_hwnd and (not ctypes.windll.user32.IsWindow(hwnd) or not ctypes.windll.user32.IsWindowVisible(hwnd)):
+            return {"success":False,"verified":False,"message":f"The expected {app_name} window is no longer available.","error":"expected_window_unavailable"}
         ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
         deadline = time.perf_counter() + 3.0
         while time.perf_counter() < deadline:
             if not ctypes.windll.user32.IsWindow(hwnd):
-                return {"success": True, "message": f"Closed {app_name} successfully."}
+                return {"success": True, "verified":True,"message": f"Closed {app_name} successfully."}
             time.sleep(0.05)
         return {"success": False, "message": f"{app_name} did not close.", "error": "window_still_open"}
 

@@ -14,6 +14,7 @@ from tools.system import (
 )
 from tools.files import (
     open_known_folder,
+    open_path,
     list_files,
     exists,
     append_text_file,
@@ -43,10 +44,14 @@ from tools.ui import (
     click_at,
 )
 from tools.browser import open_website
+from tools.whatsapp import send_whatsapp_message
 from vision.screenshot import take_screenshot
 from vision.screen_analyzer import analyze_screen
 from tools.context import describe_active_window
 from tools.keyboard import type_text
+from tools.desktop_agent import click_control,get_controls
+import os
+from pathlib import Path
 import time
 from tools.window import (
     find_application_window,
@@ -132,6 +137,12 @@ def execute_tool(
         
         return result
 
+    if tool_name == "open_path":
+        return open_path(arguments["path"])
+
+    if tool_name == "send_whatsapp_message":
+        return send_whatsapp_message(arguments["recipient"],arguments["message"],arguments.get("literal",False))
+
     file_tools = {
         "create_text_file": lambda: create_text_file(arguments["path"], arguments["contents"], arguments.get("overwrite", False)),
         "read_text_file": lambda: read_text_file(arguments["path"]),
@@ -207,23 +218,33 @@ def execute_tool(
         hwnd = find_application_window(app_name)
         if hwnd:
             ok = bring_hwnd_to_foreground(hwnd)
-            return f"Focused {app_name}: {ok}"
-        return f"Could not find window for {app_name}"
+            return {"success":bool(ok),"verified":bool(ok),"hwnd":hwnd,"message":f"Focused {app_name}." if ok else f"Windows refused to focus {app_name}.","error":None if ok else "focus_failed"}
+        return {"success":False,"message":f"Could not find window for {app_name}.","error":"window_not_found"}
 
     if tool_name == "analyze_screen":
-        screenshot_path = take_screenshot()
+        screenshot = take_screenshot()
 
-        result = analyze_screen(
-            screenshot_path,
-            arguments["question"]
-        )
-        
-        return result
+        if not screenshot.get("success"):
+            return screenshot
+
+        try:
+            result = analyze_screen(screenshot["path"],arguments["question"])
+            result["screenshot_retained"]=os.getenv("JARVIS_KEEP_ANALYSIS_SCREENSHOTS","false").lower() in {"1","true","yes","on"}
+            return result
+        finally:
+            if os.getenv("JARVIS_KEEP_ANALYSIS_SCREENSHOTS","false").lower() not in {"1","true","yes","on"}:
+                Path(screenshot["path"]).unlink(missing_ok=True)
 
     if tool_name == "active_window":
         result = describe_active_window()
         
         return result
+
+    if tool_name == "inspect_window":
+        return get_controls(arguments["app_name"],arguments.get("limit",50))
+
+    if tool_name == "click_ui_element":
+        return click_control(arguments["app_name"],arguments["name"],arguments.get("control_type"))
 
     if tool_name == "type_text":
         result = type_text(
@@ -251,6 +272,4 @@ def execute_tool(
         
         return result
 
-    return (
-        f"Unknown tool: {tool_name}"
-    )
+    return {"success":False,"message":f"Unknown tool: {tool_name}","error":"unknown_tool"}

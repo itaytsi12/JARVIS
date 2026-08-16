@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 from scripts import autostart
 from voice.background_assistant import AssistantState
 from voice.single_instance import SingleInstance
-from voice.tray_app import TrayApplication, tray_title
+from voice.tray_app import STATE_COLORS,TrayApplication,make_icon,tray_title
 from tools.windows_process import hidden_process_kwargs
 
 
@@ -36,6 +36,18 @@ class AutostartTests(unittest.TestCase):
 
 
 class TrayActionTests(unittest.TestCase):
+    def test_every_tray_state_has_transparent_corners_colored_circle_and_white_j(self):
+        from PIL import ImageColor
+        for state,color in STATE_COLORS.items():
+            with self.subTest(state=state):
+                image=make_icon(state)
+                self.assertEqual(image.getpixel((0,0))[3],0)
+                self.assertIn(ImageColor.getrgb(color),[pixel[:3] for pixel in image.get_flattened_data() if pixel[3]])
+                center=list(image.crop((18,8,46,56)).get_flattened_data())
+                self.assertGreater(sum(pixel[:3]==(255,255,255) and pixel[3]>0 for pixel in center),40)
+        disabled=make_icon(AssistantState.IDLE,disabled=True)
+        self.assertIn((119,119,119),[pixel[:3] for pixel in disabled.get_flattened_data() if pixel[3]])
+
     def test_windows_tooltip_is_bounded(self):
         self.assertLessEqual(len(tray_title(AssistantState.ERROR, "x" * 500)), 127)
 

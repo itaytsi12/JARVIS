@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from urllib.parse import quote_plus
 
 from brain.models import Action, ActionRisk, Plan
 from brain.session_context import SessionContext
-from tools.files import get_desktop_path
+from tools.files import get_desktop_path,get_documents_path
 from tools.registry import APP_ALIASES, WEBSITE_ALIASES
 
 
@@ -20,6 +21,172 @@ def _desktop_path(filename: str) -> str:
 
 def _clean(value: str) -> str:
     return value.strip(" \t\r\n,.;!?'\"")
+
+
+_COMMAND_START = r"(?:open|launch|start|play|type|write|save|close|quit|go\s+to|search|press|hit|click|maximize|minimize|switch|focus|send|message|tell|create|rename|move|read)"
+_TEXT_REFERENCES = re.compile(
+    r"^(?:exactly\s+)?(?:what you(?: just| last)? said|what you(?: just| last)? told me|your last (?:answer|response)|the previous (?:answer|response)|your previous (?:answer|response)|the last thing you said|that|the last thing)$",
+    re.I,
+)
+
+
+def segment_sequential_commands(text: str) -> list[str]:
+    """Split clear imperative sequences while protecting quoted payloads."""
+    mask=list(text);quote=None;escaped=False
+    for index,char in enumerate(text):
+        if escaped:mask[index]=" ";escaped=False;continue
+        if char=="\\" and quote:mask[index]=" ";escaped=True;continue
+        if char in {'"',"'"}:
+            quote=None if quote==char else char if quote is None else quote
+            mask[index]=" ";continue
+        if quote:mask[index]=" "
+    visible="".join(mask)
+    connector=re.compile(
+        rf"(?:\s+and\s+then\s+|\s+then\s+|\s+after\s+that\s+|\s+next\s+|\s+and\s+|,\s*(?:then\s+|next\s+)?)(?={_COMMAND_START}\b)",
+        re.I,
+    )
+    parts=[];start=0
+    for match in connector.finditer(visible):
+        part=text[start:match.start()].strip(" ,")
+        if part:parts.append(part)
+        start=match.end()
+    tail=text[start:].strip(" ,")
+    if tail:parts.append(tail)
+    return parts
+
+
+def _literal_payload(value: str) -> str:
+    value=value.strip()
+    if len(value)>=2 and value[0]==value[-1] and value[0] in {'"',"'"}:return value[1:-1]
+    return value.rstrip(".?!")
+
+
+def _type_payload(value: str, context: SessionContext):
+    """Parse type/write data, preserving quoted references as literal text."""
+    raw = value.strip()
+    quoted_match = re.fullmatch(r'''(["'])(.*)\1[.?!]?''', raw, re.S)
+    quoted = quoted_match is not None
+    payload = quoted_match.group(2) if quoted_match else _literal_payload(raw)
+    detected_reference = payload if not quoted and _TEXT_REFERENCES.fullmatch(payload) else None
+    trace = {"type_payload_before_reference_resolution": payload, "quoted_literal": quoted, "detected_reference_phrase": detected_reference}
+    if detected_reference:
+        resolved = context.resolve_text_reference(payload)
+        trace["reference_resolution_result"] = resolved
+        trace["reference_source"] = "last_spoken_response" if resolved is not None and resolved==context.last_spoken_response and payload.lower().removeprefix("exactly ") in {"what you said","what you just said","what you last said","what you told me","what you just told me","what you last told me","the last thing you said"} else "last_assistant_response" if resolved is not None else None
+        if resolved is None:
+            return None, trace
+        return resolved, trace
+    trace["reference_resolution_result"] = None
+    return payload, trace
+
+
+def _whatsapp_parts(segment:str,context:SessionContext):
+    patterns=[r"^(?:send|message)\s+(.+?)\s+on\s+whatsapp\s*(?::|that\s+)?\s*(.+)$",r"^(?:send|message)\s+(.+?)\s*:\s*(.+)$",r"^(?:send|message|tell)\s+(\S+)\s+(.+)$"]
+    for pattern in patterns:
+        match=re.match(pattern,segment,re.I)
+        if not match:continue
+        recipient=_clean(match.group(1));raw=match.group(2).strip();literal=(len(raw)>=2 and raw[0]==raw[-1] and raw[0] in {'"',"'"}) or raw.lower().startswith("exactly:")
+        if recipient.lower()=="me":return None
+        if raw.lower().startswith("exactly:"):raw=raw.split(":",1)[1].strip()
+        payload=raw[1:-1] if len(raw)>=2 and raw[0]==raw[-1] and raw[0] in {'"',"'"} else raw
+        if recipient.lower() in {"him","her","them","that person","the same person"}:
+            if not context.last_messaging_recipient:return recipient,None,{"clarification":"I don't have a recent WhatsApp recipient to use."},False
+            recipient=context.last_messaging_recipient
+        reference_candidate=payload.rstrip(".?!")
+        if _TEXT_REFERENCES.fullmatch(reference_candidate):
+            resolved=context.resolve_text_reference(reference_candidate)
+            if resolved is None:return recipient,None,{"clarification":"I don't have a previous answer to send."},True
+            return recipient,resolved,{"reference":reference_candidate,"resolved_value":"<REDACTED_MESSAGE>","literal":True},True
+        return recipient,payload,{},literal
+    return None
+
+
+def _segmented_plan(text: str,context:SessionContext) -> Plan | None:
+    segmentation_started=time.perf_counter();segments=segment_sequential_commands(text);segmentation_ms=(time.perf_counter()-segmentation_started)*1000
+    if len(segments)<2:return None
+    actions=[];resolved=[];type_traces=[];reference_started=time.perf_counter()
+    for segment in segments:
+        lowered=segment.lower().strip()
+        whatsapp=_whatsapp_parts(segment,context)
+        if whatsapp:
+            recipient,payload,metadata,literal=whatsapp
+            if payload is None:return Plan(text,[],context=metadata)
+            if metadata:resolved.append(metadata)
+            actions.append(Action("send_whatsapp_message",{"recipient":recipient,"message":payload,"literal":literal},depends_on=[len(actions)-1] if actions else [],risk=ActionRisk.CAUTION,max_attempts=1,sensitive_fields={"message"}))
+            continue
+        open_match=re.match(r"^(?:open|launch|start|go\s+to)\s+(.+)$",segment,re.I)
+        if open_match:
+            target=_clean(open_match.group(1)).lower()
+            if target in WEBSITE_ALIASES:
+                actions.append(Action("open_website",{"url":WEBSITE_ALIASES[target]},depends_on=[len(actions)-1] if actions else [],max_attempts=1))
+            elif target in APP_ALIASES:
+                app=APP_ALIASES[target];open_index=len(actions);actions.append(Action("open_application",{"app_name":app},depends_on=[open_index-1] if open_index else [],verify="process_started",max_attempts=1));actions.append(Action("wait_for_window",{"app_name":app},depends_on=[open_index],verify="window_exists",max_attempts=1))
+            else:return None
+            continue
+        type_match=re.match(r"^(?:type|write)\s+(.+)$",segment,re.I)
+        if type_match:
+            payload,trace=_type_payload(type_match.group(1),context);type_traces.append(trace)
+            if payload is None:
+                return Plan(text,[],context={"clarification":"I don't have a previous answer to type.","planning_trace":{"segments":segments,"type_text":type_traces}})
+            if trace["reference_resolution_result"] is not None:
+                resolved.append({"reference":trace["type_payload_before_reference_resolution"],"resolved_value":payload})
+            actions.append(Action("type_text",{"text":payload,"delay":.02},depends_on=[len(actions)-1] if actions else [],max_attempts=1,sensitive_fields={"text"}))
+            continue
+        search_match=re.match(r"^search(?:\s+(?:google|chrome))?\s+(?:for\s+)?(.+)$",segment,re.I)
+        if search_match:
+            app=next((a.args.get("app_name") for a in reversed(actions) if a.tool=="open_application"),None) or context.active_app
+            if app!="chrome":return None
+            actions.append(Action("open_website",{"url":SEARCH_URLS["google"].format(quote_plus(_clean(search_match.group(1))))},depends_on=[len(actions)-1] if actions else [],max_attempts=1))
+            continue
+        if re.fullmatch(r"save(?:\s+(?:it|the document|the file))?",lowered.rstrip(".?!")):
+            actions.append(Action("save_current_document",{},depends_on=[len(actions)-1] if actions else [],max_attempts=1))
+            continue
+        click_match=re.match(r"^click\s+(?:the\s+)?(.+?)(?:\s+(button|link|menu item))?(?:\s+(?:in|on)\s+(.+?))?[.?!]?$",segment,re.I)
+        if click_match:
+            name,control_type,explicit_app=click_match.groups()
+            app=(explicit_app or next((a.args.get("app_name") for a in reversed(actions) if a.tool=="open_application"),None) or context.active_app)
+            if not app:return None
+            app=APP_ALIASES.get(_clean(app).lower(),_clean(app).lower());arguments={"app_name":app,"name":_clean(name)}
+            if control_type:arguments["control_type"]={"button":"Button","link":"Hyperlink","menu item":"MenuItem"}[control_type.lower()]
+            actions.append(Action("click_ui_element",arguments,depends_on=[len(actions)-1] if actions else [],max_attempts=1))
+            continue
+        close_match=re.match(r"^(?:close|quit)\s+(.+)$",segment,re.I)
+        if close_match:
+            target=_clean(close_match.group(1)).lower()
+            if target in {"it","the app"}:target=context.last_opened_app or next((a.args.get("app_name") for a in reversed(actions) if a.tool=="open_application"),None)
+            target=APP_ALIASES.get(target,target)
+            if not target:return None
+            actions.append(Action("close_application",{"app_name":target},depends_on=[len(actions)-1] if actions else [],risk=ActionRisk.CAUTION,verify="window_closed",max_attempts=1))
+            continue
+        return None
+    reference_ms=(time.perf_counter()-reference_started)*1000
+    return Plan(text,actions,context={"segments":segments,"represented_clause_count":len(segments),"resolved_references":{"items":resolved} if resolved else {},"planning_trace":{"segments":segments,"type_text":type_traces,"had_last_assistant_response":bool(context.last_assistant_response),"had_last_spoken_response":bool(context.last_spoken_response)},"segmentation_ms":segmentation_ms,"reference_resolution_ms":reference_ms,"model_calls":0,"planning_ms":segmentation_ms+reference_ms})
+
+
+def assess_plan_completeness(command:str,plan:Plan | None) -> dict:
+    clauses=segment_sequential_commands(command)
+    if not plan or not plan.actions:return {"complete":False,"clauses":clauses,"reason":"missing_local_plan"}
+    represented=plan.context.get("represented_clause_count") if isinstance(plan.context,dict) else None
+    complete=len(clauses)<=1 or represented==len(clauses)
+    return {"complete":complete,"clauses":clauses,"represented_clause_count":represented,"reason":None if complete else "incomplete_local_plan"}
+
+
+def validate_goal_coverage(goal:str,actions:list[Action]) -> list[str]:
+    """Check semantic clause and explicit app identity fidelity before execution."""
+    clauses=segment_sequential_commands(goal);errors=[];tools=[action.tool for action in actions]
+    open_clause=next((clause for clause in clauses if re.match(r"^(?:open|launch|start)\b",clause,re.I)),None)
+    if open_clause:
+        match=re.match(r"^(?:open|launch|start)(?:\s+up)?\s+(.+)$",open_clause,re.I);requested=_clean(match.group(1)).lower() if match else ""
+        expected=APP_ALIASES.get(requested,requested)
+        planned=[str(action.args.get("app_name","")).strip().lower() for action in actions if action.tool=="open_application"]
+        if requested in {"a music","music","the music"}:errors.append("app_identification_uncertain")
+        elif not planned:errors.append("missing_open_application_clause")
+        elif expected not in planned:errors.append("app_identity_mismatch")
+    for clause in clauses:
+        lowered=clause.lower()
+        if re.match(r"^play\b",lowered) and not ("type_text" in tools and any(tool in tools for tool in {"press_key","click_ui_element"})):errors.append("missing_playback_clause")
+        if re.match(r"^search\b",lowered) and not any(tool in tools for tool in {"open_website","browser_open_url","browser_type","type_text"}):errors.append("missing_search_clause")
+    return errors
 
 
 def _search_parts(text: str) -> tuple[str, str] | None:
@@ -82,15 +249,19 @@ def _app_mentions(text: str) -> list[tuple[int, str]]:
 def should_use_task_planner(command: str) -> bool:
     lowered = command.lower()
     signals = (",", " then ", " and then ", "after that", "afterwards", "finally", "once that opens")
-    goal_patterns = ("create a text file", "containing ", "first result", "first video", "switch back", "maximize it", "open the screenshots folder")
+    goal_patterns = ("create a text file", "create a file", "containing ", "first result", "first video", "switch back", "maximize it", "open the screenshots folder","file i just created","rename it","move it to documents","read that file","tell me what is inside")
     continuation = ("open the first", "go back", "go forward", "scroll down", "scroll up", "select option", "continue until verification")
-    action_connector = re.search(r"\band\s+(?:type|write|search|look|open|close|maximize|minimize|save|switch)\b", lowered)
+    action_connector = re.search(r"\band\s+(?:play|type|write|search|look|open|close|maximize|minimize|save|switch)\b", lowered)
+    local_reference = any(phrase in lowered for phrase in ("what you said","what you just said","what you last said","what you told me","what you just told me","what you last told me","your last answer","your last response","the previous answer","the previous response","your previous answer","your previous response","the last thing you said")) or re.fullmatch(r"(?:type|write)\s+(?:exactly\s+)?(?:that|the last thing)[.?!]?",lowered) is not None
     return (
         any(s in lowered for s in signals + goal_patterns)
         or (" and " in lowered and len(_app_mentions(command)) > 1)
         or (_search_parts(command) is not None and " and " in lowered)
         or any(lowered.startswith(item) for item in continuation)
         or action_connector is not None
+        or local_reference
+        or re.match(r"^(?:type|write)\s+",lowered) is not None
+        or re.match(r"^(?:send|message|tell)\s+",lowered) is not None
     )
 
 
@@ -101,6 +272,43 @@ def create_task_plan(command: str, context: SessionContext | None = None) -> Pla
     if not text:
         return None
     actions: list[Action] = []
+
+    if re.match(r"^(?:ask|find out|tell me|who|what|when|where|why|how|which)\b",text,re.I) and re.search(r"\b(?:write|type)\s+(?:the\s+)?answer\b",text,re.I):
+        return Plan(text,[],context={"clarification":"Ask me the question first, then tell me to write my last answer. I won't type an unresolved answer reference."})
+
+    empty_file=re.fullmatch(r"create\s+(?:a\s+)?(?:new\s+)?(?:text\s+)?file\s+(?:on\s+(?:my|the)\s+desktop\s+)?(?:called|named)\s+([^,\s]+)[.?!]?",text,re.I)
+    if empty_file:
+        path=_desktop_path(_clean(empty_file.group(1)))
+        return Plan(text,[Action("create_text_file",{"path":path,"contents":""},verify="file_exists",sensitive_fields={"contents"}),Action("verify_file",{"path":path,"expected_content":""},depends_on=[0],verify="file_exists")],context={"model_calls":0})
+
+    file_reference=context.last_opened_file
+    if re.fullmatch(r"open\s+(?:the\s+)?file\s+(?:i\s+)?just\s+created[.?!]?",text,re.I):
+        return Plan(text,[Action("open_path",{"path":file_reference},verify="path_opened")],context={"model_calls":0}) if file_reference else Plan(text,[],context={"clarification":"I don't have a recently created file to open."})
+    rename_match=re.fullmatch(r"rename\s+(?:it|that file|the file)\s+to\s+([^,\s]+)[.?!]?",text,re.I)
+    if rename_match:
+        return Plan(text,[Action("rename_path",{"path":file_reference,"new_name":_clean(rename_match.group(1))},risk=ActionRisk.CAUTION,max_attempts=1,verify="destination_exists")],context={"model_calls":0}) if file_reference else Plan(text,[],context={"clarification":"I don't have a recent file to rename."})
+    move_match=re.fullmatch(r"move\s+(?:it|that file|the file)\s+to\s+(?:my\s+)?documents[.?!]?",text,re.I)
+    if move_match:
+        destination=str(get_documents_path()/Path(file_reference).name) if file_reference else None
+        return Plan(text,[Action("move_path",{"source":file_reference,"destination":destination},risk=ActionRisk.CAUTION,max_attempts=1,verify="destination_exists")],context={"model_calls":0}) if file_reference else Plan(text,[],context={"clarification":"I don't have a recent file to move."})
+    if re.fullmatch(r"(?:read\s+(?:it|that file|the file)|tell me what(?:'s| is) inside (?:it|that file|the file))[.?!]?",text,re.I):
+        return Plan(text,[Action("read_text_file",{"path":file_reference},verify="file_read")],context={"model_calls":0}) if file_reference else Plan(text,[],context={"clarification":"I don't have a recent file to read."})
+
+    segmented=_segmented_plan(text,context)
+    if segmented is not None:return segmented
+
+    whatsapp=_whatsapp_parts(text,context)
+    if whatsapp:
+        recipient,payload,metadata,literal=whatsapp
+        if payload is None:return Plan(text,[],context=metadata)
+        return Plan(text,[Action("send_whatsapp_message",{"recipient":recipient,"message":payload,"literal":literal},risk=ActionRisk.CAUTION,max_attempts=1,sensitive_fields={"message"})],context={"resolved_references":{"items":[metadata]} if metadata else {},"model_calls":0})
+
+    single_type=re.match(r"^(?:type|write)\s+(.+)$",text,re.I)
+    if single_type:
+        payload,trace=_type_payload(single_type.group(1),context)
+        if payload is None:return Plan(text,[],context={"clarification":"I don't have a previous answer to type.","planning_trace":{"segments":[text],"type_text":[trace]}})
+        resolved={"items":[{"reference":trace["type_payload_before_reference_resolution"],"resolved_value":payload}]} if trace["reference_resolution_result"] is not None else {}
+        return Plan(text,[Action("type_text",{"text":payload,"delay":.02},max_attempts=1,sensitive_fields={"text"})],context={"resolved_references":resolved,"planning_trace":{"segments":[text],"type_text":[trace],"had_last_assistant_response":bool(context.last_assistant_response),"had_last_spoken_response":bool(context.last_spoken_response)},"model_calls":0})
 
     # Safe browser continuation commands resolve against the persistent session.
     if re.match(r"^(?:open|choose)\s+the\s+first\s+(?:one|result|video)", lowered):
@@ -127,7 +335,7 @@ def create_task_plan(command: str, context: SessionContext | None = None) -> Pla
         return Plan(text, [
             Action("browser_open_url", {"url": url}, verify="url_loaded"),
             Action("browser_click", {"target": "Login", "kind": "link"}, depends_on=[0]),
-            Action("browser_type", {"target": "Username", "text": username}, depends_on=[1]),
+            Action("browser_type", {"target": "Username", "text": username}, depends_on=[1], sensitive_fields={"text"}),
             Action("browser_type", {"target": "Password", "text": password}, depends_on=[1], sensitive_fields={"text"}),
             Action("browser_click", {"target": "Log in", "kind": "button"}, depends_on=[2, 3], risk=ActionRisk.CAUTION),
         ])
@@ -138,7 +346,7 @@ def create_task_plan(command: str, context: SessionContext | None = None) -> Pla
         path = _desktop_path(_clean(file_goal.group(1)))
         contents = _clean(file_goal.group(2)).replace(", ", "\n").replace(" and ", "\n")
         return Plan(text, [
-            Action("create_text_file", {"path": path, "contents": contents}, verify="file_exists"),
+            Action("create_text_file", {"path": path, "contents": contents}, verify="file_exists", sensitive_fields={"contents"}),
             Action("verify_file", {"path": path}, depends_on=[0]),
         ])
 
@@ -156,7 +364,7 @@ def create_task_plan(command: str, context: SessionContext | None = None) -> Pla
     for _, app in app_mentions:
         open_index = len(actions)
         actions.append(Action("open_application", {"app_name": app}, verify="process_started"))
-        actions.append(Action("wait_for_window", {"app_name": app}, depends_on=[open_index], verify="window_exists"))
+        actions.append(Action("wait_for_window", {"app_name": app}, depends_on=[open_index], verify="window_exists", max_attempts=1))
 
     # Browser goals use a persistent semantic browser session.
     if search:
@@ -173,12 +381,12 @@ def create_task_plan(command: str, context: SessionContext | None = None) -> Pla
 
     typed = _extract_type_text(text)
     if typed:
-        actions.append(Action("type_text", {"text": typed, "delay": 0.02}, depends_on=[len(actions)-1] if actions else []))
+        actions.append(Action("type_text", {"text": typed, "delay": 0.02}, depends_on=[len(actions)-1] if actions else [], sensitive_fields={"text"}))
 
     save_match = re.search(r"save\s+(?:it\s+)?(?:(?:to\s+(?:(?:my|the)\s+)?desktop\s+)?as|to\s+(?:(?:my|the)\s+)?desktop\s+as)\s+([^,\s]+)", text, re.I)
     if save_match:
         path = _desktop_path(_clean(save_match.group(1)))
-        actions.append(Action("write_text_file", {"path": path, "contents": typed or ""}, depends_on=[len(actions)-1] if actions else [], verify="file_exists"))
+        actions.append(Action("write_text_file", {"path": path, "contents": typed or ""}, depends_on=[len(actions)-1] if actions else [], verify="file_exists", sensitive_fields={"contents"}))
         actions.append(Action("verify_file", {"path": path, "expected_content": typed or ""}, depends_on=[len(actions)-1]))
 
     if re.search(r"\bmaximize\s+(?:it|the app|chrome|notepad|vscode)\b", lowered):

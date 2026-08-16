@@ -1,9 +1,16 @@
 import unittest
 
-from brain.task_planner import create_task_plan, should_use_task_planner
+from brain.task_planner import assess_plan_completeness,create_task_plan,should_use_task_planner,validate_goal_coverage
 
 
 class PlannerTests(unittest.TestCase):
+    def test_question_result_chaining_never_types_unresolved_literal_payload(self):
+        for command in ("Ask who created Minecraft, write the answer in Notepad, then open YouTube.","Who created Minecraft? Write the answer in Notepad, then open YouTube."):
+            with self.subTest(command=command):
+                plan=create_task_plan(command)
+                self.assertEqual(plan.actions,[])
+                self.assertIn("Ask me the question first",plan.context["clarification"])
+
     def tools(self, goal):
         plan = create_task_plan(goal)
         self.assertIsNotNone(plan, goal)
@@ -26,6 +33,7 @@ class PlannerTests(unittest.TestCase):
             "Open Calculator, then open Notepad and type calculation complete.": ["open_application", "wait_for_window", "open_application", "wait_for_window", "type_text"],
             "Search YouTube for rock and roll.": ["browser_open_url"],
             "Search Google for black and white wallpapers.": ["browser_open_url"],
+            "Open Notepad, then click the Save button.": ["open_application","wait_for_window","click_ui_element"],
         }
         for goal, expected in cases.items():
             with self.subTest(goal=goal):
@@ -43,6 +51,24 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(should_use_task_planner("Open YouTube and search for Jude Law"))
         self.assertTrue(should_use_task_planner("Open Notepad and type hello world"))
 
+    def test_music_playback_local_plan_is_detected_as_incomplete(self):
+        for goal in ("Open Apple Music and play I Love It","Open Spotify and play I Love It"):
+            with self.subTest(goal=goal):
+                plan=create_task_plan(goal)
+                self.assertTrue(should_use_task_planner(goal));self.assertFalse(assess_plan_completeness(goal,plan)["complete"])
+                self.assertNotEqual([action.args.get("app_name") for action in plan.actions if action.tool=="open_application"],["Groove Music"])
+
+    def test_chrome_search_remains_complete_and_local(self):
+        goal="Open Chrome and search for Minecraft";plan=create_task_plan(goal)
+        self.assertEqual([action.tool for action in plan.actions],["open_application","wait_for_window","open_website"])
+        self.assertTrue(assess_plan_completeness(goal,plan)["complete"]);self.assertIn("Minecraft",plan.actions[-1].args["url"])
+
+    def test_goal_coverage_rejects_wrong_app_and_partial_playback(self):
+        from brain.models import Action
+        goal="Open Apple Music and play I Love It"
+        self.assertIn("app_identity_mismatch",validate_goal_coverage(goal,[Action("open_application",{"app_name":"Groove Music"}),Action("type_text",{"text":"I Love It"}),Action("press_key",{"key":"enter"})]))
+        self.assertIn("missing_playback_clause",validate_goal_coverage(goal,[Action("open_application",{"app_name":"apple music"})]))
+
     def test_adversarial_phrasings(self):
         cases = {
             "Could you open YouTube and look up Jude Law for me?": ["browser_open_url"],
@@ -59,6 +85,10 @@ class PlannerTests(unittest.TestCase):
                 self.assertEqual(self.tools(goal), expected)
         pronoun_plan = create_task_plan("I want to see some Jude Law videos. Open YouTube and search for him.")
         self.assertIn("Jude+Law", pronoun_plan.actions[0].args["url"])
+
+    def test_semantic_click_reuses_opened_app_and_dependency(self):
+        plan=create_task_plan("Open Notepad, then click the Save button.")
+        click=plan.actions[-1];self.assertEqual(click.args,{"app_name":"notepad","name":"Save","control_type":"Button"});self.assertEqual(click.depends_on,[1]);self.assertEqual(plan.context["model_calls"],0)
 
 
 if __name__ == "__main__":

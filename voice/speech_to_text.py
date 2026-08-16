@@ -10,9 +10,11 @@ If faster-whisper is not installed, the module raises ImportError when used.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Optional
 
 _MODEL = None
+_MODEL_LOCK = threading.Lock()
 _AVAILABLE = True
 
 try:
@@ -29,6 +31,15 @@ def _get_model(model_size: Optional[str] = None):
 		raise ImportError("faster-whisper is not installed")
 
 	if _MODEL is None:
+		with _MODEL_LOCK:
+			if _MODEL is not None:
+				return _MODEL
+			_MODEL = _create_model(model_size)
+
+	return _MODEL
+
+
+def _create_model(model_size: Optional[str] = None):
 		# Default to an English-optimized small model for better English accuracy
 		# while keeping CPU-friendly performance.
 		model_size = model_size or os.getenv("WHISPER_MODEL", "small.en")
@@ -38,29 +49,35 @@ def _get_model(model_size: Optional[str] = None):
 		# by setting WHISPER_COMPUTE_TYPE or WHISPER_MODEL environment variables.
 		compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 
-		created = False
+		model = None
 		try:
-			_MODEL = WhisperModel(model_size, device="cpu", compute_type=compute_type)
-			created = True
+			# Avoid a network/cache metadata check on the common installed-model path.
+			# A normal lookup remains the fallback so first-time setup still works.
+			model = WhisperModel(model_size, device="cpu", compute_type=compute_type, local_files_only=True)
 		except Exception as e:
-			# If CPU init fails, try auto as a last resort and provide an
-			# informative error if both fail.
 			try:
-				_MODEL = WhisperModel(model_size, device="auto", compute_type=compute_type)
-				created = True
+				model = WhisperModel(model_size, device="cpu", compute_type=compute_type)
 			except Exception as e2:
-				raise RuntimeError(
-					"Failed to initialize faster-whisper model. "
-					"CPU attempt error: %s. Auto attempt error: %s. "
-					"Set WHISPER_MODEL to a smaller model (e.g. tiny.en) or install required dependencies." % (e, e2)
-				)
+				try:
+					model = WhisperModel(model_size, device="auto", compute_type=compute_type)
+				except Exception as e3:
+					raise RuntimeError(
+						"Failed to initialize faster-whisper model. "
+						"Local CPU error: %s. CPU error: %s. Auto error: %s. "
+						"Set WHISPER_MODEL to a smaller model (e.g. tiny.en) or install required dependencies." % (e, e2, e3)
+					)
 
 		# Print a concise startup message once when the model is first created.
-		if created:
+		if model is not None:
 			print(f"[STT] Whisper model: {model_size}")
 			print("[STT] Language: English")
 
-	return _MODEL
+		return model
+
+
+def warm_up() -> None:
+	"""Load the configured model once without transcribing audio."""
+	_get_model()
 
 
 def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
@@ -75,6 +92,7 @@ def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
 		path,
 		language="en",
 		task="transcribe",
+		initial_prompt="Jarvis commands may include: Open Notepad. Type exactly what you last told me. Type exactly what you just said. Then open YouTube.",
 		beam_size=5,
 		temperature=0.0,
 		vad_filter=True,

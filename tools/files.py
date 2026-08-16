@@ -3,6 +3,7 @@ from pathlib import Path
 import os
 import shutil
 import ctypes
+import time
 from uuid import UUID
 
 
@@ -23,15 +24,45 @@ def get_desktop_path() -> Path:
 	return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop"
 
 
-def open_known_folder(name: str) -> str:
+def get_documents_path() -> Path:
+	if os.name == "nt":
+		folder_id = UUID("FDD39AD0-238F-46AF-ADB4-6C85480369C7")
+		guid = (ctypes.c_ubyte * 16).from_buffer_copy(folder_id.bytes_le)
+		path_pointer = ctypes.c_wchar_p()
+		result = ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(path_pointer))
+		if result == 0 and path_pointer.value:
+			try:return Path(path_pointer.value)
+			finally:ctypes.windll.ole32.CoTaskMemFree(path_pointer)
+	return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents"
+
+
+def open_path(path: str) -> dict:
+	p = Path(path).expanduser().resolve()
+	if not p.exists():return {"success":False,"message":"The requested path does not exist.","path":str(p),"error":"path_not_found"}
+	try:
+		os.startfile(str(p))
+		if p.suffix.casefold()==".txt":
+			from tools.window import find_application_windows
+			deadline=time.perf_counter()+6;user32=ctypes.windll.user32
+			while time.perf_counter()<deadline:
+				for hwnd in find_application_windows("notepad"):
+					length=user32.GetWindowTextLengthW(hwnd);title=ctypes.create_unicode_buffer(length+1);user32.GetWindowTextW(hwnd,title,length+1)
+					if p.name.casefold() in title.value.casefold():return {"success":True,"verified":True,"message":f"Opened {p.name}.","path":str(p),"hwnd":hwnd}
+				time.sleep(.05)
+			return {"success":False,"verified":False,"message":f"Started opening {p.name}, but no matching Notepad window appeared.","path":str(p),"error":"path_window_unverified"}
+		return {"success":True,"verified":False,"message":f"Opened {p.name}; the associated application was not independently verified.","path":str(p)}
+	except Exception as exc:return {"success":False,"message":f"Failed to open {p.name}.","path":str(p),"error":str(exc)}
+
+
+def open_known_folder(name: str) -> dict:
 	name = name.lower().strip()
 
 	user = os.path.expanduser("~")
 
 	mapping = {
 		"downloads": Path(user) / "Downloads",
-		"documents": Path(user) / "Documents",
-		"desktop": Path(user) / "Desktop",
+		"documents": get_documents_path(),
+		"desktop": get_desktop_path(),
 		"pictures": Path(user) / "Pictures",
 		"music": Path(user) / "Music",
 		"videos": Path(user) / "Videos",
@@ -40,13 +71,13 @@ def open_known_folder(name: str) -> str:
 	path = mapping.get(name)
 
 	if not path:
-		return f"Unknown known folder: {name}"
+		return {"success":False,"message":f"Unknown known folder: {name}","error":"unknown_folder"}
 
 	try:
 		os.startfile(str(path))
-		return f"Opened {name} folder."
+		return {"success":True,"message":f"Opened {name} folder.","path":str(path)}
 	except Exception as e:
-		return f"Failed to open {name}: {e}"
+		return {"success":False,"message":f"Failed to open {name}.","error":str(e)}
 
 
 def list_files(path: str) -> dict:
@@ -60,12 +91,12 @@ def list_files(path: str) -> dict:
 
 	items = [str(x.name) for x in p.iterdir()]
 
-	return {"success": True, "path": str(p), "items": items}
+	return {"success": True,"verified":True, "path": str(p), "items": items}
 
 
 def exists(path: str) -> dict:
 	p = Path(path).expanduser()
-	return {"exists": p.exists(), "path": str(p)}
+	return {"success":True,"verified":True,"exists": p.exists(), "path": str(p)}
 
 
 def create_text_file(path: str, contents: str, overwrite: bool = False) -> dict:
@@ -74,14 +105,15 @@ def create_text_file(path: str, contents: str, overwrite: bool = False) -> dict:
 		return {"success": False, "error": "File already exists; overwrite was not approved.", "path": str(p)}
 	p.parent.mkdir(parents=True, exist_ok=True)
 	p.write_text(contents, encoding="utf-8")
-	return {"success": True, "message": f"Created {p}.", "path": str(p), "bytes": p.stat().st_size}
+	return {"success": True, "verified": True, "message": f"Created {p}.", "path": str(p), "bytes": p.stat().st_size}
 
 
 def read_text_file(path: str) -> dict:
 	p = Path(path).expanduser().resolve()
 	if not p.is_file():
 		return {"success": False, "error": "File does not exist.", "path": str(p)}
-	return {"success": True, "path": str(p), "contents": p.read_text(encoding="utf-8")}
+	contents = p.read_text(encoding="utf-8")
+	return {"success": True, "verified": True, "path": str(p), "contents": contents, "message": contents}
 
 
 def write_text_file(path: str, contents: str, overwrite: bool = False) -> dict:
@@ -94,7 +126,8 @@ def append_text_file(path: str, contents: str) -> dict:
 		return {"success": False, "error": "File does not exist.", "path": str(p)}
 	with p.open("a", encoding="utf-8") as stream:
 		stream.write(contents)
-	return {"success": True, "message": f"Appended to {p}.", "path": str(p)}
+	verified=p.read_text(encoding="utf-8").endswith(contents)
+	return {"success": verified,"verified":verified,"message": f"Appended to {p}." if verified else "Append verification failed.", "path": str(p),"error":None if verified else "content_mismatch"}
 
 
 def verify_file(path: str, expected_content: str | None = None) -> dict:
@@ -108,7 +141,7 @@ def verify_file(path: str, expected_content: str | None = None) -> dict:
 			return {"success": False, "message": "File content verification failed.", "path": str(p), "error": str(exc)}
 		if actual_content != expected_content:
 			return {"success": False, "message": "File content did not match.", "path": str(p), "error": "content_mismatch"}
-	return {"success": True, "message": f"Verified {p}.", "path": str(p), "error": None}
+	return {"success": True, "verified": True, "message": f"Verified {p}.", "path": str(p), "error": None}
 
 
 def rename_path(path: str, new_name: str) -> dict:
@@ -117,7 +150,8 @@ def rename_path(path: str, new_name: str) -> dict:
 	if target.exists():
 		return {"success": False, "error": "Destination already exists."}
 	p.rename(target)
-	return {"success": True, "path": str(target), "message": f"Renamed to {target.name}."}
+	verified=target.exists() and not p.exists()
+	return {"success":verified,"verified":verified,"path":str(target),"message":f"Renamed to {target.name}." if verified else "Rename verification failed.","error":None if verified else "verification_failed"}
 
 
 def copy_path(source: str, destination: str) -> dict:
@@ -125,7 +159,8 @@ def copy_path(source: str, destination: str) -> dict:
 	if dst.exists():
 		return {"success": False, "error": "Destination already exists."}
 	shutil.copy2(src, dst)
-	return {"success": True, "path": str(dst), "message": f"Copied to {dst}."}
+	verified=dst.exists() and src.exists()
+	return {"success":verified,"verified":verified,"path":str(dst),"message":f"Copied to {dst}." if verified else "Copy verification failed.","error":None if verified else "verification_failed"}
 
 
 def move_path(source: str, destination: str) -> dict:
@@ -133,13 +168,14 @@ def move_path(source: str, destination: str) -> dict:
 	if dst.exists():
 		return {"success": False, "error": "Destination already exists."}
 	shutil.move(str(src), str(dst))
-	return {"success": True, "path": str(dst), "message": f"Moved to {dst}."}
+	verified=dst.exists() and not src.exists()
+	return {"success":verified,"verified":verified,"path":str(dst),"message":f"Moved to {dst}." if verified else "Move verification failed.","error":None if verified else "verification_failed"}
 
 
 def find_file(path: str, name: str) -> dict:
 	root = Path(path).expanduser().resolve()
 	matches = [str(item) for item in root.rglob(name)][:100]
-	return {"success": True, "path": str(root), "items": matches}
+	return {"success": True,"verified":True, "path": str(root), "items": matches}
 
 
 def search_text(path: str, query: str) -> dict:
@@ -153,7 +189,7 @@ def search_text(path: str, query: str) -> dict:
 				if query.lower() in line.lower():
 					matches.append({"path": str(item), "line": line_number, "text": line[:200]})
 					if len(matches) >= 100:
-						return {"success": True, "matches": matches}
+						return {"success": True,"verified":True, "matches": matches}
 		except (UnicodeDecodeError, OSError):
 			continue
-	return {"success": True, "matches": matches}
+	return {"success": True,"verified":True, "matches": matches}

@@ -101,3 +101,9 @@ models/wake_word/silero_vad.onnx
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Runtime memory database
+data/*.sqlite3
+data/*.sqlite3-wal
+data/*.sqlite3-shm
+exports/*.jsonl

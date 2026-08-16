@@ -82,10 +82,14 @@ def parse_local_action(text: str) -> Action | None:
     )
 
     if match:
+        target=match.group(1).strip().rstrip(".?!,;:")
+        key=target.lower()
+        if key in WEBSITE_ALIASES:
+            return Action(tool="open_website",args={"url":WEBSITE_ALIASES[key]})
         return Action(
             tool="open_application",
             args={
-                "app_name": match.group(1).strip()
+                "app_name": APP_ALIASES.get(key,key)
             }
         )
 

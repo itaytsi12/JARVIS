@@ -14,6 +14,7 @@ WEBSITE_ALIASES: Dict[str, str] = {
     "spotify web": "https://open.spotify.com",
     "netflix": "https://www.netflix.com",
     "twitch": "https://www.twitch.tv",
+    "tiktok": "https://www.tiktok.com",
     "amazon": "https://www.amazon.com",
 }
 
@@ -40,4 +41,7 @@ APP_ALIASES: Dict[str, str] = {
     "edge": "edge",
     "spotify": "spotify",
     "discord": "discord",
+    "whatsapp": "whatsapp",
+    "whats app": "whatsapp",
+    "apple music": "apple music",
 }

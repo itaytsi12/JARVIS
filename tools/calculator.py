@@ -46,16 +46,16 @@ def _evaluate(node):
     raise ValueError("Unsupported expression")
 
 
-def calculate(expression: str) -> str:
+def calculate(expression: str) -> dict:
     try:
         tree = ast.parse(expression, mode="eval")
 
         result = _evaluate(tree.body)
 
-        return str(result)
+        return {"success":True,"verified":True,"message":str(result),"value":result}
 
     except ZeroDivisionError:
-        return "You can't divide by zero."
+        return {"success":False,"message":"You can't divide by zero.","error":"division_by_zero"}
 
     except Exception:
-        return "Invalid calculation."
+        return {"success":False,"message":"Invalid calculation.","error":"invalid_expression"}

@@ -3,7 +3,10 @@
 from __future__ import annotations
 import importlib
 import os
+import threading
+import time
 from typing import Optional
+from brain.resource_locks import acquire_action_resource
 
 _pyttsx3 = None
 _engine = None
@@ -11,6 +14,7 @@ _pyttsx3_available = False
 _chatterbox_provider = None
 _chatterbox_available = False
 _openai_provider = None
+_SPEAKER_LOCK=threading.Lock()
 
 try:
 	_openai_provider = importlib.import_module('voice.tts.openai_tts')
@@ -103,18 +107,29 @@ def _provider_label(provider: str) -> str:
 def start_background() -> None:
 	"""Warm local TTS when appropriate and announce the selected provider."""
 	configured = _configured_provider()
-	if configured in {"auto", "chatterbox"} and _chatterbox_available and _chatterbox_provider is not None:
+	warm_auto=os.getenv("JARVIS_CHATTERBOX_WARM_AUTO","false").lower() in {"1","true","yes","on"}
+	if (configured == "chatterbox" or configured=="auto" and warm_auto) and _chatterbox_available and _chatterbox_provider is not None:
 		_chatterbox_provider.start_service_background()
 	print(f"TTS provider: {_provider_label(_active_provider())}")
 
 
-def speak(text: str, max_speech_chars: int = 300, lang: Optional[str] = None) -> None:
+def speak(text: str, max_speech_chars: int = 300, lang: Optional[str] = None) -> dict:
+	started=time.perf_counter()
+	with acquire_action_resource("speak_response") as resource_info:
+		with _SPEAKER_LOCK:
+			wait_ms=(time.perf_counter()-started)*1000
+			result=_speak_unlocked(text,max_speech_chars,lang)
+			result["resource"]="speaker";result["resource_wait_ms"]=round(wait_ms,3);result["cross_process_lock"]=bool(resource_info.get("cross_process"))
+			return result
+
+
+def _speak_unlocked(text: str, max_speech_chars: int = 300, lang: Optional[str] = None) -> dict:
 	"""Speak locally with Chatterbox, using pyttsx3 only on failure.
 
 	For long texts, speak a short summary and leave full text for the terminal.
 	"""
 	if not text:
-		return
+		return {"success":False,"provider":None,"error":"empty_text","spoken_chars":0}
 
 	if len(text) > max_speech_chars:
 		short = text[:max_speech_chars].rsplit(' ', 1)[0]
@@ -123,27 +138,43 @@ def speak(text: str, max_speech_chars: int = 300, lang: Optional[str] = None) ->
 	else:
 		to_speak = text
 
+	attempted=[]
 	for provider in _provider_order():
 		if provider == "chatterbox" and _chatterbox_available and _chatterbox_provider is not None:
+			attempted.append(provider)
 			try:
 				_chatterbox_provider.speak(to_speak, lang=lang or 'en')
-				return
+				return {"success":True,"provider":"chatterbox","spoken_chars":len(to_speak),"attempted_providers":attempted,"fallback_from":attempted[:-1]}
 			except Exception as e:
 				print(f"Chatterbox TTS failed: {e} -- falling back to pyttsx3")
 		elif provider == "openai" and _openai_is_available():
+			attempted.append(provider)
 			try:
 				_openai_provider.speak(to_speak)
-				return
+				return {"success":True,"provider":"openai","spoken_chars":len(to_speak),"attempted_providers":attempted,"fallback_from":attempted[:-1]}
 			except Exception as e:
 				print(f"OpenAI TTS failed: {e} -- trying local speech")
 		elif provider == "pyttsx3" and _pyttsx3_available:
+			attempted.append(provider)
 			engine = _init_pyttsx3()
 			if engine is not None:
 				engine.say(to_speak)
 				engine.runAndWait()
-				return
+				return {"success":True,"provider":"pyttsx3","spoken_chars":len(to_speak),"attempted_providers":attempted,"fallback_from":attempted[:-1]}
 
 	# Last resort: print
 	print(f"(TTS unavailable) Jarvis: {text}")
+	return {"success":False,"provider":None,"error":"tts_unavailable","spoken_chars":0,"attempted_providers":attempted,"fallback_from":attempted}
+
+
+def stop() -> None:
+	"""Stop current playback without disabling future speech."""
+	if _openai_provider is not None and hasattr(_openai_provider,"stop"):
+		_openai_provider.stop()
+	if _chatterbox_provider is not None and hasattr(_chatterbox_provider,"stop"):
+		_chatterbox_provider.stop()
+	if _engine is not None:
+		try:_engine.stop()
+		except Exception:pass
 
 

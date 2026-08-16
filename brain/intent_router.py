@@ -14,6 +14,30 @@ client = OpenAI(
 
 TOOLS = [
     {
+        "type":"function","name":"wait_for_window","description":"Wait for a previously opened Windows application to expose a visible responsive window.",
+        "parameters":{"type":"object","properties":{"app_name":{"type":"string"}},"required":["app_name"],"additionalProperties":False},"strict":True
+    },
+    {
+        "type":"function","name":"click_ui_element","description":"Click one uniquely named visible UI element in a verified open application.",
+        "parameters":{"type":"object","properties":{"app_name":{"type":"string"},"name":{"type":"string"},"control_type":{"type":"string"}},"required":["app_name","name","control_type"],"additionalProperties":False},"strict":True
+    },
+    {
+        "type":"function","name":"press_key","description":"Press a key or keyboard shortcut in the verified active application.",
+        "parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":False},"strict":True
+    },
+    {
+        "type":"function",
+        "name":"inspect_window",
+        "description":"Read a bounded list of accessibility controls from an open Windows application. This does not click or type.",
+        "parameters":{
+            "type":"object",
+            "properties":{"app_name":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100}},
+            "required":["app_name","limit"],
+            "additionalProperties":False
+        },
+        "strict":True
+    },
+    {
         "type": "function",
         "name": "open_application",
         "description": "Open a Windows application.",
@@ -167,25 +191,36 @@ def classify_intent(message: str):
         ],
         tools=TOOLS
     )
+    usage=getattr(response,"usage",None);usage_metadata={"input_tokens":getattr(usage,"input_tokens",0) or 0,"output_tokens":getattr(usage,"output_tokens",0) or 0}
 
     actions = []
 
     for item in response.output:
         if item.type == "function_call":
+            try:arguments=json.loads(item.arguments)
+            except (TypeError,json.JSONDecodeError):arguments=None
             actions.append({
                 "tool": item.name,
-                "arguments": json.loads(item.arguments)
+                "arguments": arguments
             })
 
     if actions:
         return {
             "type": "tools",
-            "actions": actions
+            "actions": actions,
+            "route_source": "cloud_intent_router",
+            "model": "gpt-5-mini",
+            "model_calls": 1,
+            **usage_metadata,
         }
 
     return {
         "type": "ai",
-        "message": message
+        "message": message,
+        "route_source": "cloud_intent_router",
+        "model": "gpt-5-mini",
+        "model_calls": 1,
+        **usage_metadata,
     }
 
     return {

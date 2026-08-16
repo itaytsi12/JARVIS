@@ -68,6 +68,14 @@ def play_wav(path: str | Path) -> None:
     sd.wait()
 
 
+def stop() -> None:
+    try:
+        import sounddevice as sd
+        sd.stop()
+    except Exception:
+        pass
+
+
 def speak(text: str) -> None:
     if not text:
         return

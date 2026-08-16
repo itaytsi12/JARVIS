@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
+from pathlib import Path
 from typing import Any
 
 
@@ -39,15 +41,27 @@ class BrowserAgent:
                 "Browser automation requires the optional 'playwright' package."
             ) from exc
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=self.headless)
-        self.page = self._browser.new_page()
+        try:
+            executable=os.getenv("JARVIS_BROWSER_EXECUTABLE")
+            if not executable:
+                from tools.browser import _resolve_chrome
+                executable=_resolve_chrome()
+            launch_args={"headless":self.headless}
+            if executable and Path(executable).is_file():launch_args["executable_path"]=executable
+            self._browser = self._playwright.chromium.launch(**launch_args)
+            self.page = self._browser.new_page()
+        except Exception:
+            try:self._playwright.stop()
+            finally:self.page=self._browser=self._playwright=None
+            raise
 
     def close(self) -> None:
-        if self._browser:
-            self._browser.close()
-        if self._playwright:
-            self._playwright.stop()
-        self.page = self._browser = self._playwright = None
+        try:
+            if self._browser:self._browser.close()
+        finally:
+            try:
+                if self._playwright:self._playwright.stop()
+            finally:self.page = self._browser = self._playwright = None
 
     def open_url(self, url: str) -> PageState:
         self.start()
@@ -62,22 +76,33 @@ class BrowserAgent:
         target = target.strip()
         candidates = []
         if kind:
-            candidates.append(self.page.get_by_role(kind, name=target, exact=False))
+            candidates.extend([self.page.get_by_role(kind,name=target,exact=True),self.page.get_by_role(kind,name=target,exact=False)])
         candidates.extend([
+            self.page.get_by_label(target, exact=True),
             self.page.get_by_label(target, exact=False),
+            self.page.get_by_placeholder(target, exact=True),
             self.page.get_by_placeholder(target, exact=False),
+            self.page.get_by_role("button", name=target, exact=True),
             self.page.get_by_role("button", name=target, exact=False),
+            self.page.get_by_role("link", name=target, exact=True),
             self.page.get_by_role("link", name=target, exact=False),
+            self.page.get_by_text(target, exact=True),
             self.page.get_by_text(target, exact=False),
         ])
+        ambiguous=False
         for locator in candidates:
             try:
-                if locator.count() and locator.first.is_visible():
-                    return locator.first
+                visible=[locator.nth(index) for index in range(min(locator.count(),20)) if locator.nth(index).is_visible()]
+                if len(visible)==1:return visible[0]
+                if len(visible)>1:ambiguous=True
             except Exception:
                 continue
         if target.startswith(("#", ".", "[")):
-            return self.page.locator(target).first
+            locator=self.page.locator(target)
+            visible=[locator.nth(index) for index in range(min(locator.count(),20)) if locator.nth(index).is_visible()]
+            if len(visible)==1:return visible[0]
+            if len(visible)>1:raise LookupError(f"Multiple visible elements matched selector {target!r}.")
+        if ambiguous:raise LookupError(f"Multiple visible elements matched {target!r}.")
         raise LookupError(f"No visible element matched {target!r}.")
 
     def find_element(self, target: str, kind: str | None = None) -> dict[str, str]:
@@ -90,15 +115,17 @@ class BrowserAgent:
         self._check_handoff()
         return self.get_page_state()
 
-    def type_into_field(self, target: str, text: str, clear: bool = True) -> None:
+    def type_into_field(self, target: str, text: str, clear: bool = True) -> bool:
         locator = self._locator(target, "textbox")
         locator.fill(text) if clear else locator.type(text)
+        return locator.input_value(timeout=1000)==text if clear else text in locator.input_value(timeout=1000)
 
     def clear_field(self, target: str) -> None:
         self._locator(target, "textbox").fill("")
 
-    def select_option(self, target: str, option: str) -> None:
-        self._locator(target, "combobox").select_option(label=option)
+    def select_option(self, target: str, option: str) -> bool:
+        locator=self._locator(target,"combobox");selected=locator.select_option(label=option)
+        return bool(selected)
 
     def press_key(self, key: str) -> None:
         self.page.keyboard.press(key)

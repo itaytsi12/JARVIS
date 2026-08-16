@@ -7,6 +7,7 @@ from tools.window import (
     bring_hwnd_to_foreground,
     find_application_window,
 )
+from brain.resource_locks import acquire_action_resource
 
 
 class Executor:
@@ -36,6 +37,17 @@ class Executor:
         return results
 
     def execute_action(
+        self,
+        action: Action,
+    ) -> ToolResult:
+
+        try:
+            with acquire_action_resource("__action_plan__"):
+                with acquire_action_resource(action.tool):return self._execute_action_unlocked(action)
+        except Exception as e:
+            return ToolResult(False,action.tool,f"Failed to execute {action.tool}.",error=str(e))
+
+    def _execute_action_unlocked(
         self,
         action: Action,
     ) -> ToolResult:
@@ -72,17 +84,19 @@ class Executor:
                 # If the tool returned structured data (dict), preserve it in ToolResult.data
                 if isinstance(raw_result, dict):
                     return ToolResult(
-                        success=raw_result.get("success", True),
+                        success=raw_result.get("success", False),
                         tool=action.tool,
                         message=str(raw_result.get("message") or raw_result),
                         data=raw_result,
                         error=raw_result.get("error"),
                     )
 
+                valid_result=bool(raw_result)
                 return ToolResult(
-                    success=True,
+                    success=valid_result,
                     tool=action.tool,
                     message=str(raw_result),
+                    error=None if valid_result else "invalid_tool_result",
                 )
 
             # TYPE TEXT
@@ -122,17 +136,19 @@ class Executor:
 
                 if isinstance(raw_result, dict):
                     return ToolResult(
-                        success=raw_result.get("success", True),
+                        success=raw_result.get("success", False),
                         tool=action.tool,
                         message=str(raw_result.get("message") or raw_result),
                         data=raw_result,
                         error=raw_result.get("error"),
                     )
 
+                valid_result=bool(raw_result)
                 return ToolResult(
-                    success=True,
+                    success=valid_result,
                     tool=action.tool,
                     message=str(raw_result),
+                    error=None if valid_result else "invalid_tool_result",
                 )
 
             # OTHER TOOLS
@@ -144,17 +160,19 @@ class Executor:
 
             if isinstance(raw_result, dict):
                 return ToolResult(
-                    success=raw_result.get("success", True),
+                    success=raw_result.get("success", False),
                     tool=action.tool,
                     message=str(raw_result.get("message") or raw_result),
                     data=raw_result,
                     error=raw_result.get("error"),
                 )
 
+            valid_result=bool(raw_result)
             return ToolResult(
-                success=True,
+                success=valid_result,
                 tool=action.tool,
                 message=str(raw_result),
+                error=None if valid_result else "invalid_tool_result",
             )
 
         except Exception as e:

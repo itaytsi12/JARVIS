@@ -53,11 +53,7 @@ def get_active_window_context() -> dict:
     }
 
 
-def describe_active_window() -> str:
+def describe_active_window() -> dict:
     context = get_active_window_context()
-
-    return (
-        f"Active window: {context['title']}\n"
-        f"Process: {context['process']}\n"
-        f"PID: {context['pid']}"
-    )
+    success=bool(context["pid"])
+    return {**context,"success":success,"verified":success,"message":f"Active window: {context['title'] or 'unknown'} ({context['process'] or 'unknown process'}).","error":None if success else "no_foreground_window"}

@@ -25,6 +25,8 @@ def create_plan(message: str) -> list[dict]:
                     "Break the user's request into the minimum number of available tool calls. "
                     "Call the tools in the exact order they should be executed. "
                     "Do not add unnecessary actions. "
+                    "Every requested step must be represented and achievable with the available tools. "
+                    "If the available tools cannot complete the entire request, return no tool calls; never return a partial plan or silently omit a step. "
                     "Do not answer conversationally."
                 )
             },
@@ -40,9 +42,11 @@ def create_plan(message: str) -> list[dict]:
 
     for item in response.output:
         if item.type == "function_call":
+            try:arguments=json.loads(item.arguments)
+            except (TypeError,json.JSONDecodeError):arguments=None
             actions.append({
                 "tool": item.name,
-                "arguments": json.loads(item.arguments)
+                "arguments": arguments
             })
 
     return actions
