@@ -20,6 +20,20 @@ from tools.windows_process import hidden_process_kwargs
 from training_data.sanitizer import sanitize_text
 
 
+def _is_isolated_worktree(workspace: str | Path) -> bool:
+    """The single cheap, structural check that distinguishes an isolated
+    `git worktree add` checkout from a normal repository checkout (like the
+    user's main JARVIS tree): a linked worktree's `.git` entry is always a
+    FILE containing `gitdir: ...`, never a directory. A primary checkout's
+    `.git` is always a directory. This is a Git invariant, not a convention
+    this codebase invented, so it can't be accidentally satisfied by an
+    ordinary repository -- including this one.
+    """
+    path = Path(workspace)
+    git_entry = path / ".git"
+    return path.is_dir() and git_entry.is_file()
+
+
 @dataclass
 class CodingAgentConstraints:
     """Everything a coding-agent invocation must respect. `workspace` is
@@ -32,7 +46,7 @@ class CodingAgentConstraints:
 
 @dataclass
 class CodingAgentResult:
-    exit_status: str  # "completed" | "crashed" | "timeout" | "no_change"
+    exit_status: str  # "completed" | "crashed" | "timeout" | "no_change" | "blocked"
     provider: str
     model: str | None = None
     invocation_mode: str = "print"
@@ -85,10 +99,17 @@ class FakeCodingAgent:
 class ClaudeCodeAdapter:
     """Shells out to the `claude` CLI in non-interactive print mode, scoped
     to the assigned worktree via `cwd`. `--dangerously-skip-permissions` is
-    used deliberately here and only here: this adapter is only ever invoked
+    used deliberately here and only here: this adapter must only ever run
     against an isolated worktree created by `brain.improvement_worktree`,
     never the user's main tree, which is exactly the sandboxed use case
     that flag is documented for.
+
+    That guarantee is enforced here, not merely assumed: every `run` call
+    first checks `_is_isolated_worktree(constraints.workspace)` and refuses
+    (returning exit_status="blocked", never raising, never invoking the
+    subprocess) if the workspace isn't a genuine linked worktree. This is
+    the last line of defense against a future caller wiring this adapter up
+    against the main repository -- accidentally or otherwise.
     """
 
     provider_name = "claude_code"
@@ -99,6 +120,16 @@ class ClaudeCodeAdapter:
 
     def run(self, task: str, constraints: CodingAgentConstraints) -> CodingAgentResult:
         started = time.time()
+        if not _is_isolated_worktree(constraints.workspace):
+            return CodingAgentResult(
+                exit_status="blocked", provider=self.provider_name, model=self.model,
+                started_at=started, ended_at=time.time(),
+                error=(
+                    f"refusing to run: {constraints.workspace!r} is not an isolated git worktree "
+                    "(--dangerously-skip-permissions is only ever safe against a worktree created by "
+                    "brain.improvement_worktree, never a primary repository checkout)"
+                ),
+            )
         args = [self.executable, "-p", task, "--output-format", "json", "--dangerously-skip-permissions"]
         if self.model:
             args += ["--model", self.model]

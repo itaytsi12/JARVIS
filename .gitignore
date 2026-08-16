@@ -107,3 +107,8 @@ data/*.sqlite3
 data/*.sqlite3-wal
 data/*.sqlite3-shm
 exports/*.jsonl
+
+# =========================
+# Autonomous improvement worktrees
+# =========================
+.jarvis-improvement-worktrees/
