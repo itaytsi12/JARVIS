@@ -8,10 +8,17 @@ import tempfile
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from .learning_approval import (
+    DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    DEFAULT_LEARNING_QUESTION,
+    LearningApprovalResult,
+    request_learning_approval as _run_learning_approval,
+)
 from .text_normalizer import normalize_transcript
 from .wake_word import OpenWakeWordEngine
 from training_data.sanitizer import sanitize_text, sanitize_user_request
@@ -44,7 +51,21 @@ class AssistantState(str, Enum):
     EXECUTING = "EXECUTING"
     SPEAKING = "SPEAKING"
     INTERRUPTED_LISTENING = "INTERRUPTED_LISTENING"
+    WAITING_FOR_LEARNING_APPROVAL = "WAITING_FOR_LEARNING_APPROVAL"
     ERROR = "ERROR"
+
+
+@dataclass
+class _PendingCapture:
+    """A cross-thread request for the single audio-owning thread to capture
+    and transcribe the next utterance on the requester's behalf, instead of
+    a second thread opening a conflicting microphone stream (Phase 4 of the
+    voice-approved continual learning pipeline). `done` is set exactly once,
+    by the audio thread, after `transcript` has been filled in (None if
+    nothing usable was captured within `timeout_seconds`)."""
+    timeout_seconds: float
+    done: threading.Event
+    transcript: str | None = None
 
 
 class AlwaysOnAssistant:
@@ -73,6 +94,10 @@ class AlwaysOnAssistant:
         self._warmup_started = threading.Event()
         self._question_threads = set()
         self._question_threads_lock = threading.Lock()
+        self._pending_capture: _PendingCapture | None = None
+        self._pending_capture_lock = threading.Lock()
+        self._learning_token = None
+        self._learning_lock = threading.Lock()
         self.log = logging.getLogger("jarvis.background")
 
     def _perf(self, stage: str, when: float | None = None) -> None:
@@ -169,6 +194,12 @@ class AlwaysOnAssistant:
     def _audio_session(self) -> None:
         import numpy as np
 
+        with self._pending_capture_lock:
+            pending = self._pending_capture
+        if pending is not None:
+            self._run_pending_capture_session(pending, np)
+            return
+
         factory = self.stream_factory or self._default_stream
         frame_seconds = self.wake_engine.frame_samples / self.wake_engine.sample_rate
         ring = deque(maxlen=max(1, int(1.2 / frame_seconds)))
@@ -249,6 +280,130 @@ class AlwaysOnAssistant:
         if self.state is not AssistantState.SPEAKING or self._stop.is_set():
             self._set_state(AssistantState.IDLE, "Wake word ready" if self.wake_enabled else "Wake word disabled")
 
+    def _run_pending_capture_session(self, pending: "_PendingCapture", np) -> None:
+        """Serve one cross-thread `_PendingCapture` request (see
+        `_capture_utterance_via_audio_thread`) using the SAME single audio
+        stream this whole class ever opens -- never a second, conflicting
+        consumer. No wake-word detection here: the caller has already
+        decided a capture is wanted (e.g. listening for "yes jarvis"/"no
+        jarvis" after a verified teacher fix), so this captures until
+        silence-after-speech or the request's own timeout, exactly like the
+        normal LISTENING phase's VAD, then transcribes and hands the result
+        back through `pending`."""
+        self._restart.clear()
+        self._set_state(AssistantState.WAITING_FOR_LEARNING_APPROVAL, "Listening for approval")
+        factory = self.stream_factory or self._default_stream
+        capture: list = []
+        listen_started = self.clock()
+        last_speech = None
+        speech_after_wake = False
+        try:
+            with self._mic_lock, factory() as stream:
+                while not self._stop.is_set():
+                    raw, overflowed = stream.read(self.wake_engine.frame_samples)
+                    if overflowed:
+                        self.log.warning("Microphone input overflow")
+                    frame = np.frombuffer(raw, dtype=np.int16).copy()
+                    now = self.clock()
+                    capture.append(frame)
+                    rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
+                    if rms >= self.speech_rms:
+                        speech_after_wake, last_speech = True, now
+                    elapsed = now - listen_started
+                    finished = speech_after_wake and last_speech is not None and now - last_speech >= self.silence_seconds
+                    if finished or elapsed >= pending.timeout_seconds:
+                        break
+        except Exception:
+            self.log.exception("Learning-approval capture failed")
+        transcript = None
+        if capture and speech_after_wake and not self._stop.is_set():
+            try:
+                transcript = self._transcribe_frames(capture)
+            except Exception:
+                self.log.exception("Learning-approval transcription failed")
+        pending.transcript = transcript
+        with self._pending_capture_lock:
+            if self._pending_capture is pending:
+                self._pending_capture = None
+        if not self._stop.is_set():
+            self._set_state(AssistantState.IDLE, "Wake word ready" if self.wake_enabled else "Wake word disabled")
+        # State/pending-slot must be fully settled BEFORE waking the
+        # waiting caller, so it never observes a stale WAITING_FOR_LEARNING_
+        # APPROVAL state or a still-set _pending_capture race.
+        pending.done.set()
+
+    def _transcribe_frames(self, frames) -> str:
+        import numpy as np
+        import soundfile as sf
+
+        audio = np.concatenate(frames).astype("float32") / 32768.0
+        temp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        path = Path(temp.name)
+        temp.close()
+        try:
+            sf.write(path, audio, self.wake_engine.sample_rate)
+            from .speech_to_text import transcribe_audio
+            return transcribe_audio(str(path))
+        finally:
+            if not self.debug_audio:
+                path.unlink(missing_ok=True)
+
+    def _capture_utterance_via_audio_thread(self, timeout_seconds: float) -> str | None:
+        """Block the CALLING thread (never the audio thread) until the
+        single audio-owning thread has captured and transcribed one
+        utterance, or `timeout_seconds` elapses. Raises RuntimeError if
+        called from the audio thread itself (that would deadlock) or while
+        another capture request is already pending (one at a time, by
+        design -- this is not a queue)."""
+        if self._thread is not None and threading.current_thread() is self._thread:
+            raise RuntimeError("_capture_utterance_via_audio_thread must not be called from the audio thread")
+        done = threading.Event()
+        request = _PendingCapture(timeout_seconds=max(0.1, timeout_seconds), done=done)
+        with self._pending_capture_lock:
+            if self._pending_capture is not None:
+                raise RuntimeError("a learning-approval capture request is already pending")
+            self._pending_capture = request
+        # The audio thread may currently be idly wake-word-listening inside
+        # its own long-lived mic session; `_restart` is the existing signal
+        # that makes it yield that session promptly (checked every frame,
+        # ~80ms) so it can pick up this pending request on its next pass.
+        self._restart.set()
+        completed = done.wait(request.timeout_seconds + 5.0)
+        with self._pending_capture_lock:
+            if self._pending_capture is request:
+                self._pending_capture = None
+        return request.transcript if completed else None
+
+    def request_learning_approval(
+        self,
+        question: str = DEFAULT_LEARNING_QUESTION,
+        timeout_seconds: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+        cancellation_token=None,
+    ) -> LearningApprovalResult:
+        """Speak the learning-approval question and listen for up to
+        `timeout_seconds` for an explicit "yes jarvis"/"no jarvis" (Phase 3),
+        reusing this assistant's single microphone consumer instead of
+        opening a second one (Phase 4). Must be called from a thread other
+        than the audio thread -- e.g. the background worker that just
+        finished driving a verified Claude teacher fix, never the
+        `jarvis-audio` thread itself."""
+        from .text_to_speech import speak
+
+        def speak_fn(text: str) -> None:
+            self._set_state(AssistantState.SPEAKING, "Learning approval question")
+            try:
+                speak(text)
+            except Exception:
+                self.log.exception("Failed to speak learning-approval question")
+
+        def listen_fn(remaining: float):
+            return self._capture_utterance_via_audio_thread(remaining)
+
+        return _run_learning_approval(
+            speak_fn=speak_fn, listen_fn=listen_fn, clock=self.clock,
+            timeout_seconds=timeout_seconds, question=question, cancellation_token=cancellation_token,
+        )
+
     def _process_capture(self, frames) -> None:
         import numpy as np
         import soundfile as sf
@@ -294,6 +449,12 @@ class AlwaysOnAssistant:
             self._perf("planning_completed")
             if route.get("type") == "question":
                 self._start_question_task(command, route, interaction_id, transcript, question_pipeline_started)
+                return
+            if route.get("type") == "start_learning":
+                self._start_learning_task(interaction_id)
+                return
+            if route.get("type") == "stop_learning":
+                self._stop_learning_task(interaction_id)
                 return
             if (re.match(r"^(?:send|message|tell)\s+",command,re.I) and route.get("type")!="revise_whatsapp_recipient") or (route.get("type")=="tool" and route.get("tool")=="analyze_screen"):
                 self._start_cancellable_action_task(command,route,interaction_id,transcript)
@@ -399,3 +560,94 @@ class AlwaysOnAssistant:
             except Exception:self.log.exception("Cancellable action task failed")
             finally:unregister_interactive_task(task_id)
         threading.Thread(target=work,name="jarvis-interactive-action",daemon=True).start()
+
+    def _start_learning_task(self, interaction_id=None) -> None:
+        """"Hey Jarvis, start learning" (Phase 11): a deterministic local
+        command, matched in brain/router.py before any planner/intent-model
+        involvement. Reuses the SAME interactive-task cancellation registry
+        (Phase 19/20) other long-running voice-triggered actions already use
+        -- the existing "cancel"/"stop" command cancels this too, in
+        addition to the dedicated "stop learning" phrase."""
+        from brain.task_supervisor import CancellationToken, register_interactive_task, unregister_interactive_task
+        from brain.learning_store import get_learning_job_store
+
+        with self._learning_lock:
+            if self._learning_token is not None and not self._learning_token.cancelled:
+                self._start_speech_task("I'm already learning, sir.", "en", interaction_id)
+                return
+            token = CancellationToken()
+            self._learning_token = token
+        task_id = register_interactive_task(token)
+
+        try:
+            job_count = len(get_learning_job_store().query_trainable())
+        except Exception:
+            self.log.exception("Could not query the learning job queue")
+            job_count = 0
+
+        if job_count:
+            plural = "s" if job_count != 1 else ""
+            announce = f"I have {job_count} approved learning task{plural}. I'll start learning now, sir."
+        else:
+            announce = "I don't have any approved learning tasks right now, sir."
+        self._start_speech_task(announce, "en", interaction_id)
+
+        def work() -> None:
+            try:
+                from pathlib import Path
+
+                from brain.improvement_coding_agent import ClaudeCodeAdapter
+                from brain.learning_evaluation import FakeBenchmark
+                from brain.learning_orchestrator import start_learning
+                from brain.learning_training import ConfiguredCloudTrainingBackend, TrainingPolicy
+
+                repository_root = str(Path(__file__).resolve().parent.parent)
+                summary = start_learning(
+                    coding_agent=ClaudeCodeAdapter(),
+                    repository_root=repository_root,
+                    # No real cloud GPU training backend is configured in
+                    # this deployment yet (Phase 12/14) -- this honestly
+                    # reports that rather than pretending to train.
+                    backend=ConfiguredCloudTrainingBackend(provider_configured=False),
+                    benchmark=FakeBenchmark(),
+                    policy=TrainingPolicy(mode="manual_only"),
+                    explicit_command=True,
+                    cancellation_token=token,
+                    progress_callback=lambda status, detail: self.log.info("[learning] %s %s", status, detail),
+                )
+                spoken = None
+                if summary.status == "CANCELLED":
+                    spoken = "Learning stopped, sir."
+                elif summary.status == "COMPLETED" and summary.promoted:
+                    spoken = "Learning is complete. The new coding model performed better and is now active, sir."
+                elif summary.status == "COMPLETED" and summary.promoted is False:
+                    spoken = "Learning is complete, but the new model did not outperform the current one, so I kept the existing model, sir."
+                elif summary.status == "FAILED" and summary.error == "pre-training checks failed":
+                    spoken = "I've prepared the training data, but training requires external compute that isn't configured yet, sir."
+                elif summary.job_count == 0:
+                    spoken = None  # already told the user before starting; nothing new to report
+                else:
+                    spoken = "I couldn't complete the learning run, sir."
+                if spoken and not self._stop.is_set():
+                    self._start_speech_task(spoken, "en", interaction_id)
+            except Exception:
+                self.log.exception("start_learning task failed")
+                if not self._stop.is_set():
+                    self._start_speech_task("I couldn't complete the learning run, sir.", "en", interaction_id)
+            finally:
+                unregister_interactive_task(task_id)
+                with self._learning_lock:
+                    if self._learning_token is token:
+                        self._learning_token = None
+
+        threading.Thread(target=work, name="jarvis-start-learning", daemon=True).start()
+
+    def _stop_learning_task(self, interaction_id=None) -> None:
+        """"Hey Jarvis, stop learning" (Phase 20)."""
+        with self._learning_lock:
+            token = self._learning_token
+        if token is not None and not token.cancelled:
+            token.cancel()
+            self._start_speech_task("Stopping learning, sir.", "en", interaction_id)
+        else:
+            self._start_speech_task("I'm not learning right now, sir.", "en", interaction_id)

@@ -67,6 +67,15 @@ def route_command(command: str) -> dict:
         return {"type": "cancel_read_only_task"}
     if text.rstrip(".?!,;:") == "continue":
         return {"type":"resume_interrupted_response"}
+
+    # Deterministic voice-approved continual learning commands (never routed
+    # through the local intent model or the cloud planner -- see
+    # brain/learning_orchestrator.py::start_learning and
+    # voice/background_assistant.py's dispatch of these two route types).
+    if text.rstrip(".?!,;:") in {"start learning", "start the learning", "begin learning"}:
+        return {"type": "start_learning"}
+    if text.rstrip(".?!,;:") in {"stop learning", "stop the learning", "cancel learning", "cancel the learning"}:
+        return {"type": "stop_learning"}
     if re.fullmatch(r"(?:make it (?:much )?shorter|shorten that|only (?:tell|give) me (?:the )?(?:top )?\d+)",text.rstrip(".?!,;:")):
         return {"type":"correct_interrupted_response","instruction":text.rstrip(".?!,;:")}
     recipient_correction=re.fullmatch(r"(?:don't send it to \S+,\s*)?send it to (.+?) instead",text.rstrip(".?!;:"))

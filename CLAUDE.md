@@ -65,6 +65,57 @@ training — `recorder.py`, `sanitizer.py`, `schema.py`, `validator.py`,
 as real or potentially real user data: never delete it as "noise" without
 explicit confirmation it's reproducible/generated.
 
+Voice-approved continual learning pipeline (Claude-as-teacher →
+voice-approved learning → later batch training), all under
+`brain/learning_*.py` + `voice/learning_approval.py`. This is a separate,
+downstream concern from the self-improvement pipeline above -- it starts
+where that pipeline's `run_attempt` already reached `READY_FOR_REVIEW`, and
+never re-implements triage/reproduction/diff-analysis/evaluation:
+
+- `brain/learning_trigger.py` — `evaluate_learning_offer(attempt)`: should
+  JARVIS even ask "do you want me to learn how to do that, sir?" Reuses
+  `ImprovementAttempt.status`/`.acceptance_gates` rather than re-deriving
+  "was this genuinely verified" from scratch, and dedups by a wording-free
+  `task_family_fingerprint`.
+- `voice/learning_approval.py` — the pure, dependency-injected 30-second
+  "yes jarvis"/"no jarvis" state machine (`request_learning_approval`). Its
+  real production wiring — `AlwaysOnAssistant.request_learning_approval` in
+  `voice/background_assistant.py` — reuses the assistant's single audio
+  thread for the approval capture too (a cross-thread `_PendingCapture`
+  handoff, never a second microphone consumer).
+- `brain/learning_models.py` / `brain/learning_store.py` — the persisted
+  `LearningJob` (SQLite, same shape as `brain/improvement_attempt_store.py`).
+- `brain/learning_package.py` — deterministic `LearningPackage` extraction
+  from a verified attempt (no LLM call, no hidden reasoning — this
+  codebase never captures that in the first place).
+- `brain/experience_store.py` — immediate, local-retrieval-only experience
+  memory, usable before any retraining.
+- `brain/learning_variation.py` — bounded, cost-controlled training-family
+  variation generation, reusing the SAME `CodingAgent`/worktree machinery
+  as the self-improvement pipeline (no second Claude integration).
+- `brain/learning_validator.py` — mechanically verifies each variant
+  (before-fails/after-passes) before it's trusted; unverified variants
+  never enter the dataset.
+- `brain/learning_dataset.py` — immutable, versioned dataset manifests.
+- `brain/learning_training.py` — `TrainingBackend` protocol,
+  `FakeTrainingBackend` (tests/dry-run), `ConfiguredCloudTrainingBackend`
+  (never dispatches real training without explicit authorization),
+  `ModelRegistry` (the only place `ACTIVE` is ever assigned).
+- `brain/learning_evaluation.py` — held-out benchmark evaluation; training
+  metrics are never consulted for promotion, only a fresh benchmark run.
+- `brain/learning_orchestrator.py` — `handle_verified_teacher_success`
+  (approval → job → package → experience) and `start_learning` (the full
+  "Hey Jarvis, start learning" batch: dataset build → pre-training checks
+  → train → evaluate → promote/reject), both voice-agnostic and fully
+  testable with fakes.
+
+No real local LoRA/QLoRA backend or cloud GPU dispatch exists yet — only
+the protocol and fakes. `voice/background_assistant.py::_start_learning_task`
+uses `ConfiguredCloudTrainingBackend(provider_configured=False)` in
+production today, so "Hey Jarvis, start learning" honestly reports that
+training requires external compute rather than silently doing nothing or
+pretending to train.
+
 ## Directories that are data/output, not source
 
 Do not treat these as code to refactor; they're generated or local-only:
@@ -76,7 +127,11 @@ self-improvement pipeline — never edit the main tree from inside one).
 
 `training/data/*.jsonl` and `training_data/` contents are the exception:
 they look like generated output but are actual dataset/trajectory data —
-keep them.
+keep them. The same applies to `data/learning_datasets/` (immutable,
+versioned training datasets built by `brain/learning_dataset.py`) and
+`data/learning_packages/` (extracted `LearningPackage` JSON, one per
+approved learning job) — both are real captured pipeline output, not
+disposable cache, even though they live under `data/`.
 
 ## Tests
 
@@ -96,6 +151,43 @@ TTS model directly. It's the reference implementation
 are manual/opt-in smoke tools (several require an explicit `--run` flag
 to actually produce audio), not part of automated regression coverage —
 that's intentional, not an oversight.
+
+## Voice-approved continual learning: commands
+
+- `"Do you want me to learn how to do that, sir?"` — spoken automatically
+  after a Claude teacher fix reaches verified `READY_FOR_REVIEW` (see
+  `brain/learning_trigger.py`'s eligibility gate). A 30-second window
+  follows; only the exact phrase "yes jarvis" approves and "no jarvis"
+  declines (case/punctuation-insensitive) — bare "yes"/"no" do not count,
+  and no answer within 30 seconds is treated as a decline.
+- `"Hey Jarvis, start learning"` (also "start the learning" / "begin
+  learning") — deterministic, matched in `brain/router.py` before any
+  planner/intent-model involvement. Gathers every approved job, builds a
+  new dataset version, and attempts training (today: honestly reports that
+  no cloud GPU backend is configured, per `ConfiguredCloudTrainingBackend`).
+- `"Hey Jarvis, stop learning"` (also "cancel learning") — cancels an
+  in-progress `start_learning` run via the same interactive-task
+  cancellation registry `brain/task_supervisor.py` already provides for
+  other long voice-triggered actions; the existing plain "cancel"/"stop"
+  command cancels it too.
+
+CLI/debug equivalents (no microphone needed):
+- `python scripts/learning_dry_run.py` — a complete, bounded, realistic
+  run of the whole pipeline (real `ClaudeCodeAdapter` for exactly one
+  teacher-fix call, fakes for voice/variation/training/benchmark from
+  there), against a disposable fixture repo. Also useful as a template for
+  manually driving/inspecting each stage.
+- Inspect the learning queue: `brain.learning_store.get_learning_job_store().query()` /
+  `.query_trainable()`.
+- Approve/decline manually: construct a `brain.learning_models.LearningJob`
+  and call `LearningJobStore.create`/`.update` directly, or call
+  `brain.learning_orchestrator.handle_verified_teacher_success` with a
+  fake `request_approval` callable (see `tests/test_learning_orchestrator.py`).
+- Start learning manually: call `brain.learning_orchestrator.start_learning(...)`
+  directly with whatever `TrainingBackend`/`Benchmark` you want.
+- Inspect a job's dataset contribution: `brain.learning_package.load_learning_package(job_id)`.
+- Inspect a training run/benchmark result: `brain.learning_training.ModelRegistry.history()`.
+- Inspect the active model: `brain.learning_training.get_model_registry().get_active()`.
 
 ## Multiple requirements files are intentional
 
