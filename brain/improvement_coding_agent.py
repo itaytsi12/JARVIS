@@ -10,6 +10,7 @@ unpredictable time.
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -130,12 +131,31 @@ class ClaudeCodeAdapter:
                     "brain.improvement_worktree, never a primary repository checkout)"
                 ),
             )
-        args = [self.executable, "-p", task, "--output-format", "json", "--dangerously-skip-permissions"]
+        # On Windows, an npm-installed CLI's bare (extensionless) name is a
+        # POSIX shell shim -- only its sibling `.cmd`/`.exe` forms are
+        # directly launchable via CreateProcess (subprocess.run(shell=False)
+        # does not apply PATHEXT fallback to a bare name the way cmd.exe
+        # does). Resolving through shutil.which first finds that launchable
+        # form; if resolution fails, fall back to the configured name
+        # unchanged so the prior (mockable) behavior is preserved.
+        executable = shutil.which(self.executable) or self.executable
+        # The task prompt is piped via stdin, never passed as a CLI argument:
+        # on Windows the resolved executable is a `.cmd` shim, launched
+        # through cmd.exe's own batch-argument tokenizer rather than
+        # CommandLineToArgvW. That tokenizer does not safely round-trip an
+        # argument containing embedded newlines (this prompt always has
+        # them) -- it silently truncates/mangles it, which was observed to
+        # drop `--dangerously-skip-permissions` from what the underlying
+        # process actually received and made the agent report itself as
+        # permission-blocked instead of editing. `-p` with no positional
+        # prompt reads the task from stdin instead, sidestepping batch
+        # tokenization entirely.
+        args = [executable, "-p", "--output-format", "json", "--dangerously-skip-permissions"]
         if self.model:
             args += ["--model", self.model]
         try:
             result = subprocess.run(
-                args, cwd=constraints.workspace, text=True, capture_output=True,
+                args, cwd=constraints.workspace, text=True, capture_output=True, input=task,
                 timeout=constraints.timeout_seconds, **hidden_process_kwargs(),
             )
         except subprocess.TimeoutExpired:
