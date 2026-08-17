@@ -1,0 +1,11 @@
+{
+  "task_id": "feature_implementation_reverse_words",
+  "category": "feature_implementation",
+  "description": "Implement reverse_words(sentence) in strings_util.py: it should return the words of the sentence in reverse order, joined by single spaces. It currently raises NotImplementedError.",
+  "fixture_dir": "feature_implementation_reverse_words",
+  "hidden_test_path": "hidden_test.py",
+  "visible_test_paths": [],
+  "timeout_seconds": 120.0,
+  "constraints": [],
+  "metadata": {}
+}

@@ -1,0 +1,46 @@
+# Larger recommended config: Qwen2.5-Coder-14B-Instruct, QLoRA (4-bit NF4).
+#
+# VRAM reality check: 4-bit QLoRA of a 14B model realistically needs
+# ~14-18GB VRAM even at batch size 1 with gradient checkpointing and a
+# modest sequence length. This is well beyond an RTX 2060 (6GB) --
+# hardware_preflight() will report LOCAL_TRAINING_NOT_FEASIBLE and this
+# config is meant for a cloud GPU (a single 24GB-class card, e.g. an
+# RTX 4090/A10G, comfortably covers it; an A100 40GB gives headroom for a
+# larger batch/sequence length).
+name: qlora_14b
+method: qlora
+base_model:
+  model_id: Qwen/Qwen2.5-Coder-14B-Instruct
+  revision: null
+  trust_remote_code: false
+  tokenizer_id: null
+  max_sequence_length: 2048
+training:
+  output_dir: data/learning_checkpoints
+  learning_rate: 0.0001
+  num_train_epochs: 2
+  max_steps: null
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 32
+  warmup_ratio: 0.03
+  save_steps: 50
+  eval_steps: 50
+  logging_steps: 10
+  seed: 42
+  validation_split_ratio: 0.1
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  bias: none
+quantization:
+  enabled: true
+  bits: 4
+  quant_type: nf4
+  double_quant: true
+  compute_dtype: bfloat16
+runtime:
+  device: auto
+  dtype: auto
+  gradient_checkpointing: true

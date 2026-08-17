@@ -1,0 +1,11 @@
+{
+  "task_id": "logical_bug_parity",
+  "category": "logical_bug",
+  "description": "is_even(n) in parity.py incorrectly returns True for odd numbers and False for even numbers -- the comparison is inverted. Fix the logic so it correctly identifies even numbers.",
+  "fixture_dir": "logical_bug_parity",
+  "hidden_test_path": "hidden_test.py",
+  "visible_test_paths": ["tests/test_parity.py"],
+  "timeout_seconds": 120.0,
+  "constraints": [],
+  "metadata": {}
+}

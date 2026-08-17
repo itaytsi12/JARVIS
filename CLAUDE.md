@@ -109,12 +109,75 @@ never re-implements triage/reproduction/diff-analysis/evaluation:
   → train → evaluate → promote/reject), both voice-agnostic and fully
   testable with fakes.
 
-No real local LoRA/QLoRA backend or cloud GPU dispatch exists yet — only
-the protocol and fakes. `voice/background_assistant.py::_start_learning_task`
-uses `ConfiguredCloudTrainingBackend(provider_configured=False)` in
-production today, so "Hey Jarvis, start learning" honestly reports that
-training requires external compute rather than silently doing nothing or
-pretending to train.
+A REAL local LoRA/QLoRA training backend and a REAL executable coding
+benchmark exist under `training/code_model/` (a separate, dedicated
+sub-package — see below). `voice/background_assistant.py::_start_learning_task`
+uses them by default in production (`training/code_model/production.py` is
+the one place that decision is made) — no `FakeTrainingBackend`/
+`FakeBenchmark` in the voice path; those remain test-only.
+
+### `training/code_model/` — the real training/benchmark backend
+
+- `config.py` + `configs/*.yaml` — `CodeModelTrainingConfig` (base model,
+  LoRA, quantization, runtime, hyperparameters). Never hardcode a model id
+  elsewhere; add/edit a YAML config instead. `small_smoke_test.yaml`
+  (`sshleifer/tiny-gpt2`, CPU/GPU-safe, seconds to run) is for tests/dry
+  runs only. `qlora_7b.yaml` (`Qwen/Qwen2.5-Coder-7B-Instruct`) is this
+  project's recommended real config and production's default.
+- `hardware.py` — real GPU/VRAM/RAM/disk/bitsandbytes detection and a real
+  parameter-count/VRAM feasibility estimate (fetches the real HF
+  `AutoConfig`, no hardcoded per-model table). Verified on this
+  deployment's actual hardware (RTX 2060, 6GB VRAM): CUDA and 4-bit
+  bitsandbytes quantization both genuinely work here, but `qlora_7b`'s
+  ~7.6GB estimated requirement exceeds this card's free VRAM — expect
+  `HuggingFaceLoRATrainingBackend.is_available()` to correctly report
+  infeasible on this machine until either the config is downsized or
+  training is run on a bigger GPU.
+- `hf_backend.py` — `HuggingFaceLoRATrainingBackend`, the real
+  `TrainingBackend`: genuine `transformers`/`peft`/`accelerate` model load,
+  quantization, LoRA injection, tokenization, forward/backward training,
+  checkpointing, and a real (weight-level, not bit-exact-optimizer-state)
+  resume. Never trains from scratch.
+- `dataset_formatting.py` — extends (never modifies) `brain/learning_dataset.py`'s
+  JSONL into prompt/response SFT examples.
+- `context_packer.py` — compact, evidence-driven multi-file repository
+  context (seed files → their local imports → named tests → keyword
+  search), used both when formatting training data context and by the
+  student adapter at inference time.
+- `student_adapter.py` — `LocalCodingModelAdapter`, a real
+  `CodingAgent` implementation backed by a loaded HF model (+ optional
+  trained LoRA adapter): a bounded inspect → patch → test → revise loop
+  against real pytest execution, not chat text.
+- `export.py` — real LoRA/QLoRA-adapter → merged-standalone-model export
+  (`peft`'s real `merge_and_unload`); GGUF conversion is documented (the
+  exact llama.cpp command), not vendored.
+- `benchmark/` — `RealCodingBenchmark` (implements
+  `brain.learning_evaluation.Benchmark` for real) plus
+  `benchmark/fixtures/*/` (five real, executable, hidden-test-verified
+  tasks spanning distinct categories — syntax/runtime, logical, cross-file,
+  regression, feature-implementation; more categories can be added as new
+  fixture directories without any schema change). Reuses
+  `brain.improvement_diff_analysis.analyze_diff` and
+  `brain.task_supervisor.SafeCommandRunner` — no second diff/subprocess
+  implementation.
+- `leakage.py` — quarantines any dataset example whose content matches a
+  held-out benchmark fixture, via `brain.learning_dataset.build_dataset_version`'s
+  `example_filter` hook.
+- `production.py` — the ONE place `voice/background_assistant.py` decides
+  which backend/benchmark/`TrainingConfig` "Hey Jarvis, start learning"
+  actually uses. `JARVIS_CODE_MODEL_CONFIG` (default `"qlora_7b"`) picks
+  the config.
+- `train.py` / `evaluate.py` / `benchmark/__main__.py` / `export.py` /
+  `start_learning.py` — one-command CLIs (`python -m training.code_model.train
+  --config ... --dataset ...`, etc.) for debugging without voice/a
+  microphone.
+
+Needs `training/requirements-code-model.txt` in its own venv
+(`.venv-code-model`, same per-subsystem-venv convention as
+`.venv-agent`/`.venv-intent`) — torch/transformers/peft/accelerate/
+bitsandbytes are NOT installed in the main JARVIS runtime venv, and tests
+that need them (`tests/test_hf_backend.py` and similar) skip themselves
+(not fail) when run outside that venv.
 
 ## Directories that are data/output, not source
 
@@ -163,20 +226,36 @@ that's intentional, not an oversight.
 - `"Hey Jarvis, start learning"` (also "start the learning" / "begin
   learning") — deterministic, matched in `brain/router.py` before any
   planner/intent-model involvement. Gathers every approved job, builds a
-  new dataset version, and attempts training (today: honestly reports that
-  no cloud GPU backend is configured, per `ConfiguredCloudTrainingBackend`).
+  new dataset version, and runs the REAL `HuggingFaceLoRATrainingBackend` +
+  REAL `RealCodingBenchmark` (`training/code_model/production.py`). If the
+  configured model doesn't fit this machine, it honestly reports that
+  rather than pretending to train (`FeasibilityResult.mode ==
+  "LOCAL_TRAINING_NOT_FEASIBLE"`, surfaced via `backend.is_available()`).
 - `"Hey Jarvis, stop learning"` (also "cancel learning") — cancels an
   in-progress `start_learning` run via the same interactive-task
   cancellation registry `brain/task_supervisor.py` already provides for
   other long voice-triggered actions; the existing plain "cancel"/"stop"
-  command cancels it too.
+  command cancels it too. Training checkpoints already written are kept
+  (never marked `TRAINED`, never promoted).
+- `"Hey Jarvis, learning status"` — reports the current run stage (if any),
+  how many approved jobs are queued, and the most recent model version's
+  status.
 
 CLI/debug equivalents (no microphone needed):
-- `python scripts/learning_dry_run.py` — a complete, bounded, realistic
-  run of the whole pipeline (real `ClaudeCodeAdapter` for exactly one
-  teacher-fix call, fakes for voice/variation/training/benchmark from
-  there), against a disposable fixture repo. Also useful as a template for
-  manually driving/inspecting each stage.
+- `python scripts/learning_dry_run.py` — the voice-approval half (real
+  `ClaudeCodeAdapter` for exactly one teacher-fix call, fake
+  voice/variation/training/benchmark from there), against a disposable
+  fixture repo.
+- `python scripts/code_model_full_dry_run.py` — the training/benchmark
+  half: REAL dataset build → REAL tiny LoRA training
+  (`small_smoke_test.yaml`) → real saved adapter → REAL benchmark harness
+  (all 5 fixture tasks) → real promotion decision. No fakes for training or
+  benchmarking. Needs `.venv-code-model`.
+- `python -m training.code_model.train --config <name> --dataset <jsonl>`,
+  `.evaluate --model <version>`, `.benchmark --model <version>`,
+  `.export --model <version> --output <dir>`,
+  `.start_learning --repository-root <path>` (the full pipeline, same as
+  the voice command) — see `training/code_model/*.py`.
 - Inspect the learning queue: `brain.learning_store.get_learning_job_store().query()` /
   `.query_trainable()`.
 - Approve/decline manually: construct a `brain.learning_models.LearningJob`
@@ -188,6 +267,66 @@ CLI/debug equivalents (no microphone needed):
 - Inspect a job's dataset contribution: `brain.learning_package.load_learning_package(job_id)`.
 - Inspect a training run/benchmark result: `brain.learning_training.ModelRegistry.history()`.
 - Inspect the active model: `brain.learning_training.get_model_registry().get_active()`.
+
+## Your first REAL model training run
+
+1. Create the environment: `python -m venv .venv-code-model`, then install
+   torch from the CUDA index matching your driver (see
+   `training/requirements-code-model.txt`'s header), then
+   `.venv-code-model\Scripts\python -m pip install -r training/requirements-code-model.txt`.
+2. Choose/confirm a base model: `qlora_7b.yaml` (`Qwen/Qwen2.5-Coder-7B-Instruct`)
+   is the recommended default; add a new `training/code_model/configs/*.yaml`
+   for a different one. `.venv-code-model\Scripts\python -c
+   "from training.code_model.hardware import check_feasibility; from
+   training.code_model.config import load_config;
+   print(check_feasibility(load_config('qlora_7b')))"` tells you honestly
+   whether your current machine can run it locally.
+3. Use JARVIS normally; approve verified Claude teacher fixes with "yes
+   jarvis" as they come up (see the ongoing-use loop below).
+4. Say "Hey Jarvis, start learning" (or run
+   `python -m training.code_model.start_learning --repository-root <path>`).
+   This builds the dataset, and either trains locally (if feasible) or
+   tells you it needs external compute plus the exact command/config to
+   run there.
+5. If local: training checkpoints under `code_model_config.training.output_dir`
+   and the final adapter are real, real-time-inspectable via
+   `training/code_model/hf_backend.py::load_run_record`.
+6. If external/cloud: take the reported config + the built dataset's
+   `.jsonl` path to your cloud GPU environment and run the same
+   `python -m training.code_model.train --config qlora_7b --dataset <path>`
+   command there (install `training/requirements-code-model.txt` there
+   too). Copy the resulting adapter directory back.
+7. Evaluation and promotion happen automatically at the end of
+   `start_learning` (voice or CLI) — the candidate is only promoted if the
+   real benchmark shows it's genuinely better; otherwise the active model
+   is kept and the candidate is recorded as `REJECTED`, not deleted.
+8. Export for local inference: `python -m training.code_model.export
+   --model <version> --output <dir>` merges the adapter into a standalone
+   model directory; `training.code_model.export.gguf_conversion_command(...)`
+   gives the exact llama.cpp command for a GGUF/quantized local build if
+   you want one.
+9. Configure JARVIS to use the newly ACTIVE model: query
+   `brain.learning_training.get_model_registry().get_active()` from
+   wherever the real inference call site ends up living (this session ships
+   the `CodingAgent`-protocol adapter, `training.code_model.student_adapter.LocalCodingModelAdapter`,
+   but does not wire a second, always-on "local student attempts every
+   task first" runtime loop into `brain/agent.py` — that's the natural
+   next step once a genuinely trained model exists to wire in).
+
+### Ongoing use, going forward
+
+```
+Use JARVIS
+  -> student/local path fails or has low confidence on a coding task
+  -> Claude teaches (existing self-improvement pipeline, unchanged)
+  -> independent verification proves the fix works
+  -> "Do you want me to learn how to do that, sir?"
+  -> "Yes Jarvis"
+  -> (repeat over time, across many fixes)
+  -> "Hey Jarvis, start learning"
+  -> dataset build, training, benchmark evaluation, and promotion
+     all happen automatically -- no further code required
+```
 
 ## Multiple requirements files are intentional
 

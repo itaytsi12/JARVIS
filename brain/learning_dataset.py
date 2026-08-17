@@ -161,11 +161,20 @@ def build_dataset_version(
     *,
     dataset_root: Path | str | None = None,
     dataset_version: str | None = None,
+    example_filter: Any = None,
 ) -> DatasetManifest:
     """Write one new, immutable dataset version to disk and return its
     manifest. Never mutates or overwrites a prior version -- raises
     FileExistsError if `dataset_version` is explicitly given and already
-    exists, exactly to protect that immutability guarantee."""
+    exists, exactly to protect that immutability guarantee.
+
+    `example_filter`, if given, is a `Callable[[list[DatasetExample]],
+    list[DatasetExample]]` applied immediately after `collect_examples`,
+    before anything is written -- the hook
+    `training/code_model/leakage.py` (Phase 18) uses to quarantine any
+    example that matches a held-out benchmark fixture. Defaults to `None`
+    (no filtering), so every existing caller's behavior is unchanged.
+    """
     root = Path(dataset_root) if dataset_root else _default_dataset_root()
     root.mkdir(parents=True, exist_ok=True)
     version = dataset_version or next_dataset_version(root)
@@ -175,6 +184,8 @@ def build_dataset_version(
         raise FileExistsError(f"dataset version {version!r} already exists at {root}")
 
     examples = collect_examples(batch)
+    if example_filter is not None:
+        examples = example_filter(examples)
     with jsonl_path.open("w", encoding="utf-8") as fh:
         for example in examples:
             fh.write(canonical_json(example.to_dict()) + "\n")

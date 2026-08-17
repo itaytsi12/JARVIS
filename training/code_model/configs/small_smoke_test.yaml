@@ -1,0 +1,50 @@
+# Tiny, fast, genuinely-real training config (Phase 26 smoke test).
+#
+# sshleifer/tiny-gpt2 is a public, few-hundred-KB, randomly-initialized
+# GPT-2-architecture model published specifically for fast CI smoke tests --
+# not a coding model, not expected to produce useful completions. Its only
+# job here is proving the training MECHANICS (model load, tokenizer,
+# LoRA/quantization setup, forward/backward pass, checkpoint save, reload)
+# are genuinely real, in seconds, on CPU or GPU, with a ~10MB download.
+name: small_smoke_test
+method: lora   # standard LoRA, not QLoRA -- tiny-gpt2 is far too small for
+               # 4-bit quantization to make sense or even always succeed
+               # (very few/small linear layers); QLoRA itself is separately
+               # exercised against a real base model where noted in
+               # qlora_7b.yaml. See training/code_model/hardware.py for how
+               # the backend picks method automatically per-config.
+base_model:
+  model_id: sshleifer/tiny-gpt2
+  revision: null
+  trust_remote_code: false
+  tokenizer_id: null
+  max_sequence_length: 256
+training:
+  output_dir: data/learning_checkpoints
+  learning_rate: 0.001
+  num_train_epochs: 1
+  max_steps: 4
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  warmup_ratio: 0.0
+  save_steps: 4
+  eval_steps: 4
+  logging_steps: 1
+  seed: 42
+  validation_split_ratio: 0.2
+lora:
+  rank: 4
+  alpha: 8
+  dropout: 0.0
+  target_modules: ["c_attn"]  # GPT-2's fused QKV projection name
+  bias: none
+quantization:
+  enabled: false
+  bits: 4
+  quant_type: nf4
+  double_quant: true
+  compute_dtype: float16
+runtime:
+  device: auto
+  dtype: auto
+  gradient_checkpointing: false

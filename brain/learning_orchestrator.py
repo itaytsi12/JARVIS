@@ -349,6 +349,7 @@ def start_learning(
         candidate = ModelVersion(
             model_version=result.model_version, dataset_version=manifest.dataset_version,
             training_run_id=result.training_run_id, created_at=_now(), metrics=result.metrics,
+            base_model=result.base_model, adapter_path=result.checkpoint_path, config_hash=result.config_hash,
         )
         model_registry.record(candidate)
         active = model_registry.get_active()
@@ -356,6 +357,7 @@ def start_learning(
             old_model_version=active.model_version if active else None,
             new_model_version=candidate.model_version, benchmark=benchmark, gate_config=gate_config,
         )
+        model_registry.mark_evaluated(candidate.model_version, outcome.new_metrics.to_dict())
         summary.candidate_model_version = candidate.model_version
         summary.promoted = outcome.promote
         summary.reasons = [outcome.reason]

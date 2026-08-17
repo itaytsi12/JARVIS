@@ -73,6 +73,8 @@ class TrainingRunResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     resumed_from: str | None = None
+    base_model: str | None = None
+    config_hash: str | None = None
 
 
 class TrainingBackend(Protocol):
@@ -253,8 +255,20 @@ class ModelVersion:
     training_run_id: str
     created_at: str
     metrics: dict[str, Any] = field(default_factory=dict)
-    status: str = "CANDIDATE"  # "CANDIDATE" | "ACTIVE" | "REJECTED"
+    status: str = "CANDIDATE"  # "CANDIDATE" | "EVALUATED" | "ACTIVE" | "REJECTED" | "REPLACED" | "ARCHIVED"
     rejection_reason: str | None = None
+
+    # Real training-artifact fields (Phase 9 of the real-training-backend
+    # extension). All optional/default-None so every existing caller that
+    # constructs a ModelVersion with only the original fields keeps working
+    # unchanged.
+    base_model: str | None = None
+    parent_model_version: str | None = None
+    adapter_path: str | None = None
+    merged_model_path: str | None = None
+    quantized_artifact_path: str | None = None
+    config_hash: str | None = None
+    benchmark_result: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -316,6 +330,25 @@ class ModelRegistry:
                 "SELECT payload_json FROM model_versions WHERE status='ACTIVE' ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
         return ModelVersion.from_dict(json.loads(row["payload_json"])) if row else None
+
+    def mark_evaluated(self, model_version: str, benchmark_result: dict[str, Any]) -> ModelVersion:
+        """Records a completed real benchmark run's result on a still-
+        CANDIDATE model, transitioning it to `EVALUATED` -- an auditable
+        checkpoint between "training finished" and the promote/reject
+        decision, distinct from either. Never itself decides promote vs
+        reject; `promote`/`reject` remain the only two functions that ever
+        move a model version out of `EVALUATED`."""
+        with self._lock, self.connection:
+            version = self.get(model_version)
+            if version is None:
+                raise KeyError(f"no such model version: {model_version!r}")
+            version.status = "EVALUATED"
+            version.benchmark_result = dict(benchmark_result)
+            self.connection.execute(
+                "UPDATE model_versions SET status=?, payload_json=? WHERE model_version=?",
+                (version.status, json.dumps(version.to_dict()), model_version),
+            )
+            return version
 
     def promote(self, model_version: str) -> ModelVersion:
         """The only way `status='ACTIVE'` is ever assigned. Demotes any

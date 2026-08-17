@@ -98,6 +98,7 @@ class AlwaysOnAssistant:
         self._pending_capture_lock = threading.Lock()
         self._learning_token = None
         self._learning_lock = threading.Lock()
+        self._learning_last_status: tuple[str, str] | None = None
         self.log = logging.getLogger("jarvis.background")
 
     def _perf(self, stage: str, when: float | None = None) -> None:
@@ -456,6 +457,9 @@ class AlwaysOnAssistant:
             if route.get("type") == "stop_learning":
                 self._stop_learning_task(interaction_id)
                 return
+            if route.get("type") == "learning_status":
+                self._learning_status_task(interaction_id)
+                return
             if (re.match(r"^(?:send|message|tell)\s+",command,re.I) and route.get("type")!="revise_whatsapp_recipient") or (route.get("type")=="tool" and route.get("tool")=="analyze_screen"):
                 self._start_cancellable_action_task(command,route,interaction_id,transcript)
                 return
@@ -597,23 +601,33 @@ class AlwaysOnAssistant:
                 from pathlib import Path
 
                 from brain.improvement_coding_agent import ClaudeCodeAdapter
-                from brain.learning_evaluation import FakeBenchmark
                 from brain.learning_orchestrator import start_learning
-                from brain.learning_training import ConfiguredCloudTrainingBackend, TrainingPolicy
+                from brain.learning_training import TrainingPolicy
+                from training.code_model.production import build_production_backend, build_production_benchmark, build_training_config
 
                 repository_root = str(Path(__file__).resolve().parent.parent)
+                # Real backend/benchmark (Phase 19): no FakeTrainingBackend
+                # or FakeBenchmark in this production path. Which base
+                # model/config is used is controlled by
+                # JARVIS_CODE_MODEL_CONFIG (default: "qlora_7b", this
+                # project's recommended real config -- see
+                # training/code_model/configs/). If this machine can't
+                # actually run it, backend.is_available() honestly reports
+                # that (Phase 6/20) and start_learning stops before
+                # claiming training began; it never silently substitutes a
+                # fake.
+                backend = build_production_backend()
+                benchmark = build_production_benchmark(backend.code_model_config)
                 summary = start_learning(
                     coding_agent=ClaudeCodeAdapter(),
                     repository_root=repository_root,
-                    # No real cloud GPU training backend is configured in
-                    # this deployment yet (Phase 12/14) -- this honestly
-                    # reports that rather than pretending to train.
-                    backend=ConfiguredCloudTrainingBackend(provider_configured=False),
-                    benchmark=FakeBenchmark(),
+                    backend=backend,
+                    benchmark=benchmark,
+                    training_config=build_training_config(backend.code_model_config),
                     policy=TrainingPolicy(mode="manual_only"),
                     explicit_command=True,
                     cancellation_token=token,
-                    progress_callback=lambda status, detail: self.log.info("[learning] %s %s", status, detail),
+                    progress_callback=self._on_learning_progress,
                 )
                 spoken = None
                 if summary.status == "CANCELLED":
@@ -651,3 +665,51 @@ class AlwaysOnAssistant:
             self._start_speech_task("Stopping learning, sir.", "en", interaction_id)
         else:
             self._start_speech_task("I'm not learning right now, sir.", "en", interaction_id)
+
+    def _on_learning_progress(self, status: str, detail: str) -> None:
+        self._learning_last_status = (status, detail)
+        self.log.info("[learning] %s %s", status, detail)
+
+    def _learning_status_task(self, interaction_id=None) -> None:
+        """"Hey Jarvis, learning status" (Phase 21): reports the current
+        stage of an in-progress run (if any, from the last
+        `progress_callback` update `start_learning` sent), plus queue and
+        latest-model summary from the persisted stores -- never requires an
+        active run to answer something useful."""
+        def work() -> None:
+            try:
+                from brain.learning_store import get_learning_job_store
+                from brain.learning_training import get_model_registry
+
+                with self._learning_lock:
+                    active = self._learning_token is not None and not self._learning_token.cancelled
+                    last_status = self._learning_last_status
+
+                parts = []
+                if active and last_status:
+                    parts.append(f"Learning is currently in the {last_status[0].replace('_', ' ').lower()} stage.")
+                elif active:
+                    parts.append("Learning is currently running.")
+                else:
+                    parts.append("No learning run is active right now.")
+
+                try:
+                    trainable = len(get_learning_job_store().query_trainable())
+                    parts.append(f"{trainable} approved learning task{'s' if trainable != 1 else ''} waiting.")
+                except Exception:
+                    self.log.exception("Could not query the learning job queue for status")
+
+                try:
+                    history = get_model_registry().history(limit=1)
+                    if history:
+                        latest = history[0]
+                        parts.append(f"Most recent model: {latest.model_version}, status {latest.status.lower()}.")
+                except Exception:
+                    self.log.exception("Could not query the model registry for status")
+
+                self._start_speech_task(" ".join(parts), "en", interaction_id)
+            except Exception:
+                self.log.exception("learning status task failed")
+                self._start_speech_task("I couldn't check the learning status, sir.", "en", interaction_id)
+
+        threading.Thread(target=work, name="jarvis-learning-status", daemon=True).start()

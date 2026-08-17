@@ -1,0 +1,11 @@
+{
+  "task_id": "syntax_runtime_bug_off_by_sign",
+  "category": "syntax_runtime_bug",
+  "description": "The add(a, b) function in calc.py has a bug: it subtracts instead of adding. Fix it so add(a, b) returns a + b.",
+  "fixture_dir": "syntax_runtime_bug_off_by_sign",
+  "hidden_test_path": "hidden_test.py",
+  "visible_test_paths": ["tests/test_calc.py"],
+  "timeout_seconds": 120.0,
+  "constraints": [],
+  "metadata": {}
+}

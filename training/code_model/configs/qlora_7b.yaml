@@ -1,0 +1,53 @@
+# Recommended real training run: Qwen2.5-Coder-7B-Instruct, QLoRA (4-bit
+# NF4), the config this repo recommends for a first real fine-tune.
+#
+# Apache-2.0 licensed, strong on held-out coding benchmarks among
+# comparably-sized open-weight models, native HF `transformers` support,
+# clean chat template. Update `base_model.model_id` here (not in
+# hf_backend.py) if you later want a different/newer base model -- the
+# orchestrator never hardcodes a model id.
+#
+# VRAM reality check (see training/code_model/hardware.py): 4-bit QLoRA of a
+# 7B model needs roughly 6-8GB VRAM at seq_len=1024-2048 with batch size 1 +
+# gradient checkpointing. An RTX 2060 (6GB) is BELOW that comfortably-safe
+# line -- hardware_preflight() will very likely report
+# LOCAL_TRAINING_NOT_FEASIBLE for this config on that GPU and recommend a
+# cloud GPU class instead. This file is the config to hand to that cloud
+# job, not necessarily to run locally as-is.
+name: qlora_7b
+method: qlora
+base_model:
+  model_id: Qwen/Qwen2.5-Coder-7B-Instruct
+  revision: null
+  trust_remote_code: false
+  tokenizer_id: null
+  max_sequence_length: 2048
+training:
+  output_dir: data/learning_checkpoints
+  learning_rate: 0.0002
+  num_train_epochs: 2
+  max_steps: null
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  warmup_ratio: 0.03
+  save_steps: 50
+  eval_steps: 50
+  logging_steps: 10
+  seed: 42
+  validation_split_ratio: 0.1
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  bias: none
+quantization:
+  enabled: true
+  bits: 4
+  quant_type: nf4
+  double_quant: true
+  compute_dtype: bfloat16
+runtime:
+  device: auto
+  dtype: auto
+  gradient_checkpointing: true

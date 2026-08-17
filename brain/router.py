@@ -76,6 +76,8 @@ def route_command(command: str) -> dict:
         return {"type": "start_learning"}
     if text.rstrip(".?!,;:") in {"stop learning", "stop the learning", "cancel learning", "cancel the learning"}:
         return {"type": "stop_learning"}
+    if text.rstrip(".?!,;:") in {"learning status", "what is the learning status", "what's the learning status", "status of learning"}:
+        return {"type": "learning_status"}
     if re.fullmatch(r"(?:make it (?:much )?shorter|shorten that|only (?:tell|give) me (?:the )?(?:top )?\d+)",text.rstrip(".?!,;:")):
         return {"type":"correct_interrupted_response","instruction":text.rstrip(".?!,;:")}
     recipient_correction=re.fullmatch(r"(?:don't send it to \S+,\s*)?send it to (.+?) instead",text.rstrip(".?!;:"))

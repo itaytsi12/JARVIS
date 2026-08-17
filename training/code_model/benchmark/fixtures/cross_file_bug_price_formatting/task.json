@@ -1,0 +1,11 @@
+{
+  "task_id": "cross_file_bug_price_formatting",
+  "category": "cross_file_bug",
+  "description": "order_summary(item_name, price_cents) in orders.py should return a formatted price string using format_price(cents) from formatting.py. format_price already expects an amount in cents. orders.py currently multiplies price_cents by 100 again before calling format_price, double-scaling the value. Fix the bug in orders.py's call to format_price -- do not change format_price's contract in formatting.py, since other callers depend on it.",
+  "fixture_dir": "cross_file_bug_price_formatting",
+  "hidden_test_path": "hidden_test.py",
+  "visible_test_paths": ["tests/test_orders.py"],
+  "timeout_seconds": 120.0,
+  "constraints": ["do not change formatting.py's format_price signature or contract"],
+  "metadata": {}
+}

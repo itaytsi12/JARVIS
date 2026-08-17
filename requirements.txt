@@ -6,3 +6,4 @@ sounddevice
 soundfile
 pyttsx3
 Pillow
+pyyaml

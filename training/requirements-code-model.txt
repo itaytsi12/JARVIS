@@ -1,0 +1,26 @@
+# Dedicated environment for the real LoRA/QLoRA coding-model training
+# backend (training/code_model/). Isolated from the main JARVIS runtime venv
+# and every other per-subsystem venv (.venv-agent, .venv-intent,
+# .venv-chatterbox) on purpose -- see CLAUDE.md's "Multiple requirements
+# files are intentional" section. Create with:
+#
+#   python -m venv .venv-code-model
+#   .venv-code-model\Scripts\python -m pip install --upgrade pip
+#   .venv-code-model\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   .venv-code-model\Scripts\python -m pip install -r training/requirements-code-model.txt
+#
+# torch is intentionally NOT pinned here: install it first, separately, from
+# the CUDA-specific index matching your driver (see training/code_model/hardware.py
+# for how to check what your GPU/driver support). Versions below are the
+# exact versions verified working (CUDA 4-bit bitsandbytes quantization
+# functionally tested end-to-end) against torch==2.6.0+cu124 on an
+# RTX 2060 (6GB VRAM) + driver CUDA 13.2 on 2026-08-17.
+
+transformers>=5.15,<6
+peft>=0.20,<0.21
+accelerate>=1.14,<2
+datasets>=5.0,<6
+bitsandbytes>=0.50,<0.51
+numpy>=2.4,<3
+pyyaml>=6,<7
+psutil>=7,<8

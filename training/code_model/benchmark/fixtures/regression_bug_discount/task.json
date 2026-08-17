@@ -1,0 +1,11 @@
+{
+  "task_id": "regression_bug_discount",
+  "category": "regression_bug",
+  "description": "apply_discount(items, percent) in inventory.py should reduce each item's price by percent percent, but currently does nothing (it's a no-op). Fix apply_discount without breaking total_value's existing, already-passing behavior in the same file.",
+  "fixture_dir": "regression_bug_discount",
+  "hidden_test_path": "hidden_test.py",
+  "visible_test_paths": ["tests/test_inventory.py"],
+  "timeout_seconds": 120.0,
+  "constraints": ["tests/test_inventory.py must continue to pass after the fix"],
+  "metadata": {}
+}
