@@ -21,6 +21,13 @@ from voice.elevenlabs_realtime_stt import (
     is_configured,
 )
 
+# Tests never need the real (production-default 300ms) post-`on_open`
+# auth-error grace window `connect()` now waits out (see module docstring
+# on the grace window itself) -- zero it here so this whole file stays
+# fast; the grace window's actual behavior is covered by its own dedicated
+# tests below, which set it explicitly per-test.
+os.environ.setdefault("ELEVENLABS_STT_AUTH_GRACE_MS", "0")
+
 
 class FakeWSApp:
     """A controllable stand-in for websocket.WebSocketApp. Tests choose
@@ -109,6 +116,33 @@ class ElevenLabsSTTConnectionTests(unittest.TestCase):
         session = ElevenLabsRealtimeSTT(api_key="sk-test", connect_timeout=0.05, ws_app_factory=_factory(never_open=True))
         with self.assertRaises(ElevenLabsSTTError):
             session.connect()
+
+    def test_auth_error_arriving_shortly_after_on_open_still_fails_connect(self):
+        # Confirmed live against the real ElevenLabs realtime endpoint: the
+        # WebSocket handshake (on_open) can succeed and THEN a business-
+        # logic auth_error message arrives (followed by close) -- on_open
+        # alone is not proof of a genuinely usable session. This simulates
+        # exactly that ordering: on_open fires synchronously, then a
+        # separate thread delivers the auth_error message shortly after,
+        # while connect() is still inside its post-open grace window.
+        def factory(url, header, on_open, on_message, on_error, on_close):
+            app = FakeWSApp(url, header, on_open, on_message, on_error, on_close)
+
+            def deliver_late_auth_error():
+                app.push("auth_error", error="You must be authenticated to use this endpoint.")
+
+            app._deliver_late_auth_error = deliver_late_auth_error
+            return app
+
+        with patch.dict(os.environ, {"ELEVENLABS_STT_AUTH_GRACE_MS": "500"}, clear=False):
+            session = ElevenLabsRealtimeSTT(api_key="sk-test", ws_app_factory=factory)
+            timer = threading.Timer(0.05, lambda: FakeWSApp.instances[0]._deliver_late_auth_error())
+            timer.start()
+            try:
+                with self.assertRaises(ElevenLabsSTTError):
+                    session.connect()
+            finally:
+                timer.cancel()
 
     def test_connect_error_raises_cleanly_never_crashes(self):
         session = ElevenLabsRealtimeSTT(api_key="sk-test", connect_timeout=1.0, ws_app_factory=_factory(fail_immediately=True))
@@ -214,13 +248,24 @@ class ElevenLabsSTTVoiceLanguageTests(unittest.TestCase):
         self.assertIn("language_code=he", url)
         self.assertNotIn("language_code=en", url)
 
-    def test_missing_voice_language_env_defaults_to_english(self):
+    def test_missing_voice_language_env_defaults_to_auto(self):
         env = dict(os.environ)
         env.pop("VOICE_LANGUAGE", None)
         with patch.dict(os.environ, env, clear=True):
             session = ElevenLabsRealtimeSTT(api_key="sk-test", ws_app_factory=_factory())
             session.connect()
-        self.assertIn("language_code=en", FakeWSApp.instances[0].url)
+        url = FakeWSApp.instances[0].url
+        self.assertIn("include_language_detection=true", url)
+        self.assertNotIn("language_code=", url)
+
+    def test_auto_mode_never_forces_a_language_code(self):
+        with patch.dict(os.environ, {"VOICE_LANGUAGE": "auto"}, clear=False):
+            session = ElevenLabsRealtimeSTT(api_key="sk-test", ws_app_factory=_factory())
+            session.connect()
+        url = FakeWSApp.instances[0].url
+        self.assertNotIn("language_code=en", url)
+        self.assertNotIn("language_code=he", url)
+        self.assertIn("include_language_detection=true", url)
 
     def test_unsupported_voice_language_fails_clearly_not_silently(self):
         from voice.voice_language import UnsupportedVoiceLanguage

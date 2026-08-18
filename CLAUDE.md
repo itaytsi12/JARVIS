@@ -100,23 +100,36 @@ configured or fails -- neither fallback was removed.
 - `voice/startup_validation.py` — logs which STT/TTS providers are active
   at startup (`run_tray()` and `voice_controller.run_voice_loop()`) without
   making a real (paid) API call just to check health.
-- `voice/voice_language.py` — the explicit `VOICE_LANGUAGE` mode
-  (`get_voice_language()`, `"en"` default or `"he"`; anything else raises
-  `UnsupportedVoiceLanguage` rather than guessing). No mixed-language/
-  auto-detected transcription -- both `voice/elevenlabs_realtime_stt.py`
-  (the realtime Scribe `language_code` query param -- same parameter this
-  client already sent, previously hardcoded to `"en"`) and
-  `voice/speech_to_text.py`'s local Whisper fallback read this SAME value.
-  Whisper additionally picks its DEFAULT model from it: `"small.en"`
-  (English-only, historical default) for `en`, `"small"` (multilingual --
-  the `.en` variants literally cannot transcribe Hebrew) for `he`, and
-  skips the English `initial_prompt` hint in Hebrew mode so it can't bias
-  output back toward English; `WHISPER_MODEL` still overrides either way.
-  Spoken OUTPUT stays English regardless
-  (`voice/language_utils.py::detect_dominant_language` is unchanged,
-  deliberately still hardcoded to `"en"` -- Hebrew TTS is out of scope for
-  now; see the language UX rule below for exactly what JARVIS says in
-  Hebrew mode). `brain/music_intent.py::classify_music_intent`
+- `voice/voice_language.py` — the `VOICE_LANGUAGE` mode: `"auto"`
+  (recommended default -- English OR Hebrew, detected per utterance),
+  `"en"` (forced English input), `"he"` (forced Hebrew input); anything
+  else raises `UnsupportedVoiceLanguage` rather than guessing. This is
+  STT INPUT only. `get_tts_language()` is a separate, hard-enforced policy
+  that ALWAYS returns `"en"` regardless of `VOICE_LANGUAGE` -- `TTS_LANGUAGE`
+  is read only so a non-`"en"` value can be reported/logged, it can never
+  change actual behavior (Hebrew TTS is out of scope). `detect_input_language(text)`
+  is the local, script-based (no LLM), Unicode-range (`֐`-`׿`)
+  per-utterance detector; `resolve_utterance_language(text)` is what
+  callers actually use -- the forced language in `en`/`he` mode, or
+  `detect_input_language(text)` in `auto` mode. Both
+  `voice/elevenlabs_realtime_stt.py`'s realtime Scribe session and
+  `voice/speech_to_text.py`'s local Whisper fallback read `get_voice_language()`
+  for INPUT configuration:
+  - Forced `en`/`he`: ElevenLabs sends an explicit `language_code` query
+    param (a real, documented ElevenLabs realtime parameter); Whisper
+    passes that code to `.transcribe(language=...)`.
+  - `auto`: ElevenLabs OMITS `language_code` and instead sends
+    `include_language_detection=true` (also a real, documented parameter
+    -- confirmed against the live API reference, not guessed) so Scribe
+    detects and preserves whichever language was actually spoken. Whisper
+    passes `language=None` (its own per-segment auto-detect), never the
+    literal string `"auto"` (not a real Whisper language code).
+  Whisper's DEFAULT model size is `"small.en"` (English-only, historical
+  default) only for forced `en`; `"small"` (multilingual -- the `.en`
+  variants literally cannot transcribe Hebrew) for `he` AND `auto`; the
+  English `initial_prompt` hint is skipped for anything but forced `en`
+  so it can't bias output back toward English; `WHISPER_MODEL` still
+  overrides either way. `brain/music_intent.py::classify_music_intent`
   detects Hebrew text itself (any `֐`-`׿` character) and routes
   through a separate, self-contained Hebrew pattern set
   (`_classify_hebrew_intent`) covering the same intents as the English
@@ -126,12 +139,109 @@ configured or fails -- neither fallback was removed.
   search query. `tools/music/apple_music_provider.py::_norm` was fixed
   from an ASCII-only `[^a-z0-9 ]` filter (which silently stripped Hebrew
   titles to nothing before fuzzy-scoring them) to a Unicode-aware `\w`
-  filter. Known limitation: an artist whose Apple Music catalog metadata
-  is itself in Latin script (e.g. "Omer Adam") can still be mis-ranked
-  against a Hebrew-titled search, since local fuzzy-text scoring can't
-  bridge a script mismatch the way Apple's own search backend does --
-  Hebrew-titled content (the common case) is unaffected and confirmed
-  live to work correctly.
+  filter. `_classify_hebrew_intent`'s song/query extraction is a single
+  merged pattern (`(?:נגן|תנגן|שים) (?:לי )?(?:את ה(?:שיר|סינגל) )?(.+)`)
+  covering every combination of verb + optional dative filler ("לי") +
+  optional "את השיר"/"את הסינגל" wrapper -- the remaining substring is
+  captured WHOLE via `(.+)` and never tokenized, so an arbitrary
+  multi-word title ("שני משוגעים", "יום חדש", "דרך השלום") always comes
+  through intact (confirmed live: an earlier, narrower set of separate
+  patterns -- one requiring exactly "נגן"/"תנגן" for the "את השיר" wrapper,
+  none stripping "לי" -- meant "שים לי X" incorrectly kept "לי" as part of
+  the song, and "שים את השיר X" didn't strip the wrapper at all). Optional
+  song+artist qualification ("X של Y" / "X מאת Y") is split by
+  `_split_hebrew_song_artist` on the LAST such separator (own dedicated
+  known limitation: a song title that itself legitimately contains a
+  standalone "של"/"מאת" word would be mis-split -- not distinguishable
+  from a real qualifier by text alone). `tools/music/apple_music_provider.py`'s
+  `_PLAY_DISPATCH["PLAY_QUERY"]` reuses `_play_song` (not the ambiguous
+  `_play_query`) whenever an artist is present, so the artist is used for
+  both a better catalog search AND post-playback verification instead of
+  being silently dropped. Known limitation: an artist whose Apple Music
+  catalog metadata is itself in Latin script (e.g. "Omer Adam") can still
+  be mis-ranked against a Hebrew-titled SEARCH query, since local
+  fuzzy-text scoring can't bridge a script mismatch the way Apple's own
+  search backend does -- Hebrew-titled content (the common case) is
+  unaffected and confirmed live to work correctly; separately, the same
+  cross-script mismatch on VERIFICATION (comparing the spoken Hebrew
+  artist name against the observed Latin-script player-bar text) is
+  handled in `_play_and_record`: once the SONG itself is a confirmed exact
+  match, an unbridgeable Hebrew-vs-Latin artist mismatch no longer blocks
+  `verified` (transliterating to force a match would violate the "never
+  transliterate Hebrew" rule; a same-script but genuinely wrong artist
+  still correctly fails verification).
+
+  **False-success rule (confirmed live and fixed):** `_play_and_record`
+  used to return `success=True` unconditionally -- a search hit, row
+  click, or Play-button click succeeding was never itself treated as
+  proof the RIGHT track is playing, but the reported `success` field said
+  otherwise regardless of the independently-computed `verified` flag,
+  meaning the honest "I started the request, but I couldn't confirm the
+  track, sir." hedge was already being composed but never actually
+  reached the user (background_assistant.py's ack/response architecture
+  stays silent on `success=True`). `success` is now `verified` for this
+  path specifically -- the same convention every other tool in this
+  codebase already follows (`tools/applications.py`, `tools/system.py`'s
+  window-state tools) when a claimed outcome can be independently
+  confirmed. A short, bounded settle-retry (up to 3 tries, 300ms apart)
+  covers a live-observed timing race where the player-bar's marquee
+  label can very briefly report stale/inconsistent artist text
+  immediately after a fresh play trigger (song text was correct every
+  time this was observed; not reliably reproduced on repeated fresh
+  triggers, so this is defensive, not a confirmed root cause).
+  `music_now_playing` no longer falls back to the locally-remembered
+  last-requested song when the live DOM can't be read -- it now honestly
+  reports `"I can't tell what's currently playing, sir."` instead,
+  since local/requested state can silently disagree with what a human
+  changed via another route entirely.
+
+  **Preview-vs-full-playback: root-caused and fixed live (storefront
+  mismatch, NOT DRM/CDP).** An earlier investigation pass wrongly
+  suspected DRM/EME behaving differently under CDP attachment -- fully
+  superseded once the user reported previews happen even on a fully
+  manual click inside the SAME dedicated JARVIS Chrome (ruling out
+  Playwright/automation as a factor entirely). The REAL, confirmed-live
+  root cause: `search()`, `get_recently_played()` (`/listen-now`), and
+  `list_library_playlists()` (`/library/all-playlists`) all navigated to
+  storefront-LESS URLs (e.g. `music.apple.com/search?term=...`), which
+  Apple silently redirects to the `us` storefront regardless of the
+  signed-in account's actual region -- while the bare root `/` correctly
+  redirects to the account's real storefront (confirmed live: `/il/home`
+  for this account). Every search result inherited a `/us/...` href,
+  pointing at catalog content the account's subscription has no
+  full-playback entitlement for; Apple Music Web serves only a short
+  instant-preview clip for that (standard, expected behavior for
+  cross-region catalog access) while the player-bar UI still reports
+  completely normal "now playing" state -- so song/artist metadata
+  matching alone was never sufficient proof this was a full play, which
+  is what `playback_type()` below exists to catch independently of the
+  root cause. Live evidence ruling out DRM/CDP specifically:
+  `navigator.requestMediaKeySystemAccess('com.widevine.alpha', ...)` is
+  called by MusicKit JS and succeeds every time (`result: 'granted'`);
+  zero DRM/license network traffic occurs for a `/us/` play at all (the
+  site chooses a plain unencrypted preview file up front, never even
+  attempting a DRM handshake); the account's MusicKit `musicUserToken`/
+  `isAuthorized` state is valid. Playing the SAME song via its `/il/...`
+  href was confirmed live to switch to a real MSE-backed streaming
+  `<audio>` element (`duration: Infinity`, no `AudioPreview` CDN path in
+  its `currentSrc`) instead of the static preview file.
+  `AppleMusicWebController._resolve_storefront()` now resolves the real
+  storefront once (via the root-redirect trick above, cached for the
+  controller's lifetime, falling back to `"us"` -- the previous, if
+  wrong, hardcoded behavior -- on any resolution failure) and every
+  storefront-less URL in this module uses it.
+
+  `AppleMusicWebController.playback_type()` still independently detects
+  whether current audio is a short instant-PREVIEW clip (a plain
+  `<audio>` element on Apple's `AudioPreview<N>` CDN path, ~90s or a
+  `duration` this low) rather than real full-track streaming, kept as a
+  defense-in-depth signal (e.g. against a future storefront-resolution
+  edge case, or an account genuinely without full-catalog entitlement for
+  a specific track) even now that the storefront bug itself is fixed --
+  `_play_and_record` downgrades `verified`/`success` to `False` with the
+  message `"I could only start a short preview, not the full track,
+  sir."` whenever one is detected, rather than silently accepting a
+  preview as a successful play.
 - `voice/background_assistant.py::_process_capture` accepts an optional
   ElevenLabs committed transcript (skips Whisper entirely when present),
   an optional `PartialActionLedger` (dedupes the final route/plan against
@@ -148,35 +258,77 @@ configured or fails -- neither fallback was removed.
   phrase, transcribes it, synthesizes and plays one phrase). Never run by
   the automated test suite.
 
-**Language UX rule — TTS speaks English only, always, even in Hebrew
-mode.** For an English command, `voice/response_formatter.py::format_spoken_response`
-still composes the usual contextual English phrasing ("Opening YouTube,
-sir." / "Playing Starboy, sir."), unchanged. For a Hebrew command
-(`voice/voice_language.py::is_hebrew_mode()` true), JARVIS must never
-speak the recognized Hebrew entity/song/playlist text, nor translate or
-transliterate it -- the action itself still receives and uses that exact
-Hebrew text (e.g. the Apple Music search query), only the TTS output is
-restricted. `voice/response_formatter.py::generic_acknowledgement()`
-(a random pick from a fixed 4-phrase, always-English, entity-free tuple:
-"Okay, on it, sir." / "Certainly, sir." / "Right away, sir." / "On it,
-sir.") and `generic_failure_message()` (fixed: "I couldn't complete that
-action, sir.") exist for exactly this. `voice/background_assistant.py::_process_capture`'s
-main command path branches on `is_hebrew_mode()`: in Hebrew mode it fires
-`generic_acknowledgement()` via `_start_speech_task` immediately, BEFORE
-the blocking `run_agent(...)` call even starts (not gated on
-`_command_needs_planning` the way the English "I'll check that, sir."
-ack is) -- action execution and the acknowledgement genuinely overlap,
-never sequential. After `run_agent` returns, Hebrew mode speaks nothing
-further on success (the immediate ack already covered it -- never speaks
-twice for one outcome) and exactly one `generic_failure_message()` on
-failure (checked via `execution_outcome["success"]`, which `brain/agent.py::run_agent`
-always populates), instead of calling `format_spoken_response` with the
-raw response text the way English mode does. This only covers the main
-synchronous command path (`_process_capture`'s `tool`/`local_plan`/
-`plan`/`ai` routes); `_start_question_task` (QUESTION-type routes) and
-`_start_cancellable_action_task` (WhatsApp send/message/tell,
-`analyze_screen`) are separate dispatch paths not covered by this rule --
-they were out of scope for this change.
+**Language UX rule — TTS speaks English only, always; every command gets
+an immediate pre-action acknowledgement that overlaps with execution.**
+`voice/background_assistant.py::_process_capture`'s main command path
+(`tool`/`local_plan`/`plan`/`ai` routes -- QUESTION-type routes via
+`_start_question_task` and WhatsApp send/message/tell/`analyze_screen`
+via `_start_cancellable_action_task` are separate dispatch paths, out of
+scope here) resolves `input_language = resolve_utterance_language(transcript)`
+per utterance, then immediately (BEFORE the blocking `run_agent(...)`
+call even starts -- action and acknowledgement genuinely overlap, never
+sequential) fires exactly one acknowledgement via `_start_speech_task`:
+- English utterance: `voice/response_formatter.py::compose_contextual_ack(route)`
+  -- deterministic (no LLM), derived only from the resolved route's
+  tool/arguments ("Opening YouTube, sir." / "Playing Starboy, sir." /
+  "Okay, playing your Gym playlist, sir." / "I'll check that, sir." for
+  `plan`/`ai` routes / "On it, sir." fallback for an unmapped tool). Never
+  claims completion ("Opening YouTube, sir.", never "YouTube is open,
+  sir.").
+- Hebrew utterance: `generic_acknowledgement()` -- a random pick from a
+  fixed 4-phrase, always-English, entity-free tuple ("Okay, on it, sir."
+  / "Certainly, sir." / "Right away, sir." / "On it, sir."). The action
+  itself still receives and uses the exact Hebrew text (e.g. the Apple
+  Music search query) -- only the TTS output is restricted; Hebrew is
+  never spoken, translated, or transliterated.
+
+After `run_agent` returns (checked via `execution_outcome["success"]`,
+which `brain/agent.py::run_agent` always populates): on success, NOTHING
+further is spoken for either language (the immediate ack already covered
+it -- never speaks twice for one outcome). On failure, exactly one more
+message: English reuses `format_spoken_response`'s existing specific,
+user-friendly tool failure text (e.g. "I couldn't confirm playback,
+sir."); Hebrew always uses the fixed, entity-free `generic_failure_message()`
+("I couldn't complete that action, sir.") instead, since the tool's own
+failure text could itself contain the recognized Hebrew entity.
+
+**Planner must never override an already-resolved deterministic route.**
+`brain/agent.py::_run_agent_impl` used to decide whether to invoke the
+task planner from `should_use_task_planner(command)` ALONE, independent
+of whether `route_command` had already resolved a deterministic route --
+confirmed live that a Hebrew music command could this way reach the
+generic (cloud) planner and have it invent its own action (observed:
+opening `music.youtube.com` instead of using the already-correct Apple
+Music route). `_is_deterministic_music_route(route)` now guards this:
+when `route` is already a `{"type": "tool", "tool": "open_music" |
+"music_*"}` route (everything `brain/music_intent.py::route_music_command`
+returns), the planner is never even consulted, for either language.
+`brain/router.py::route_command` also gained a small Hebrew
+website-name lookup (`יוטיוב`/`גוגל`/`רדיט`/`גיטהאב`/`טיקטוק`) checked
+before its generic `open_application` fallback -- Hebrew "פתח
+יוטיוב"/"תפתח יוטיוב" previously fell through to (and failed) trying to
+launch a nonexistent desktop app named after the Hebrew site word, since
+the existing English website-alias branch only ever matched an ASCII
+`"open "`/`"go to "` prefix.
+
+`python -m brain.music_intent "<text>"` is a no-voice-needed diagnostic
+(`brain/music_intent.py::_diagnose`) printing detected language,
+normalized text, classified intent, extracted entities, resolved
+provider, route type, and tool for one input string -- the fastest way to
+trace which layer a live Hebrew (or English) routing failure broke at.
+
+**ElevenLabs realtime STT: on_open is not proof of an authenticated
+session.** Confirmed live against the real API: the WebSocket handshake
+can succeed (`on_open` fires) and a business-logic `auth_error` message
+then arrives shortly AFTER, followed by the server closing the
+connection -- this reproduced the exact observed symptom of a silent,
+unlogged fallback to Whisper with no error anywhere. `connect()` now
+waits a brief additional grace window (`ELEVENLABS_STT_AUTH_GRACE_MS`,
+default 300ms) after `on_open` for an error/close before declaring the
+session genuinely ready. Safe diagnostic logging was added throughout
+the STT path (`[STT] configured_provider=...`, `voice_language_mode=...`,
+`active_provider=...`, `provider_fallback_reason=...`,
+`committed_language=...`, `committed_text=...`) -- never keys/tokens.
 
 ### Music (Alexa-like Apple Music Web control)
 

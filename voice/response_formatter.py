@@ -52,6 +52,99 @@ def generic_failure_message() -> str:
     return _GENERIC_FAILURE_MESSAGE
 
 
+_FALLBACK_ACK = "On it, sir."
+
+
+def _ack_for_tool(tool: str | None, args: dict) -> str | None:
+    """Deterministic (no LLM), present-progressive acknowledgement text for
+    a route BEFORE it has executed -- reuses the same friendly-name helpers
+    `_describe_action`/`format_spoken_response` use for the (unrelated,
+    post-execution) completion phrasing, so the two never invent
+    conflicting names for the same site/app. Returns None for a tool this
+    composer has no specific phrasing for -- callers fall back to
+    `_FALLBACK_ACK`."""
+    if tool == "open_website":
+        url = args.get("url", "")
+        query = _extract_search_query(url)
+        site = _pretty_site_name(url)
+        if query:
+            return f"Okay, I'm searching for {urllib.parse.unquote_plus(query)}, sir."
+        return f"Opening {site}, sir."
+    if tool == "youtube_search":
+        query = args.get("query", "")
+        return f"Okay, I'm searching for {query}, sir."
+    if tool == "open_application":
+        return f"Opening {_natural_name(str(args.get('app_name') or 'that'))}, sir."
+    if tool in ("close_application", "close_window"):
+        return f"Closing {_natural_name(str(args.get('app_name') or 'that'))}, sir."
+    if tool == "music_play":
+        song, artist, playlist = args.get("song"), args.get("artist"), args.get("playlist")
+        intent = args.get("intent")
+        if song:
+            return f"Playing {song}, sir."
+        if artist:
+            return f"Playing {artist}, sir."
+        if playlist:
+            return f"Okay, playing your {playlist} playlist, sir."
+        if intent == "PLAY_LAST_PLAYED":
+            return "Okay, playing the last song you listened to, sir."
+        if intent == "RESUME_LAST_SESSION":
+            return "Okay, resuming your music, sir."
+        return "Okay, playing music, sir."
+    if tool == "open_music":
+        return "Opening Apple Music, sir."
+    if tool == "music_next":
+        return "Okay, next song, sir."
+    if tool == "music_previous":
+        return "Okay, previous song, sir."
+    if tool in ("music_pause",):
+        return "Pausing, sir."
+    if tool in ("music_resume",):
+        return "Resuming, sir."
+    if tool in ("music_stop",):
+        return "Stopping, sir."
+    if tool == "music_now_playing":
+        return "Okay, checking, sir."
+    if tool == "calculator":
+        return "Okay, calculating, sir."
+    if tool == "take_screenshot":
+        return "Okay, taking a screenshot, sir."
+    if tool == "analyze_screen":
+        return "Okay, I'll take a look, sir."
+    if tool == "volume_up":
+        return "Turning the volume up, sir."
+    if tool == "volume_down":
+        return "Turning the volume down, sir."
+    if tool == "mute_volume":
+        return "Muting, sir."
+    return None
+
+
+def compose_contextual_ack(route: dict | None) -> str:
+    """The immediate, pre-execution English acknowledgement for an ENGLISH
+    command (Part 7/9/10 of the bilingual voice UX rule): deterministic,
+    derived only from the resolved route/tool -- never an LLM call, never
+    claims completion ("Opening YouTube, sir." not "YouTube is open,
+    sir."). Hebrew commands never call this -- see `generic_acknowledgement`
+    instead, which is entity-free by construction."""
+    if not route:
+        return _FALLBACK_ACK
+    rtype = route.get("type")
+    if rtype == "tool":
+        return _ack_for_tool(route.get("tool"), route.get("arguments") or {}) or _FALLBACK_ACK
+    if rtype in ("plan", "ai"):
+        return "I'll check that, sir."
+    if rtype == "local_plan":
+        actions = route.get("actions") or []
+        if actions:
+            first_tool, first_args = _action_parts(actions[0])
+            ack = _ack_for_tool(first_tool, first_args)
+            if ack:
+                return ack
+        return "Okay, I'll get started, sir."
+    return _FALLBACK_ACK
+
+
 def _pretty_site_name(url: str) -> str:
     try:
         p = urllib.parse.urlparse(url)

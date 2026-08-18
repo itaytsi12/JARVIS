@@ -292,6 +292,67 @@ class LiveConfirmedUrlTests(unittest.TestCase):
         self.assertIn("/listen-now", goto_url)
 
 
+class StorefrontResolutionTests(unittest.TestCase):
+    """Root-cause fix for a confirmed-live preview-only-playback bug: every
+    storefront-LESS URL this module used to build silently defaulted to
+    the `us` storefront regardless of the signed-in account's actual
+    region, so search results pointed at catalog content the account's
+    subscription had no full-playback entitlement for."""
+
+    def _controller_with_url(self, resolved_url):
+        session = FakeSession()
+        page = session.page_to_return
+        page.url = resolved_url
+        return AppleMusicWebController(session=session), page
+
+    def test_resolves_storefront_from_root_redirect(self):
+        controller, page = self._controller_with_url("https://music.apple.com/il/home")
+        self.assertEqual(controller._resolve_storefront(), "il")
+
+    def test_resolution_is_cached_not_repeated(self):
+        controller, page = self._controller_with_url("https://music.apple.com/il/home")
+        controller._resolve_storefront()
+        goto_calls_after_first = page.goto.call_count
+        controller._resolve_storefront()
+        self.assertEqual(page.goto.call_count, goto_calls_after_first)
+
+    def test_falls_back_to_us_when_url_unrecognized(self):
+        session = FakeSession()
+        page = session.page_to_return
+        page.url = Mock()  # not a real string -- resolution must not crash
+        controller = AppleMusicWebController(session=session)
+        self.assertEqual(controller._resolve_storefront(), "us")
+
+    def test_falls_back_to_us_when_navigation_raises(self):
+        session = FakeSession()
+        page = session.page_to_return
+        page.goto.side_effect = Exception("network error")
+        controller = AppleMusicWebController(session=session)
+        self.assertEqual(controller._resolve_storefront(), "us")
+
+    def test_search_uses_resolved_storefront_in_url(self):
+        controller, page = self._controller_with_url("https://music.apple.com/il/home")
+        page.get_by_role.return_value.first.wait_for.side_effect = Exception("no results")
+        page.get_by_role.return_value.all.return_value = []
+        controller.search("שני משוגעים")
+        goto_url = page.goto.call_args.args[0]
+        self.assertIn("/il/search", goto_url)
+
+    def test_library_playlists_uses_resolved_storefront_in_url(self):
+        controller, page = self._controller_with_url("https://music.apple.com/il/home")
+        page.locator.return_value.all.return_value = []
+        controller.list_library_playlists()
+        goto_url = page.goto.call_args.args[0]
+        self.assertIn("/il/library/all-playlists", goto_url)
+
+    def test_recently_played_uses_resolved_storefront_in_url(self):
+        controller, page = self._controller_with_url("https://music.apple.com/il/home")
+        page.get_by_text.return_value.first.wait_for.side_effect = Exception("not found")
+        controller.get_recently_played()
+        goto_url = page.goto.call_args.args[0]
+        self.assertIn("/il/listen-now", goto_url)
+
+
 class PlaybackInteractionTests(unittest.TestCase):
     """Confirmed live: a track row's own "Play <title> by <artist>" button
     reliably starts that exact track; the page-level hero PLAY button can

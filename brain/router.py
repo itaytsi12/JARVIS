@@ -439,6 +439,32 @@ def route_command(command: str) -> dict:
         }
 
     # -------------------------
+    # Hebrew "open <website>" (e.g. "פתח יוטיוב") -- mirrors the English
+    # website-alias branch above (line ~283), which only ever matched an
+    # ASCII "open "/"go to " prefix and so never got a chance to run for
+    # Hebrew "פתח"/"תפתח" phrasing; that phrasing fell all the way through
+    # to the generic open_application branch below instead, which then
+    # tried (and fails) to launch a nonexistent desktop app named after the
+    # Hebrew site word. Only a small, explicit set of Hebrew website names
+    # is recognized here -- unrecognized Hebrew targets still correctly
+    # fall through to open_application, unchanged.
+    # -------------------------
+    hebrew_website_names = {
+        "יוטיוב": "youtube", "גוגל": "google", "רדיט": "reddit",
+        "גיטהאב": "github", "טיקטוק": "tiktok",
+    }
+    hebrew_open_match = re.match(r"^(?:תפתח|פתח)\s+(.+)$", text)
+    if hebrew_open_match:
+        hebrew_target = hebrew_open_match.group(1).strip().rstrip(".?!,;:")
+        website_key = hebrew_website_names.get(hebrew_target)
+        if website_key and website_key in WEBSITE_ALIASES:
+            return {
+                "type": "tool",
+                "tool": "open_website",
+                "arguments": {"url": WEBSITE_ALIASES[website_key]},
+            }
+
+    # -------------------------
     # Open applications
     # -------------------------
 

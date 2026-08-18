@@ -46,6 +46,13 @@ def _get_state_store():
     return get_music_state_store()
 
 
+_HEBREW_CHAR = re.compile(r"[֐-׿]")
+
+
+def _contains_hebrew(text: str) -> bool:
+    return bool(_HEBREW_CHAR.search(text or ""))
+
+
 def _norm(text: str) -> str:
     # Unicode-aware: `\w` matches Hebrew (and any other script) letters,
     # not just ASCII -- an `[^a-z0-9 ]` ASCII-only version used to strip
@@ -297,15 +304,18 @@ def music_add_to_favorites() -> dict[str, Any]:
 
 
 def music_now_playing(aspect: str = "song") -> dict[str, Any]:
+    # "What's playing" must reflect the REAL, live player DOM at this
+    # exact moment -- never the last song JARVIS itself requested, a
+    # search query, or locally-remembered state, all of which can be
+    # stale or simply wrong the instant a human changes the track another
+    # way. `current_track_info()` is the single source of truth here;
+    # honest failure ("I can't tell what's currently playing, sir.") beats
+    # ever answering from stale local state.
     controller = _get_controller()
     info: dict[str, Any] = {}
     if controller.is_session_live() and controller.page is not None:
         info = controller.current_track_info()
         _maybe_record_observed_playback(info)
-    if not info.get("observed"):
-        state = _get_state_store().get_state()
-        if state.current_song:
-            info = {"song": state.current_song, "artist": state.current_artist, "observed": True}
     if not info.get("observed"):
         return _result(False, "I can't tell what's currently playing, sir.", error="now_playing_unavailable")
     if aspect == "artist":
@@ -416,7 +426,49 @@ def _play_and_record(controller, match: dict[str, Any], expected_song: str | Non
     info = controller.current_track_info() if playing else {}
     song_match = bool(expected_song) and info.get("observed") and _title_matches(expected_song, info.get("song") or "")
     artist_match = not expected_artist or (info.get("observed") and _title_matches(expected_artist, info.get("artist") or "", threshold=0.5))
+    # Observed live: the player-bar's marquee/scroller label can very
+    # briefly report inconsistent text right after a fresh play trigger
+    # (once observed an artist button read as "Song by <artist>" instead
+    # of "<artist>" alone, immediately after starting playback, though not
+    # reliably reproduced on repeated fresh triggers). The SONG matched
+    # correctly every time this was observed -- only the artist label
+    # looked transiently stale -- so a short, bounded re-read specifically
+    # covers a failed artist_match without re-doing song verification or
+    # adding latency to the common case (playing/song_match already true
+    # and artist_match already true skips this entirely).
+    if playing and song_match and not artist_match and expected_artist:
+        for _ in range(3):
+            time.sleep(0.3)
+            info = controller.current_track_info()
+            artist_match = info.get("observed") and _title_matches(expected_artist, info.get("artist") or "", threshold=0.5)
+            if artist_match:
+                break
+    # Known limitation (already documented): an artist whose real Apple
+    # Music catalog metadata is Latin-script (e.g. "Omer Adam") can never
+    # fuzzy-match a Hebrew-spoken artist name ("עומר אדם") -- no shared
+    # characters at all, so no threshold fixes it, and transliterating
+    # here to force a match would violate the "never transliterate
+    # Hebrew" rule. Once the SONG itself is a confirmed, exact match, an
+    # unbridgeable script mismatch on the artist alone must not turn a
+    # genuinely correct play into a reported failure -- it's the search
+    # query dispatch (`_play_song`'s `f"{song} {artist}"` combined query)
+    # that already used the Hebrew artist name to FIND the right result;
+    # this is purely a verification-time comparison limit.
+    if not artist_match and expected_artist and _contains_hebrew(expected_artist) and info.get("artist") and not _contains_hebrew(info["artist"]):
+        artist_match = bool(song_match)
     verified = bool(playing and (song_match or (not expected_song and playing)) and artist_match)
+    # Preview-vs-full detection (confirmed live, see
+    # AppleMusicWebController.playback_type's docstring for the full
+    # investigation): song/artist metadata matching is NOT sufficient
+    # proof of full playback -- Apple's short instant-preview clip shows
+    # the exact same "now playing" song/artist/is_playing state as real
+    # full-track streaming. A verified song/artist match downgrades to
+    # unverified (never claimed as confirmed success) when the actual
+    # audio is a detected preview.
+    playback = controller.playback_type() if playing else {"observed": False}
+    is_preview = bool(playback.get("observed") and playback.get("is_preview"))
+    if is_preview:
+        verified = False
     store = _get_state_store()
     if playing:
         store.record_track(
@@ -432,11 +484,21 @@ def _play_and_record(controller, match: dict[str, Any], expected_song: str | Non
         return _result(False, f"I found {match['title']}, but playback didn't start.", error="playback_did_not_start")
     song_name = info.get("song") or match.get("title")
     artist_name = info.get("artist") or expected_artist
-    if verified:
+    if is_preview:
+        message = "I could only start a short preview, not the full track, sir."
+    elif verified:
         message = f"Playing {song_name} by {artist_name}." if artist_name else f"Playing {song_name}."
     else:
-        message = f"Started playback, but I couldn't confirm it's exactly {expected_song or match.get('title')}."
-    return _result(True, message, verified=verified, song=song_name, artist=artist_name)
+        # False-success rule: a row click / Play click succeeding is NOT
+        # itself proof the right track is playing (search returning a
+        # result, or a click landing, are exactly the false signals this
+        # must never trust) -- only observed player metadata matching the
+        # requested song/artist counts as confirmed. `success=False` here
+        # (not the previous hardcoded `True`) is what makes this honest
+        # hedge actually reach the user instead of being silently treated
+        # as a normal success with nothing further spoken.
+        message = "I started the request, but I couldn't confirm the track, sir."
+    return _result(verified, message, verified=verified, song=song_name, artist=artist_name, is_preview=is_preview)
 
 
 def _play_song(song: str, artist: str | None) -> dict[str, Any]:
@@ -690,7 +752,15 @@ _PLAY_DISPATCH = {
     "PLAY_ARTIST": lambda a: _play_artist(a["artist"]),
     "PLAY_ALBUM": lambda a: _play_album(a["album"], a.get("artist")),
     "PLAY_PLAYLIST": lambda a: _play_playlist(a.get("playlist"), a.get("scope"), bool(a.get("shuffle"))),
-    "PLAY_QUERY": lambda a: _play_query(a.get("song") or a.get("raw_text") or "", bool(a.get("contextual"))),
+    # A PLAY_QUERY with an artist attached (e.g. Hebrew "X של Y" / "X מאת Y"
+    # -- see brain/music_intent.py::_split_hebrew_song_artist) is really a
+    # song+artist request, not an ambiguous bare query -- reuse _play_song
+    # so the artist is both used for a better catalog search AND for
+    # post-playback verification, instead of being silently dropped.
+    "PLAY_QUERY": lambda a: (
+        _play_song(a["song"], a["artist"]) if a.get("song") and a.get("artist")
+        else _play_query(a.get("song") or a.get("raw_text") or "", bool(a.get("contextual")))
+    ),
     "PLAY_LAST_PLAYED": lambda a: _play_last_played(),
     "PLAY_RECENT": lambda a: _play_recent(),
     "RESUME_LAST_SESSION": lambda a: _resume_last_session(),

@@ -586,23 +586,31 @@ class AlwaysOnAssistant:
                 self._start_cancellable_action_task(command,route,interaction_id,transcript)
                 return
             needs_planning = self._command_needs_planning(command, route)
-            from .voice_language import is_hebrew_mode
-            hebrew_mode = is_hebrew_mode()
-            if hebrew_mode:
-                # Language UX rule: TTS speaks English only, always. A
-                # Hebrew-mode command's action (which DOES receive/preserve
-                # the exact recognized Hebrew entities -- see
-                # brain/music_intent.py) must never have its Hebrew
-                # payload spoken back, translated, or transliterated. The
-                # generic ack starts immediately, concurrently with the
-                # action below -- never waits for it to finish.
-                if not self.muted:
-                    from .response_formatter import generic_acknowledgement
-                    perf.mark("acknowledgement_tts_request")
-                    self._start_speech_task(generic_acknowledgement(), "en", None)
-            elif needs_planning and not self.muted:
+            # Bilingual voice UX: VOICE_LANGUAGE (auto/en/he) controls STT
+            # INPUT only -- the ACTUAL per-utterance input language (what
+            # decides ack wording) is resolved here, per utterance, never
+            # assumed from the configured mode alone (auto mode especially
+            # must not treat every utterance as one fixed language).
+            from .voice_language import resolve_utterance_language
+            input_language = resolve_utterance_language(transcript)
+            hebrew_mode = input_language == "he"
+            if not self.muted:
                 perf.mark("acknowledgement_tts_request")
-                self._start_speech_task("I'll check that, sir.", "en", None)
+                if hebrew_mode:
+                    # TTS speaks English only, always. A Hebrew command's
+                    # action (which DOES receive/preserve the exact
+                    # recognized Hebrew entities -- see
+                    # brain/music_intent.py) must never have its Hebrew
+                    # payload spoken back, translated, or transliterated.
+                    from .response_formatter import generic_acknowledgement
+                    self._start_speech_task(generic_acknowledgement(), "en", None)
+                else:
+                    # Deterministic, non-LLM contextual ack ("Opening
+                    # YouTube, sir." / "Playing Starboy, sir.") fired
+                    # immediately, BEFORE run_agent below even starts --
+                    # action and acknowledgement genuinely overlap.
+                    from .response_formatter import compose_contextual_ack
+                    self._start_speech_task(compose_contextual_ack(route), "en", None)
             self._perf("execution_started")
             if needs_planning:
                 perf.mark("planner_started")
@@ -616,19 +624,20 @@ class AlwaysOnAssistant:
                 return
             response_text = response.get("message") if isinstance(response, dict) else str(response)
             self.log.info("Final action result: %s", _redact_for_log(response_text))
-            if hebrew_mode:
-                # Success: the immediate generic ack above already covered
-                # it -- no additional speech (never speak twice for the
-                # same outcome). Failure: exactly ONE short, generic,
-                # English follow-up -- never the contextual message, which
-                # could contain the recognized Hebrew text.
-                if execution_outcome.get("success"):
-                    lang, spoken = "en", None
-                else:
-                    from .response_formatter import generic_failure_message
-                    lang, spoken = "en", generic_failure_message()
+            # Success: the immediate ack above already covered it -- no
+            # additional speech, for EITHER language (never speak twice for
+            # the same outcome). Failure: exactly ONE short English
+            # follow-up. Hebrew always uses the generic, entity-free
+            # failure message (the tool's own failure text could contain
+            # the recognized Hebrew entity); English reuses the specific,
+            # user-friendly tool failure message where one exists.
+            if execution_outcome.get("success"):
+                lang, spoken = "en", None
+            elif hebrew_mode:
+                from .response_formatter import generic_failure_message
+                lang, spoken = "en", generic_failure_message()
             else:
-                lang = detect_dominant_language(transcript)
+                lang = "en"
                 spoken = format_spoken_response(command, route, response_text, lang=lang, execution=execution_outcome)
             self._perf("formatter_completed")
             self.log.info("Formatter result / final spoken response: %s",_redact_for_log(spoken))

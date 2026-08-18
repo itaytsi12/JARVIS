@@ -68,7 +68,10 @@ class RealtimeSTTController:
                 self._flush_pending()
             except Exception as exc:
                 self._connect_error = exc
-                log.info("ElevenLabs realtime STT unavailable this interaction: %s", exc)
+                log.info(
+                    "[STT] active_provider=whisper_fallback provider_fallback_reason=%s: %s",
+                    type(exc).__name__, str(exc)[:300],
+                )
             finally:
                 self._connected.set()
 

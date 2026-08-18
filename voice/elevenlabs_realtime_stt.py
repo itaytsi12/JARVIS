@@ -60,6 +60,16 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _safe_error_reason(exc: Exception) -> str:
+    """A loggable connect-failure reason with the API key stripped, in case
+    it ever ended up embedded in an underlying library's error string."""
+    text = str(exc)
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if api_key:
+        text = text.replace(api_key, "<redacted>")
+    return text[:300]
+
+
 def is_configured() -> bool:
     """Whether ElevenLabs realtime STT is both configured AND its client
     library is installed -- checked cheaply, no network call, no credits
@@ -144,20 +154,29 @@ class ElevenLabsRealtimeSTT:
 
     # -- lifecycle -----------------------------------------------------
     def connect(self) -> None:
-        # `language_code` is the same query parameter this client has
-        # always sent to ElevenLabs' realtime Scribe endpoint (no new/
-        # guessed parameter) -- only its VALUE now comes from the single
-        # explicit `VOICE_LANGUAGE` mode (see voice/voice_language.py)
-        # instead of being hardcoded to English. "en"/"he" are both valid
-        # ISO-639-1 codes Scribe accepts directly.
+        # `language_code` and `include_language_detection` are both real,
+        # documented query parameters of ElevenLabs' realtime Scribe
+        # endpoint (confirmed against the live API reference -- no guessed
+        # parameter names). Forced `"en"`/`"he"` modes keep sending an
+        # explicit `language_code` exactly as before. `"auto"` mode does
+        # the opposite of forcing a language: it omits `language_code`
+        # entirely and sets `include_language_detection=true` instead, so
+        # Scribe detects and preserves whichever language was actually
+        # spoken per utterance rather than being told to expect one.
         from .voice_language import get_voice_language
-        language_code = get_voice_language()
+        voice_language = get_voice_language()
         params = (
-            f"model_id={self.model}&language_code={language_code}&audio_format=pcm_{self.sample_rate}"
+            f"model_id={self.model}&audio_format=pcm_{self.sample_rate}"
             f"&commit_strategy=vad&vad_silence_threshold_secs={self._silence_secs}"
         )
+        if voice_language == "auto":
+            params += "&include_language_detection=true"
+        else:
+            params += f"&language_code={voice_language}"
         url = f"{ENDPOINT}?{params}"
+        log.info("[STT] configured_provider=elevenlabs voice_language_mode=%s model=%s", voice_language, self.model)
         ready = threading.Event()
+        error_or_close = threading.Event()
 
         def on_open(_ws):
             self._connected.set()
@@ -165,13 +184,17 @@ class ElevenLabsRealtimeSTT:
 
         def on_message(_ws, message):
             self._handle_message(message)
+            if self._error is not None:
+                error_or_close.set()
 
         def on_error(_ws, error):
             self._error = error if isinstance(error, Exception) else RuntimeError(str(error))
+            error_or_close.set()
             ready.set()
 
         def on_close(_ws, _status_code, _msg):
             self._closed.set()
+            error_or_close.set()
             ready.set()
 
         self._ws = self._ws_app_factory(
@@ -185,11 +208,37 @@ class ElevenLabsRealtimeSTT:
         self._recv_thread.start()
         if not ready.wait(self.connect_timeout):
             self.close()
+            log.info("[STT] active_provider=elevenlabs_realtime provider_fallback_reason=connect_timeout")
             raise ElevenLabsSTTError("timed out connecting to ElevenLabs realtime STT")
+        # The raw WebSocket handshake succeeding (on_open) is NOT itself
+        # proof of a successfully AUTHENTICATED realtime session: confirmed
+        # live that ElevenLabs can accept the handshake, then send a
+        # business-logic `auth_error` message and close the connection --
+        # both arriving shortly AFTER on_open, not instead of it. Without
+        # this brief grace window, `connect()` could return "success" for a
+        # session that is already failing, and the caller would silently
+        # get no transcript 5s later with no logged reason at all (this
+        # reproduced the exact live symptom: silent fallback to Whisper).
+        if not self._error and not self._closed.is_set():
+            grace_secs = _env_float("ELEVENLABS_STT_AUTH_GRACE_MS", 300.0) / 1000.0
+            error_or_close.wait(grace_secs)
         if self._error is not None:
+            self.close()
+            log.info("[STT] active_provider=elevenlabs_realtime provider_fallback_reason=%s", type(self._error).__name__ + ": " + _safe_error_reason(self._error))
             raise ElevenLabsSTTError(f"ElevenLabs realtime STT connection failed: {self._error}")
         if self._closed.is_set():
+            log.info("[STT] active_provider=elevenlabs_realtime provider_fallback_reason=connection_closed_immediately")
             raise ElevenLabsSTTError("ElevenLabs realtime STT connection closed immediately")
+        log.info("[STT] active_provider=elevenlabs_realtime provider_fallback_reason=none (connected)")
+
+    @staticmethod
+    def _log_committed(data: dict, text: str) -> None:
+        """Safe diagnostic logging (Part 13): the transcript itself IS the
+        thing being diagnosed here (item 2/13's explicit ask -- to tell
+        which layer a live Hebrew failure broke at), never a secret. No
+        API key/token is ever included."""
+        detected_language = data.get("language_code") or data.get("language") or data.get("detected_language") or "unknown"
+        log.info("[STT] committed_language=%s committed_text=%r", detected_language, text)
 
     def _handle_message(self, raw_message) -> None:
         try:
@@ -207,11 +256,13 @@ class ElevenLabsRealtimeSTT:
                 self._committed_text = text
             event = TranscriptEvent("committed", text, data)
             self._committed_event.set()
+            self._log_committed(data, text)
         elif message_type in {"final_transcript", "final_transcript_with_timestamps"}:
             with self._lock:
                 self._committed_text = text
             event = TranscriptEvent("final", text, data)
             self._committed_event.set()
+            self._log_committed(data, text)
         elif message_type == "session_started":
             event = TranscriptEvent("session_started", "", data)
         elif message_type in _ERROR_MESSAGE_TYPES:

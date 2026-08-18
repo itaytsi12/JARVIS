@@ -38,6 +38,7 @@ class FakeController:
         self.play_from_page_ok = True
         self.now_playing = {"song": None, "artist": None, "is_playing": False, "observed": False}
         self.next_now_playing = None  # what current_track_info() returns AFTER a control action
+        self.next_playback_type = {"observed": False}  # what playback_type() returns; default = not full/preview-observable
         self.shuffle_state = False
         self.repeat_state = False
         self.library_added = False
@@ -62,6 +63,9 @@ class FakeController:
     # now playing -------------------------------------------------------
     def current_track_info(self, page=None):
         return dict(self.now_playing)
+
+    def playback_type(self, page=None):
+        return dict(self.next_playback_type) if self.next_playback_type is not None else {"observed": False}
 
     def wait_for_playing(self, timeout=6.0):
         if self.next_now_playing:
@@ -234,10 +238,15 @@ class SearchAndPlayTests(ProviderTestCase):
     def test_play_verifies_song_and_artist_before_claiming_success_text(self):
         self.controller.search_results = [{"type": "song", "title": "Starboy", "href": "/song/1"}]
         # Simulate a wrong track actually loading (playback started, but not
-        # the requested song) -- verification must catch this.
+        # the requested song) -- verification must catch this. False-success
+        # rule: a row/Play click landing is NOT itself proof of success --
+        # only observed player metadata matching the request counts, so an
+        # unverified outcome must report success=False (never a bare,
+        # unqualified "it's playing") so the honest hedge actually reaches
+        # the user instead of being silently treated as a normal success.
         self.controller.next_now_playing = {"song": "Completely Different Song", "artist": "Someone Else", "is_playing": True, "observed": True}
         result = provider.music_play("PLAY_SONG", song="Starboy", artist="The Weeknd")
-        self.assertTrue(result["success"])
+        self.assertFalse(result["success"])
         self.assertFalse(result["verified"])
         self.assertIn("couldn't confirm", result["message"])
 

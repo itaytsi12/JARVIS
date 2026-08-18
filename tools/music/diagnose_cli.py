@@ -110,6 +110,9 @@ def play(song: str, artist: str | None = None) -> None:
     report["verified_song"] = bool(info.get("observed") and _title_matches(song, info.get("song") or ""))
     if artist:
         report["verified_artist"] = bool(info.get("observed") and _title_matches(artist, info.get("artist") or "", threshold=0.5))
+    playback = controller.playback_type() if playing else {"observed": False}
+    report["playback_duration_seconds"] = playback.get("duration")
+    report["is_preview"] = playback.get("is_preview") if playback.get("observed") else None
     _print(report)
 
 

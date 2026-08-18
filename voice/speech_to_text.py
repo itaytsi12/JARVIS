@@ -100,13 +100,18 @@ def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
 	model = _get_model(model_size)
 	voice_language = get_voice_language()
 	# The English initial_prompt is an English-phrasing hint -- steering
-	# Whisper toward it in Hebrew mode would bias output back toward
-	# English, exactly what an explicit Hebrew-only mode must not do.
+	# Whisper toward it in Hebrew/auto mode would bias output back toward
+	# English, exactly what a non-English-only mode must not do.
 	initial_prompt = _ENGLISH_INITIAL_PROMPT if voice_language == "en" else None
+	# faster-whisper's `language=` expects a real ISO code or None (meaning
+	# "detect per-segment") -- "auto" is this project's own mode name, not
+	# a real Whisper language code, so it must never be passed through
+	# literally (that would raise/misbehave inside faster-whisper).
+	whisper_language = None if voice_language == "auto" else voice_language
 
 	segments, info = model.transcribe(
 		path,
-		language=voice_language,
+		language=whisper_language,
 		task="transcribe",
 		initial_prompt=initial_prompt,
 		beam_size=5,

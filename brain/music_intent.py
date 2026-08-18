@@ -201,29 +201,55 @@ def _classify_hebrew_intent(normalized: str, original: str, provider: str | None
     if re.fullmatch(r"(?:נגן|תנגן) (?:משהו )?ש(?:שמעתי לאחרונה|אני שומע לאחרונה)", text):
         return MusicIntent(MusicIntentType.PLAY_RECENT, original, provider=provider)
 
-    # "play the playlist <X>"
-    m = re.fullmatch(r"(?:נגן|תנגן|שים) את ה(?:פלייליסט|רשימת ההשמעה)(?: של)? (.+)", text)
+    # "play the playlist <X>" -- "לי" ("for me") may appear right after the
+    # verb ("שים לי את הפלייליסט X"), same as the song patterns below.
+    m = re.fullmatch(r"(?:נגן|תנגן|שים) (?:לי )?את ה(?:פלייליסט|רשימת ההשמעה)(?: של)? (.+)", text)
     if m:
         playlist = _titlecase_span(original, normalized, m.group(1))
         return MusicIntent(MusicIntentType.PLAY_PLAYLIST, original, playlist=playlist, provider=provider)
 
-    # "play the song <X>" -- strip the "את השיר" wrapper so the extracted
-    # entity is exactly <X>, never "את השיר <X>" (Part: preserve entities
-    # exactly, e.g. "נגן את השיר שני משוגעים" -> song="שני משוגעים").
-    m = re.fullmatch(r"(?:נגן|תנגן) את השיר (.+)", text)
+    # "play [me] [the song] <X> [of/by <artist>]" -- covers every combination
+    # of: verb (נגן/תנגן/שים), an optional dative filler right after it
+    # ("שים לי X" = "put on X for me" -- the "לי" is not part of the song),
+    # an optional "את השיר"/"את הסינגל" wrapper ("play THE SONG X"), and an
+    # optional trailing artist qualifier (" של "/" מאת "). The remaining
+    # substring (after `_titlecase_span` recovers its original casing/
+    # Unicode from `original`, never re-derived from the lowercased
+    # `normalized` text) is preserved WHOLE as one entity -- never
+    # tokenized/split on whitespace -- so an arbitrary multi-word Hebrew
+    # song title (e.g. "שני משוגעים", "יום חדש", "דרך השלום") always comes
+    # through intact instead of only its first or last word.
+    m = re.fullmatch(r"(?:נגן|תנגן|שים) (?:לי )?(?:את ה(?:שיר|סינגל) )?(.+)", text)
     if m:
-        song = _titlecase_span(original, normalized, m.group(1))
-        return MusicIntent(MusicIntentType.PLAY_QUERY, original, song=song, provider=provider)
-
-    # Generic "play/put on <X>" -- ambiguous song vs. artist, exactly like
-    # the English PLAY_QUERY fallback: resolved by real search-result
-    # scoring at execution time, never guessed here.
-    m = re.fullmatch(r"(?:נגן|תנגן|שים) (.+)", text)
-    if m:
-        query = _titlecase_span(original, normalized, m.group(1))
-        return MusicIntent(MusicIntentType.PLAY_QUERY, original, song=query, provider=provider)
+        remainder = _titlecase_span(original, normalized, m.group(1))
+        song, artist = _split_hebrew_song_artist(remainder)
+        return MusicIntent(MusicIntentType.PLAY_QUERY, original, song=song, artist=artist, provider=provider)
 
     return None
+
+
+_HEBREW_ARTIST_SEPARATOR = re.compile(r"\s+(?:של|מאת)\s+")
+
+
+def _split_hebrew_song_artist(remainder: str) -> tuple[str, str | None]:
+    """Split "<song> של <artist>" / "<song> מאת <artist>" on the LAST such
+    separator (Part 4) -- a normal multi-word song title is never split
+    just because it has multiple words; only an explicit artist-qualifying
+    "של"/"מאת" token (with whitespace on both sides, so it can't accidentally
+    match inside a word like the definite-article-prefixed "השלום") triggers
+    a split. Known limitation, same class as the English "of"/"by" case:
+    a song title that itself legitimately contains a standalone "של"/"מאת"
+    word (rare) would be mis-split -- not distinguishable from a real
+    artist qualifier by text alone, so this heuristic (matching every given
+    example) is the accepted tradeoff."""
+    matches = list(_HEBREW_ARTIST_SEPARATOR.finditer(remainder))
+    if not matches:
+        return remainder.strip(), None
+    last = matches[-1]
+    song, artist = remainder[:last.start()].strip(), remainder[last.end():].strip()
+    if not song or not artist:
+        return remainder.strip(), None
+    return song, artist
 
 
 def classify_music_intent(text: str) -> MusicIntent | None:
@@ -453,3 +479,50 @@ def route_music_command(text: str) -> dict | None:
         }}
 
     return None
+
+
+def _diagnose(text: str) -> dict:
+    """No-voice-needed diagnostic (item 7 of the bilingual voice work):
+    shows exactly what each stage of Hebrew (or English) music routing
+    decided for one input string, so a live failure can be traced to the
+    specific layer that broke it -- classification, entity extraction, or
+    provider resolution -- without needing a microphone or STT at all."""
+    from voice.voice_language import detect_input_language
+
+    intent = classify_music_intent(text)
+    route = route_music_command(text)
+    provider = None
+    if intent is not None:
+        if intent.provider in {"spotify", "youtube"}:
+            provider = intent.provider
+        elif route is not None:
+            provider = "apple_music"
+    return {
+        "input": text,
+        "detected_language": detect_input_language(text),
+        "normalized_text": text.strip(),
+        "music_intent": intent.intent.value if intent is not None else None,
+        "entities": {
+            "song": intent.song if intent else None,
+            "artist": intent.artist if intent else None,
+            "album": intent.album if intent else None,
+            "playlist": intent.playlist if intent else None,
+            "mood": intent.mood if intent else None,
+        } if intent is not None else {},
+        "provider": provider,
+        "route_type": route.get("type") if route is not None else None,
+        "tool": route.get("tool") if route is not None else None,
+    }
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")  # Windows consoles default to cp1252, which cannot print Hebrew.
+    if len(sys.argv) < 2:
+        print('Usage: python -m brain.music_intent "<text>"')
+        raise SystemExit(2)
+    result = _diagnose(" ".join(sys.argv[1:]))
+    print(json.dumps(result, ensure_ascii=False, indent=2))

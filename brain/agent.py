@@ -117,11 +117,31 @@ def run_agent(command: str, route: dict | None = None, interaction_id: str | Non
         raise
 
 
+def _is_deterministic_music_route(route: dict | None) -> bool:
+    """`brain/music_intent.py::route_music_command` (invoked from
+    `brain/router.py::route_command` BEFORE any planner fallback) always
+    returns a fully-resolved `{"type": "tool", "tool": "open_music" |
+    "music_*", ...}` route -- there is nothing left to re-plan. Without
+    this guard, `should_use_task_planner(command)` below is evaluated
+    independent of what `route` already resolved to, so a real utterance
+    could match one of its generic signals (e.g. a stray comma) and the
+    planner would silently discard an already-correct music route and
+    invent its own (e.g. opening music.youtube.com) -- confirmed live."""
+    if not route or route.get("type") != "tool":
+        return False
+    tool = route.get("tool")
+    return isinstance(tool, str) and (tool == "open_music" or tool.startswith("music_"))
+
+
 def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execution_meta: dict, cancellation_token=None,original_user_text: str | None=None,speculative_ledger=None) -> str:
     control_types={"cancel_read_only_task","task_status","resume_interrupted_response","correct_interrupted_response","revise_whatsapp_recipient"}
     if route is None and re.match(r"^(?:stop|cancel|never mind|continue|make it|shorten that|only (?:tell|give)|(?:don't send it|send it).+instead)",command,re.I):
         route=route_command(command)
-    use_task_planner=(not route or route.get("type") not in control_types) and should_use_task_planner(command)
+    use_task_planner=(
+        (not route or route.get("type") not in control_types)
+        and not _is_deterministic_music_route(route)
+        and should_use_task_planner(command)
+    )
     runtime_log.info("Runtime decision: %s; command=%r; agent_runtime_id=%s context_id=%s", "task_planner" if use_task_planner else "deterministic_router", _command_for_log(command), id(agent_runtime), id(agent_runtime.context))
     if use_task_planner:
         execution_meta["route_type"] = "task_plan"

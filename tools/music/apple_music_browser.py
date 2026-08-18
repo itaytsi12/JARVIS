@@ -92,6 +92,7 @@ class AppleMusicWebController:
     def __init__(self, session: AuthenticatedBrowserSession | None = None):
         self.session = session or get_authenticated_browser_session()
         self._page = None
+        self._storefront: str | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle -- thin wrappers over the shared session, translating its
@@ -124,6 +125,42 @@ class AppleMusicWebController:
     @property
     def page(self):
         return self._page
+
+    _STOREFRONT_IN_URL = re.compile(r"^https://music\.apple\.com/([a-z]{2})(?:/|$)")
+
+    def _resolve_storefront(self) -> str:
+        """The signed-in account's real Apple Music storefront (e.g.
+        `"il"`), resolved once and cached for this controller's lifetime.
+
+        Confirmed live and root-caused a preview-only playback bug: every
+        storefront-LESS URL this module used (`/search?term=...`,
+        `/listen-now`, `/library/all-playlists`) silently redirects to the
+        `us` storefront regardless of the signed-in account's actual
+        region, while navigating to the bare root `/` correctly redirects
+        to the account's real storefront (observed live: `/il/home` for
+        this account). Search results built from a `/us/...` URL point at
+        US-catalog content the account's subscription has no full-playback
+        entitlement for -- DRM/Widevine negotiation succeeds and the
+        player-bar UI shows normal "now playing" state either way, but
+        Apple Music silently serves only a short instant-preview clip for
+        content outside the subscribed storefront. Playing the SAME song
+        via its `/il/...` URL (this account's real storefront) was
+        confirmed live to use real MSE-backed streaming (duration reported
+        as `Infinity`, no `AudioPreview` CDN path) instead. Falls back to
+        `"us"` (the previous, if wrong, hardcoded behavior) if resolution
+        fails for any reason -- never crashes a caller over this."""
+        if self._storefront is not None:
+            return self._storefront
+        page = self.ensure_music_tab()
+        try:
+            page.goto(APPLE_MUSIC_URL + "/", wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(500)
+            match = self._STOREFRONT_IN_URL.match(page.url)
+            self._storefront = match.group(1) if match else "us"
+        except Exception as exc:
+            log.info("Apple Music storefront resolution failed, defaulting to 'us': %s", exc)
+            self._storefront = "us"
+        return self._storefront
 
     # ------------------------------------------------------------------
     # Sign-in state
@@ -201,6 +238,42 @@ class AppleMusicWebController:
             info["artist"] = artist
             info["observed"] = True
         return info
+
+    def playback_type(self, page=None) -> dict[str, Any]:
+        """Best-effort detection of whether current audio is Apple's short
+        instant PREVIEW clip rather than real full-track subscription
+        streaming. Confirmed live: clicking a track's row/platter/hero
+        "Play" control (regardless of which of those three, or whether
+        navigation to get there was a hard `page.goto` or an in-app SPA
+        link click -- all four combinations were tried live) can serve a
+        plain `<audio>` element whose `currentSrc` is on Apple's
+        `AudioPreview<N>` CDN path with a ~90s duration, while the player
+        bar UI still reports normal playing/song/artist state -- there is
+        currently no DOM signal distinguishing this from confirmed full
+        playback other than inspecting the actual audio element. Returns
+        `{"observed": False}` (never guessed) when no `<audio>` element
+        exists at all -- genuine full-track DRM'd streaming may use a
+        different mechanism this can't introspect, so an absent `<audio>`
+        element is NOT itself evidence of full playback either."""
+        page = page or self._page
+        if page is None:
+            return {"observed": False}
+        try:
+            info = page.evaluate(
+                """() => {
+                    const els = [...document.querySelectorAll('audio')];
+                    const active = els.find(e => !e.paused) || els[els.length - 1];
+                    if (!active) return null;
+                    return {src: active.currentSrc || '', duration: active.duration || null};
+                }"""
+            )
+        except Exception:
+            return {"observed": False}
+        if not info or not info.get("src"):
+            return {"observed": False}
+        duration = info.get("duration")
+        is_preview = "preview" in info["src"].lower() or bool(duration and duration <= 95)
+        return {"observed": True, "is_preview": is_preview, "duration": duration}
 
     def wait_for_playing(self, timeout: float = 6.0) -> bool:
         page = self._page
@@ -337,7 +410,7 @@ class AppleMusicWebController:
         Never guesses a result -- an empty list means nothing was found."""
         page = self.ensure_music_tab()
         try:
-            page.goto(f"{APPLE_MUSIC_URL}/search?term={_url_quote(query)}", wait_until="domcontentloaded", timeout=15000)
+            page.goto(f"{APPLE_MUSIC_URL}/{self._resolve_storefront()}/search?term={_url_quote(query)}", wait_until="domcontentloaded", timeout=15000)
         except Exception as exc:
             log.info("Apple Music search navigation failed: %s", exc)
             return []
@@ -488,7 +561,7 @@ class AppleMusicWebController:
         entries with a real album/song link are returned."""
         page = self.ensure_music_tab()
         try:
-            page.goto(f"{APPLE_MUSIC_URL}/listen-now", wait_until="domcontentloaded", timeout=15000)
+            page.goto(f"{APPLE_MUSIC_URL}/{self._resolve_storefront()}/listen-now", wait_until="domcontentloaded", timeout=15000)
         except Exception as exc:
             log.info("Apple Music listen-now navigation failed: %s", exc)
             return []
@@ -541,7 +614,7 @@ class AppleMusicWebController:
         and silently returned an empty/useless list every time)."""
         page = self.ensure_music_tab()
         try:
-            page.goto(f"{APPLE_MUSIC_URL}/library/all-playlists", wait_until="domcontentloaded", timeout=15000)
+            page.goto(f"{APPLE_MUSIC_URL}/{self._resolve_storefront()}/library/all-playlists", wait_until="domcontentloaded", timeout=15000)
         except Exception as exc:
             log.info("Apple Music playlist listing navigation failed: %s", exc)
             return []
