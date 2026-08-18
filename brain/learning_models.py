@@ -132,6 +132,18 @@ class LearningJob:
     fingerprint: str = ""
 
     # ------------------------------------------------------------------
+    # ACTIVE-LEARNING PRIORITY (Part A, Phase A9) -- set when this job's
+    # teacher fix followed a genuine, verified STUDENT failure on the same
+    # task: the highest-value kind of teacher example, since it's proof the
+    # current student model specifically could not do this. Read (never
+    # written) by `brain/learning_dataset.py` so a future training pass can
+    # prioritize/oversample these rows -- purely additive metadata, the
+    # dataset row itself is unchanged either way.
+    # ------------------------------------------------------------------
+    high_value: bool = False
+    high_value_reason: str | None = None
+
+    # ------------------------------------------------------------------
     # METADATA
     # ------------------------------------------------------------------
     error: str | None = None

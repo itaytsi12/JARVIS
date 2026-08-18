@@ -40,9 +40,16 @@ def _get_model(model_size: Optional[str] = None):
 
 
 def _create_model(model_size: Optional[str] = None):
-		# Default to an English-optimized small model for better English accuracy
-		# while keeping CPU-friendly performance.
-		model_size = model_size or os.getenv("WHISPER_MODEL", "small.en")
+		from .voice_language import get_voice_language, language_name
+		voice_language = get_voice_language()
+		# English keeps the historical English-optimized small model. Hebrew
+		# (or any future non-English mode) MUST use a multilingual model --
+		# the ".en" variants are English-only and cannot transcribe Hebrew at
+		# all, no matter what `language=` is passed to .transcribe(). Only
+		# ever loads ONE model per process (the module-level singleton below
+		# is keyed by whichever size this resolves to), never both.
+		default_model = "small.en" if voice_language == "en" else "small"
+		model_size = model_size or os.getenv("WHISPER_MODEL", default_model)
 
 		# Prefer CPU by default to avoid cublas/cuda DLL errors on Windows
 		# machines that don't have CUDA configured. Users can still override
@@ -70,7 +77,7 @@ def _create_model(model_size: Optional[str] = None):
 		# Print a concise startup message once when the model is first created.
 		if model is not None:
 			print(f"[STT] Whisper model: {model_size}")
-			print("[STT] Language: English")
+			print(f"[STT] Language: {language_name(voice_language)}")
 
 		return model
 
@@ -80,19 +87,28 @@ def warm_up() -> None:
 	_get_model()
 
 
+_ENGLISH_INITIAL_PROMPT = "Jarvis commands may include: Open Notepad. Type exactly what you last told me. Type exactly what you just said. Then open YouTube."
+
+
 def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
 	"""Transcribe an audio file at `path` to text using a local model.
 
 	Returns the recognized text (empty string on no speech).
 	"""
+	from .voice_language import get_voice_language
 
 	model = _get_model(model_size)
+	voice_language = get_voice_language()
+	# The English initial_prompt is an English-phrasing hint -- steering
+	# Whisper toward it in Hebrew mode would bias output back toward
+	# English, exactly what an explicit Hebrew-only mode must not do.
+	initial_prompt = _ENGLISH_INITIAL_PROMPT if voice_language == "en" else None
 
 	segments, info = model.transcribe(
 		path,
-		language="en",
+		language=voice_language,
 		task="transcribe",
-		initial_prompt="Jarvis commands may include: Open Notepad. Type exactly what you last told me. Type exactly what you just said. Then open YouTube.",
+		initial_prompt=initial_prompt,
 		beam_size=5,
 		temperature=0.0,
 		vad_filter=True,

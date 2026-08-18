@@ -9,11 +9,47 @@ and avoids reading raw URLs, PIDs, file paths, JSON, or stack traces aloud.
 """
 from __future__ import annotations
 
+import random
 import urllib.parse
 import re
 from typing import Optional
 
 from tools.registry import WEBSITE_ALIASES
+
+# Hebrew-mode TTS (Part: language UX rule) -- JARVIS speaks English only,
+# always. For an English command that's already guaranteed by
+# `format_spoken_response` below (it only ever composes English phrasing
+# from English route/tool data). For a HEBREW command, the response would
+# otherwise need to speak the recognized Hebrew entity/song/playlist text
+# verbatim (or, worse, someone might be tempted to translate/transliterate
+# it) -- neither is acceptable, so Hebrew-mode interactions use ONLY one of
+# these short, generic, entity-free acknowledgements instead of a
+# contextual one. Never derived from the command or response text, so it
+# can never leak foreign-language content into TTS.
+_GENERIC_ACKNOWLEDGEMENTS = (
+    "Okay, on it, sir.",
+    "Certainly, sir.",
+    "Right away, sir.",
+    "On it, sir.",
+)
+
+#: Same rule for a failed Hebrew-mode command: one short, generic, English
+#: failure message -- never the contextual message a failed English
+#: command gets, since that could contain the recognized Hebrew text
+#: (e.g. "I couldn't find <Hebrew playlist name>").
+_GENERIC_FAILURE_MESSAGE = "I couldn't complete that action, sir."
+
+
+def generic_acknowledgement() -> str:
+    """A short, generic, ALWAYS-English acknowledgement for Hebrew-mode
+    commands -- see module note above."""
+    return random.choice(_GENERIC_ACKNOWLEDGEMENTS)
+
+
+def generic_failure_message() -> str:
+    """The one short, generic, ALWAYS-English message spoken after a
+    Hebrew-mode command fails -- see module note above."""
+    return _GENERIC_FAILURE_MESSAGE
 
 
 def _pretty_site_name(url: str) -> str:
@@ -52,6 +88,13 @@ def _natural_name(value: str) -> str:
         "calculator": "Calculator",
     }
     return names.get(value.strip().lower(), value.strip())
+
+
+def _strip_error_suffix(text: str) -> str:
+    """Strip a trailing "\\nError: <code>" suffix (appended by
+    `brain/agent.py`'s tool-route failure path for logs/terminal output,
+    never meant for TTS) before a message is spoken."""
+    return re.split(r"\n\s*Error:\s*", text or "", maxsplit=1)[0].strip()
 
 
 def _sanitize_for_speech(text: str) -> str:
@@ -168,7 +211,16 @@ def _format_spoken_response_base(command: str, route: dict, response_text: str, 
         return "I didn't perform any actions." if lang != 'he' else "לא ביצעתי שום פעולה."
 
     failure_text = (response_text or "").lower()
-    if rtype in EXECUTABLE_ROUTE_TYPES and any(marker in failure_text for marker in ("failed", "couldn't", "could not", "error:")):
+    # Music tools (brain/music_intent.py's `open_music`/`music_*` routes)
+    # deliberately craft short, specific, TTS-safe failure/status sentences
+    # ("Apple Music needs you to sign in, sir.", "I couldn't find that
+    # playlist, sir.") -- speaking THOSE is the whole point (Part 20/25 of
+    # the music feature). The generic keyword-based flattening below exists
+    # for tools whose raw message/error text is not meant for TTS; it must
+    # not swallow a message a tool specifically wrote to be spoken.
+    tool_name = route.get("tool") if rtype == "tool" else None
+    speaks_for_itself = isinstance(tool_name, str) and (tool_name == "open_music" or tool_name.startswith("music_"))
+    if rtype in EXECUTABLE_ROUTE_TYPES and not speaks_for_itself and any(marker in failure_text for marker in ("failed", "couldn't", "could not", "error:")):
         return "I couldn't complete that action."
 
     # Tool-level routes
@@ -246,19 +298,24 @@ def _format_spoken_response_base(command: str, route: dict, response_text: str, 
                 return f"Pressed {key}."
             return default_ok if lang != 'he' else "בסדר."
 
-        # Generic open/close responses
-        if response_text and response_text.lower().startswith("opened"):
-            # try to infer resource
-            m = re.match(r'Opened\s+(https?://\S+|\S+)\s+in', response_text)
-            if m:
-                site = _pretty_site_name(m.group(1))
-                if lang == 'he':
-                    return f"אוקיי, פותח את {site}."
-                return f"Okay, opening {site}."
-            return default_ok
+        # NOTE: a former "Generic open/close responses" block used to live
+        # here, matching any message starting with "opened" against the
+        # `open_website` tool's specific "Opened <url> in <browser>."
+        # format. Both `open_website` and `open_application` already return
+        # from their own dedicated branches above, so that block was
+        # unreachable for its intended purpose -- it only ever fired for
+        # OTHER tools whose message happened to start with "Opened" (e.g.
+        # music's "Opened Apple Music, sir."), silently flattening them to
+        # "Okay." Removed rather than reused, since the fallback below
+        # already speaks any such message correctly.
 
-        # Fallback: short sanitized version
-        s = _sanitize_for_speech(response_text)
+        # Fallback: short sanitized version. Tool-route failures append a
+        # technical "\nError: <code>" suffix meant for logs/terminal output
+        # (see brain/agent.py's `route["type"]=="tool"` failure branch) --
+        # strip it before speaking so a clean message like "Apple Music
+        # needs you to sign in, sir." doesn't have a raw error code read
+        # aloud right after it.
+        s = _sanitize_for_speech(_strip_error_suffix(response_text))
         if s:
             return s if len(s) < 200 else s[:200].rsplit(' ', 1)[0] + '...'
 

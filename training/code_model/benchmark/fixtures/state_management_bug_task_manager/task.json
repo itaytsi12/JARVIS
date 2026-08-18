@@ -1,0 +1,11 @@
+{
+  "task_id": "state_management_bug_task_manager",
+  "category": "state_management_bug",
+  "description": "TaskManager is supposed to allow at most ONE task to be RUNNING at a time -- starting or resuming a task while another is already running should raise a ValueError, not silently allow two tasks to run simultaneously. Right now TaskManager.start_task and TaskManager.resume_task don't check this, so a specific sequence of start/pause/resume calls across multiple tasks can leave more than one task RUNNING at once. Fix the state management bug in task_manager.py (task_state.py's Task class itself is correct).",
+  "fixture_dir": "state_management_bug_task_manager",
+  "hidden_test_path": "hidden_test.py",
+  "visible_test_paths": ["tests/test_task_manager.py"],
+  "timeout_seconds": 150.0,
+  "constraints": ["do not remove the ability to pause a running task and later resume a different one"],
+  "metadata": {"production_files": 2}
+}

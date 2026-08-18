@@ -59,7 +59,7 @@ def ask_ai(message: str) -> str:
     return response.output_text
 
 
-def run_agent(command: str, route: dict | None = None, interaction_id: str | None = None, original_user_text: str | None = None, cancellation_token=None, execution_outcome: dict | None = None) -> str:
+def run_agent(command: str, route: dict | None = None, interaction_id: str | None = None, original_user_text: str | None = None, cancellation_token=None, execution_outcome: dict | None = None, speculative_ledger=None) -> str:
     request_started = time.perf_counter()
     recorder = get_recorder()
     created_interaction = interaction_id is None
@@ -71,7 +71,7 @@ def run_agent(command: str, route: dict | None = None, interaction_id: str | Non
     execution_meta = {}
     agent_runtime.context.last_user_message = original_user_text or command
     try:
-        response = _run_agent_impl(command, route, recorder, iid, execution_meta, cancellation_token,original_user_text)
+        response = _run_agent_impl(command, route, recorder, iid, execution_meta, cancellation_token,original_user_text,speculative_ledger)
         explicit_success=execution_meta.get("success")
         textual_failure = explicit_success is None and ("error:" in response.lower() or "couldn't" in response.lower() or response.lower().startswith(("failed ","failure:")))
         failed = explicit_success is False or textual_failure
@@ -117,7 +117,7 @@ def run_agent(command: str, route: dict | None = None, interaction_id: str | Non
         raise
 
 
-def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execution_meta: dict, cancellation_token=None,original_user_text: str | None=None) -> str:
+def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execution_meta: dict, cancellation_token=None,original_user_text: str | None=None,speculative_ledger=None) -> str:
     control_types={"cancel_read_only_task","task_status","resume_interrupted_response","correct_interrupted_response","revise_whatsapp_recipient"}
     if route is None and re.match(r"^(?:stop|cancel|never mind|continue|make it|shorten that|only (?:tell|give)|(?:don't send it|send it).+instead)",command,re.I):
         route=route_command(command)
@@ -158,7 +158,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                     return "I identified the application request, but I don't have a complete validated UI plan to play that item, so I didn't open anything."
                 cloud_plan=Plan(command,cloud_actions,context={"planning_trace":{"segments":completeness["clauses"]},"represented_clause_count":len(completeness["clauses"]),"fallback_from":"incomplete_local_plan"})
                 recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"cloud_planner","goal":cloud_plan.safe_goal(),"actions":[{"tool":a.tool,"arguments":_safe_action_arguments(a)} for a in cloud_actions]},iid)
-                results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token,execution_meta))
+                results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token,execution_meta,speculative_ledger))
                 execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(cloud_actions,results)
                 execution_meta["success"]=len(results)==len(cloud_actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(cloud_actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
                 return format_results(results)
@@ -176,7 +176,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
             if plan.context.get("resolved_references"):
                 recorder.record(EventType.RESOLVED_REFERENCES, _safe_reference_payload(plan.context["resolved_references"]), iid)
             recorder.record(EventType.PLAN_CREATED, {"route_type":"task_plan","route_source":"deterministic_planner","goal": plan.safe_goal(), "actions": [{"tool": a.tool, "arguments": _safe_action_arguments(a)} for a in plan.actions]}, iid)
-            results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,plan,agent_runtime,cancellation_token,execution_meta))
+            results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,plan,agent_runtime,cancellation_token,execution_meta,speculative_ledger))
             execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(plan.actions,results)
             execution_meta["success"]=len(results)==len(plan.actions) and all(result.success for result in results)
             execution_meta["verified"]=_results_verified(plan.actions,results)
@@ -202,7 +202,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                 return "I couldn't build a complete validated plan for every part of that request, so I didn't execute anything."
             cloud_plan=Plan(command,cloud_actions,context={"planning_trace":{"segments":missing_completeness["clauses"]},"represented_clause_count":len(missing_completeness["clauses"]),"fallback_from":"missing_local_plan"})
             recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"cloud_planner","goal":cloud_plan.safe_goal(),"actions":[{"tool":a.tool,"arguments":_safe_action_arguments(a)} for a in cloud_actions]},iid)
-            results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token,execution_meta))
+            results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token,execution_meta,speculative_ledger))
             execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(cloud_actions,results)
             execution_meta["success"]=len(results)==len(cloud_actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(cloud_actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
             return format_results(results)
@@ -367,7 +367,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
 
     if route["type"] == "local_plan":
         execution_meta["private_response"]=_has_private_response(route["actions"])
-        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,route["actions"]),agent_runtime,cancellation_token,execution_meta))
+        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,route["actions"]),agent_runtime,cancellation_token,execution_meta,speculative_ledger))
         execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(route["actions"],results)
         execution_meta["success"]=len(results)==len(route["actions"]) and all(result.success for result in results);execution_meta["verified"]=_results_verified(route["actions"],results);execution_meta["model_calls"]+=_result_model_calls(results)
 
@@ -400,7 +400,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
 
         execution_meta["private_response"]=_has_private_response(actions)
 
-        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,actions),agent_runtime,cancellation_token,execution_meta))
+        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,actions),agent_runtime,cancellation_token,execution_meta,speculative_ledger))
         execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(actions,results)
         execution_meta["success"]=len(results)==len(actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
 
@@ -422,7 +422,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
 
         execution_meta["private_response"]=_has_private_response(actions)
 
-        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,actions),agent_runtime,cancellation_token,execution_meta))
+        results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,Plan(command,actions),agent_runtime,cancellation_token,execution_meta,speculative_ledger))
         execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(actions,results)
         execution_meta["success"]=len(results)==len(actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
 
@@ -504,7 +504,25 @@ def _record_prepared_actions(recorder,iid,actions,context):
     return prepared
 
 
-def _execute_recorded_plan(recorder,iid,plan,runtime,cancellation_token=None,execution_meta=None):
+def _execute_recorded_plan(recorder,iid,plan,runtime,cancellation_token=None,execution_meta=None,speculative_ledger=None):
+    if speculative_ledger is not None:
+        # Part C: a leading step this plan is about to (re-)execute may
+        # already have been completed early from a stable, safe partial
+        # transcript (see brain/speculative_execution.py) -- never run the
+        # same open/volume/mute action twice. Only ever trims from the
+        # front and only actions with no unmet dependency wiring, so
+        # execution order for genuinely dependent steps is untouched.
+        from brain.speculative_execution import reconcile_local_plan_actions
+        trimmed=reconcile_local_plan_actions(speculative_ledger,plan.actions)
+        if plan.actions and not trimmed:
+            # The whole plan (all of it) was already completed early --
+            # report that real evidence instead of silently claiming
+            # nothing happened. `plan.actions` is deliberately left
+            # untouched so `_paired_execution` pairs this synthetic result
+            # against the real action it corresponds to.
+            recorder.record(EventType.TASK_COMPLETED,{"reason":"already_completed_by_speculative_partial_action"},iid)
+            return [ToolResult(True,plan.actions[0].tool,"Already completed from an earlier action.",{"verified":True})]
+        plan.actions=trimmed
     errors=validate_plan_preflight(plan,runtime.context)
     runtime_log.info("Complete plan before execution: %r",[(action.tool,_safe_action_arguments(action)) for action in plan.actions])
     for index,action in enumerate(plan.actions):runtime_log.info("Tool registry lookup: action=%d tool=%s registered=%s",index,action.tool,action.tool in RUNTIME_TOOLS)

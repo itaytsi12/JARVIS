@@ -38,11 +38,12 @@ def _correct_fix_agent() -> FakeCodingAgent:
 class FixtureLoadingTests(unittest.TestCase):
     def test_all_shipped_fixtures_load(self):
         tasks = load_tasks_from_directory(DEFAULT_FIXTURES_ROOT)
-        self.assertEqual(len(tasks), 5)
+        self.assertEqual(len(tasks), 8)
         ids = {t.task_id for t in tasks}
         self.assertEqual(ids, {
             "syntax_runtime_bug_off_by_sign", "logical_bug_parity", "cross_file_bug_price_formatting",
             "regression_bug_discount", "feature_implementation_reverse_words",
+            "multi_class_bug_pricing_cache", "state_management_bug_task_manager", "api_misuse_retry_contract",
         })
 
     def test_categories_span_multiple_distinct_categories(self):

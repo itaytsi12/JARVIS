@@ -35,6 +35,359 @@ Command flow, top to bottom:
   `whatsapp.py`, etc.). This is the only place OS/browser/app automation
   should live.
 
+### Overlapping realtime voice pipeline (ElevenLabs)
+
+JARVIS's always-on voice loop (`voice/background_assistant.py`'s
+`AlwaysOnAssistant`, still the single owner of the one real microphone
+stream -- see `_audio_session`) can use ElevenLabs for BOTH speech-to-text
+and text-to-speech, with speech/planning/execution deliberately overlapping
+instead of forming one long blocking pipeline. Configured via `.env`:
+`STT_PROVIDER=elevenlabs` + `ELEVENLABS_STT_MODEL` (Scribe realtime),
+`TTS_PROVIDER=elevenlabs` + `ELEVENLABS_VOICE_ID` + `ELEVENLABS_TTS_MODEL`
+(`eleven_flash_v2_5`). Everything here degrades gracefully to the
+pre-existing Whisper/pyttsx3-or-cloud TTS chain if ElevenLabs isn't
+configured or fails -- neither fallback was removed.
+
+- `voice/elevenlabs_realtime_stt.py` — `ElevenLabsRealtimeSTT`, a
+  synchronous websocket client (via `websocket-client`) for ElevenLabs'
+  realtime speech-to-text. Never opens a microphone itself -- it's FED PCM
+  frames by whichever caller already owns the one real audio stream.
+  Delivers `partial_transcript`/`committed_transcript` events through an
+  `on_event` callback; `commit()` blocks (bounded) for the final transcript.
+- `voice/realtime_capture.py` — `RealtimeSTTController`, the bridge between
+  `AlwaysOnAssistant`'s audio-owning thread and one `ElevenLabsRealtimeSTT`
+  session per wake/listen interaction: connects on a background thread (so
+  a slow network never blocks mic reads), buffers frames captured before
+  the connection is ready, and feeds every partial transcript through
+  `brain/speculative_execution.py`'s `PartialActionLedger`.
+- `brain/speculative_execution.py` — safe speculative execution from
+  unstable partial transcripts. `classify_partial_route` only ever
+  resolves through the real `brain.router.route_command`, restricted to
+  `brain.safe_tools.CONTEXT_INDEPENDENT_TOOLS` (open app/website, volume,
+  mute, screenshot -- nothing destructive, communicative, or irreversible).
+  `PartialActionLedger` requires 2 consecutive identical partials before
+  firing, and `reconcile_final_route`/`reconcile_local_plan_actions`
+  prevent the eventual final command from re-running an action a partial
+  transcript already started.
+- `brain/safe_tools.py` — the single `CONTEXT_INDEPENDENT_TOOLS` allowlist
+  shared by `speculative_execution.py` (safe to start early) AND
+  `brain/agent_runtime.py`'s Part-H parallel-independent-action execution
+  (safe to run concurrently with siblings) -- same underlying safety
+  property (self-contained, no shared-state race), one list.
+- `brain/agent_runtime.py` — `AgentRuntime._execute_plan` now takes a
+  concurrent path (`_execute_plan_parallel`) when EVERY action in a plan
+  has empty `depends_on` AND is in `CONTEXT_INDEPENDENT_TOOLS`; any plan
+  with real ordering dependencies (e.g. open browser -> navigate -> click)
+  is untouched and stays fully sequential. Uses
+  `Executor.execute_action_unlocked_plan` to avoid re-acquiring the
+  process-wide `action_plan` resource lock from a worker thread (that lock
+  is already held for the whole plan by the calling thread; RLock
+  reentrancy is per-thread, not per-plan).
+- `voice/tts/elevenlabs_tts.py` — streaming ElevenLabs TTS: requests raw
+  PCM over `POST /v1/text-to-speech/{voice_id}/stream` and writes each
+  chunk straight into a live `sounddevice.OutputStream` as it arrives (no
+  temp file, playback starts before the response finishes). Wired into
+  `voice/text_to_speech.py`'s existing provider-order/fallback chain
+  (`_provider_order`/`_speak_unlocked`/`stop`) alongside the pre-existing
+  `openai_tts.py`/`chatterbox_tts.py` providers -- never replaces them.
+- `voice/voice_perf.py` — `VoiceInteractionTimer`: per-interaction,
+  honestly-measured latency stages (`wake_detected`, `first_partial_transcript`,
+  `first_stable_intent`, `acknowledgement_tts_request`, `committed_transcript`,
+  `planner_started`/`finished`, `final_tts_started`, `interaction_finished`,
+  etc.) with a compact "VOICE PERF" summary logged once per interaction. A
+  stage that a given interaction never reached is simply absent, never
+  fabricated.
+- `voice/startup_validation.py` — logs which STT/TTS providers are active
+  at startup (`run_tray()` and `voice_controller.run_voice_loop()`) without
+  making a real (paid) API call just to check health.
+- `voice/voice_language.py` — the explicit `VOICE_LANGUAGE` mode
+  (`get_voice_language()`, `"en"` default or `"he"`; anything else raises
+  `UnsupportedVoiceLanguage` rather than guessing). No mixed-language/
+  auto-detected transcription -- both `voice/elevenlabs_realtime_stt.py`
+  (the realtime Scribe `language_code` query param -- same parameter this
+  client already sent, previously hardcoded to `"en"`) and
+  `voice/speech_to_text.py`'s local Whisper fallback read this SAME value.
+  Whisper additionally picks its DEFAULT model from it: `"small.en"`
+  (English-only, historical default) for `en`, `"small"` (multilingual --
+  the `.en` variants literally cannot transcribe Hebrew) for `he`, and
+  skips the English `initial_prompt` hint in Hebrew mode so it can't bias
+  output back toward English; `WHISPER_MODEL` still overrides either way.
+  Spoken OUTPUT stays English regardless
+  (`voice/language_utils.py::detect_dominant_language` is unchanged,
+  deliberately still hardcoded to `"en"` -- Hebrew TTS is out of scope for
+  now; see the language UX rule below for exactly what JARVIS says in
+  Hebrew mode). `brain/music_intent.py::classify_music_intent`
+  detects Hebrew text itself (any `֐`-`׿` character) and routes
+  through a separate, self-contained Hebrew pattern set
+  (`_classify_hebrew_intent`) covering the same intents as the English
+  cascade -- entities are extracted with the same span-recovery helper
+  used for English, so Hebrew Unicode is preserved exactly (never
+  translated or transliterated) all the way through to the Apple Music
+  search query. `tools/music/apple_music_provider.py::_norm` was fixed
+  from an ASCII-only `[^a-z0-9 ]` filter (which silently stripped Hebrew
+  titles to nothing before fuzzy-scoring them) to a Unicode-aware `\w`
+  filter. Known limitation: an artist whose Apple Music catalog metadata
+  is itself in Latin script (e.g. "Omer Adam") can still be mis-ranked
+  against a Hebrew-titled search, since local fuzzy-text scoring can't
+  bridge a script mismatch the way Apple's own search backend does --
+  Hebrew-titled content (the common case) is unaffected and confirmed
+  live to work correctly.
+- `voice/background_assistant.py::_process_capture` accepts an optional
+  ElevenLabs committed transcript (skips Whisper entirely when present),
+  an optional `PartialActionLedger` (dedupes the final route/plan against
+  anything already fired speculatively), and speaks a brief
+  "I'll check that, sir." CONCURRENTLY with cloud/task-planner work
+  starting (`_command_needs_planning`, reusing `brain.task_planner.should_use_task_planner`
+  -- no separate heuristic). `brain/agent.py::run_agent`'s new
+  `speculative_ledger` kwarg (threaded through `_execute_recorded_plan`)
+  extends the same deduplication to plans built later inside `run_agent`
+  itself (local task-plan and cloud-plan branches), not just the router's
+  own `local_plan`/`tool` routes.
+- `scripts/test_elevenlabs_voice.py` — optional, explicit-`--run`-only
+  manual smoke test making REAL, paid ElevenLabs calls (records a short
+  phrase, transcribes it, synthesizes and plays one phrase). Never run by
+  the automated test suite.
+
+**Language UX rule — TTS speaks English only, always, even in Hebrew
+mode.** For an English command, `voice/response_formatter.py::format_spoken_response`
+still composes the usual contextual English phrasing ("Opening YouTube,
+sir." / "Playing Starboy, sir."), unchanged. For a Hebrew command
+(`voice/voice_language.py::is_hebrew_mode()` true), JARVIS must never
+speak the recognized Hebrew entity/song/playlist text, nor translate or
+transliterate it -- the action itself still receives and uses that exact
+Hebrew text (e.g. the Apple Music search query), only the TTS output is
+restricted. `voice/response_formatter.py::generic_acknowledgement()`
+(a random pick from a fixed 4-phrase, always-English, entity-free tuple:
+"Okay, on it, sir." / "Certainly, sir." / "Right away, sir." / "On it,
+sir.") and `generic_failure_message()` (fixed: "I couldn't complete that
+action, sir.") exist for exactly this. `voice/background_assistant.py::_process_capture`'s
+main command path branches on `is_hebrew_mode()`: in Hebrew mode it fires
+`generic_acknowledgement()` via `_start_speech_task` immediately, BEFORE
+the blocking `run_agent(...)` call even starts (not gated on
+`_command_needs_planning` the way the English "I'll check that, sir."
+ack is) -- action execution and the acknowledgement genuinely overlap,
+never sequential. After `run_agent` returns, Hebrew mode speaks nothing
+further on success (the immediate ack already covered it -- never speaks
+twice for one outcome) and exactly one `generic_failure_message()` on
+failure (checked via `execution_outcome["success"]`, which `brain/agent.py::run_agent`
+always populates), instead of calling `format_spoken_response` with the
+raw response text the way English mode does. This only covers the main
+synchronous command path (`_process_capture`'s `tool`/`local_plan`/
+`plan`/`ai` routes); `_start_question_task` (QUESTION-type routes) and
+`_start_cancellable_action_task` (WhatsApp send/message/tell,
+`analyze_screen`) are separate dispatch paths not covered by this rule --
+they were out of scope for this change.
+
+### Music (Alexa-like Apple Music Web control)
+
+First-class, deterministic music capability -- no LLM for ordinary
+requests. Apple Music Web (`https://music.apple.com`) is the default
+provider; explicit "on Spotify"/"on YouTube" reuses the existing generic
+browser-search-and-click-first-result flow instead of a second bespoke
+integration. Apple Music desktop is intentionally NOT used (unreliable
+sign-in on this machine).
+
+- `brain/music_intent.py` — `classify_music_intent`/`route_music_command`,
+  a local classifier module in the same family as `local_planner.py`/
+  `intent_router.py` (called BY `brain/router.py`, never a competing
+  router). Regex/keyword based, extracts song/artist/album/playlist/mood/
+  provider entities; ambiguous titles ("play Starboy") are deliberately
+  left unresolved here and disambiguated by real search-result scoring at
+  execution time, not guessed from text. `FAST_PATH_TOOLS` is the single
+  source of truth `brain/safe_tools.py::CONTEXT_INDEPENDENT_TOOLS` mirrors
+  for which music tools are safe to fire from a partial realtime-STT
+  transcript or run concurrently.
+- `tools/browser_authenticated.py` — `AuthenticatedBrowserSession`: the
+  shared, reusable session manager for any capability that needs a
+  browser already signed into the user's REAL accounts. Several earlier
+  approaches were tried and rejected, each confirmed LIVE on this machine
+  (not just theorized), in order:
+  1. Attaching to the user's already-running everyday Chrome directly --
+     not technically available; Chrome's profile-singleton lock blocks a
+     second automated process from getting a distinct, debuggable handle
+     to it.
+  2. A JARVIS-owned dedicated persistent Playwright profile
+     (`launch_persistent_context`) -- the profile mechanism worked, but
+     Apple's interactive sign-in (idmsa.apple.com/appleid.apple.com) hung
+     indefinitely after the password step specifically when the
+     signing-in browser was Playwright-driven (`navigator.webdriver`,
+     `--enable-automation`, a live CDP connection) -- confirmed live with
+     the SAME account signing in fine in an ordinary Chrome window using
+     that exact profile.
+  3. CDP-attaching to the user's REGULAR Chrome profile via
+     `--user-data-dir=<the real default %LOCALAPPDATA%\Google\Chrome\User Data>`
+     plus `--remote-debugging-port` -- confirmed live that Chrome does
+     NOT actually enable the debugger there while the user's normal
+     Chrome is running (virtually always, including a background-only
+     process many installs keep alive after all windows close): the new
+     process just prints "Opening in existing browser session." and exits
+     immediately (code 0) without ever applying the debug flags.
+  4. A RELATIVE `--user-data-dir` path (even for a brand-new, never-before
+     -used directory) -- confirmed live to trigger the exact same
+     "Opening in existing browser session." + immediate-exit behavior as
+     #3, for reasons not fully understood (Chrome/Windows resolving it
+     inconsistently) but reliably reproduced and reliably fixed by always
+     resolving to an absolute path (`Path.resolve()`) first.
+
+  What actually works, confirmed live end-to-end: `launch_chrome_for_jarvis`
+  (`python -m tools.browser_authenticated --launch`) launches a genuinely
+  ordinary, human-driven Chrome window -- no `--enable-automation`, no
+  Playwright -- against a DEDICATED, non-default, ABSOLUTE-path profile
+  directory (`DEFAULT_AUTH_PROFILE_DIR`, default
+  `data/browser_profiles/authenticated_chrome/`, override with
+  `JARVIS_AUTH_CHROME_PROFILE_DIR`). That profile starts out signed out of
+  everything; sign in manually once, directly in the window `--launch`
+  opens (safe to do there -- this launch adds no automation fingerprint).
+  JARVIS then attaches over CDP (`chromium.connect_over_cdp(...)`) and
+  reuses that session for every future run. `--launch`:
+  - Binds the debugger to `127.0.0.1` ONLY, refuses any other host.
+  - Refuses to target the user's true default profile directory
+    (`default_user_data_dir()`) even if explicitly requested, since #3
+    above proved that never works while the user's regular Chrome runs.
+  - Refuses if a chrome.exe is already running against that SAME resolved
+    profile directory specifically (`_chrome_running_with_profile`,
+    inspects each process's own command line -- NOT "is any chrome.exe
+    running anywhere," which would wrongly block launches while the
+    user's unrelated, different-profile daily browsing is open).
+  - Never claims success from `Popen` not raising alone: detects an
+    almost-immediate process exit (the "forwarded to an existing session"
+    signature) and polls `/json/version` for up to `verify_timeout`
+    seconds, reporting a real failure honestly in either case rather than
+    a false "launched successfully."
+  - Prints the exact, non-secret command line before launching.
+
+  Exposes `ensure_page`/`find_page`/`list_pages` (tab reuse -- never opens
+  a duplicate; opens a new tab in the SAME context only when none
+  matches), `diagnose()` (`python -m tools.browser_authenticated
+  --diagnose`: CDP reachability, context/page counts, each page's
+  redacted hostname/title -- no voice/JARVIS needed), and
+  `cookie_counts(urls=...)` (safe diagnostic: per-domain COUNTS only,
+  never values, and callers should scope `urls` to their own domains
+  rather than enumerating the whole real profile). Opt-in
+  (`JARVIS_AUTH_BROWSER_DEBUG=1`) `attach_diagnostics` logs URL
+  transitions/popups/console/page-errors/failed-request status codes --
+  never headers, cookies, tokens, or request/response bodies. Any future
+  authenticated-session consumer (WhatsApp Web, Gmail, Calendar, ...)
+  should reuse `get_authenticated_browser_session()` and add its tool
+  names to `brain/resource_locks.py::AUTHENTICATED_BROWSER_TOOLS` rather
+  than inventing a second session/profile mechanism.
+- `tools/music/apple_music_browser.py` — `AppleMusicWebController`: Apple
+  Music-specific DOM control (search, transport, playlists, queue,
+  now-playing parsing) layered on top of whatever page
+  `AuthenticatedBrowserSession.ensure_page("music.apple.com", ...)` hands
+  back. Owns NO browser lifecycle/profile of its own -- no dedicated
+  `user_data_dir`, no `--setup` step; if Apple Music itself isn't signed
+  into inside the user's session, `is_signed_in()` reports that honestly
+  (`AppleMusicSignInRequired`) rather than JARVIS ever touching the sign-in
+  form. Uses semantic ARIA-role/name locators first (mirrors
+  `tools/browser_agent.py`'s locator strategy), and exposes
+  `diagnose()` (`python -m tools.music.apple_music_browser --diagnose`)
+  and `diagnose_auth_state()` (delegates to `cookie_counts`, scoped to
+  Apple's own domains only) for tightening a selector or investigating a
+  stuck sign-in against the real site, without voice/JARVIS involved.
+- `tools/music/apple_music_provider.py` — turns a classified intent into
+  real controller calls: search-result scoring (Part 8: never blindly
+  click the first result), playlist fuzzy-matching via
+  `tools/music/playlist_cache.py` (locally cached playlist names, TTL
+  refresh, never credentials), local playback history/resume via
+  `brain/music_state.py` (`MusicStateStore`, same SQLite-store shape as
+  `brain/experience_store.py`), and honest verification -- a `PLAY_*`
+  result is only worded as confirmed when the observed song/artist
+  actually match; otherwise the response hedges instead of claiming false
+  success. Also records local history from OBSERVED playback (not just
+  playback JARVIS itself started) via `_maybe_record_observed_playback`,
+  called from the pause/resume/next/previous fast path and
+  `music_now_playing` -- so "play the last song I listened to" still
+  works even after a manually-started track, deduped so the same
+  continuing track is never recorded twice.
+
+  **Real Apple Music Web DOM, confirmed live** (spot-checked against the
+  actual site -- re-verify if Apple changes their markup):
+  - The page-level hero "PLAY" button is UNRELIABLE: observed live
+    `disabled` right after navigating to a playlist despite being fully
+    visible, and even when clickable, a row-button click can leave it
+    needing a *second*, separate click to actually start playback (see
+    below). Every track row instead exposes an accessible button named
+    exactly `"Play <title> by <artist>"` (`_ROW_PLAY_NAME` in
+    `apple_music_browser.py`) -- confirmed to work in Hebrew-titled rows
+    too (the aria-label stays in English). This is the reliable target,
+    used by `play_from_current_page` (first row) and
+    `play_specific_track(title, artist)` (exact row, for a known song).
+  - A row-button click sometimes only SELECTS/LOADS the track (the
+    player-bar metadata updates, the hero PLAY button becomes enabled)
+    WITHOUT starting playback -- confirmed live on a playlist immediately
+    after navigation, while the identical click pattern started playback
+    immediately elsewhere (a song's own detail page). Never assume the
+    row click alone is enough:
+    `AppleMusicWebController._confirm_playing_or_click_hero` waits
+    briefly for the Pause state and clicks the (by then enabled) hero
+    PLAY button as a follow-up if it never arrives.
+  - `document.title` does NOT update to reflect now-playing (confirmed
+    live -- it stays the static page title). The real now-playing source
+    is the player bar: `[data-testid="marquee-text-item"]` (song, a
+    `<span>`) and `[data-testid="marquee-text-item-button"]` (artist, a
+    `<button>`) -- `current_track_info`'s primary source; title-parsing
+    is kept only as a last-resort fallback.
+  - Real catalog song titles routinely carry a `"(feat. X)"` suffix the
+    user's spoken request never mentions (Apple's actual title for
+    "Starboy" is "Starboy (feat. Daft Punk)") -- a plain fuzzy ratio
+    against the bare request scores this only ~0.48, well under any sane
+    threshold, and an exact-title ALBUM of the same name used to
+    outrank the correct SONG entirely. `_title_matches` (prefix-match
+    aware) and `_best_search_match`'s decisive type-preference bonus
+    (Part 8) both exist specifically to fix this -- used for BOTH
+    result-selection scoring and post-playback verification so the two
+    can never disagree.
+  - The user's real library playlists live at `/library/all-playlists`,
+    NOT `/library/playlists` (which renders only the sidebar's own "All
+    Playlists" nav link and nothing else -- an easy, silent trap).
+    Apple's own Recently Played shelf lives on `/listen-now` (redirects
+    to `/us/home`), NOT the bare root `/`, under a heading literally
+    named "Recently Played"; some of its entries are playlist/station
+    contexts with `href="#"` (JS-driven, not a real link) and are
+    skipped since there's nothing safe to navigate to for them.
+  - This is a heavy client-rendered SPA: search results, the library
+    playlist list, and the recently-played shelf all render well after
+    `domcontentloaded` -- every navigation-driven read waits for a real
+    element (`locator(...).wait_for(state="visible")`) rather than a
+    fixed sleep, which was confirmed live to sometimes need ~1.5-2s.
+- `tools/music/media_keys.py` — Windows SMTC play/pause/next/previous key
+  presses (extends `tools/audio.py`'s existing volume-key mechanism). The
+  fast path for pause/resume/next/previous/stop: press the media key
+  first (near-instant, no browser round-trip), then verify via the
+  Playwright page state if a tracked session exists, falling back to a
+  direct control click only if the key press isn't confirmed.
+- `tools/music/provider.py` — a minimal `MusicProvider` `Protocol` (Part
+  24's provider abstraction). Only `apple_music_provider.py` is a full
+  implementation; Spotify/YouTube don't get a class here since
+  `music_intent.py` already handles them via the generic browser flow.
+- `tools/music/diagnose_cli.py` — no-voice-needed diagnostics:
+  `python -m tools.music.diagnose_cli <now-playing|playlists|history|recently-played>`,
+  `... search "QUERY"`, `... play "SONG" ["ARTIST"]` (the last one
+  genuinely starts playback and prints every step -- result selected,
+  action used, observed state, verification -- the fastest way to debug
+  a live playback issue without going through voice).
+- Registered tool names (`music_pause`, `music_resume`, `music_next`,
+  `music_previous`, `music_stop`, `open_music`, `music_play`,
+  `music_now_playing`, `music_queue_add`, `music_queue_next`,
+  `music_shuffle_on`/`_off`, `music_repeat_on`/`_off`,
+  `music_add_to_library`, `music_add_to_favorites`, `music_restart_track`,
+  `music_artist_more`) live in `brain/tool_router.py`'s dispatch table like
+  every other tool, and share a dedicated `"authenticated_browser"`
+  resource lock in `brain/resource_locks.py`
+  (`AUTHENTICATED_BROWSER_TOOLS`, separate from the generic
+  `browser_session` lock `tools/browser_agent.py`'s ephemeral,
+  unauthenticated browser uses) so ordinary web browsing and authenticated
+  playback never serialize behind each other. Any future authenticated-
+  session tool (WhatsApp Web, Gmail, ...) is added to that same set.
+- Known limitation: a compound multi-clause command like "open Apple Music
+  and play X" still goes through the pre-existing cloud/task-planner path
+  (`brain/task_planner.py`, desktop `open_application`), not this module --
+  that path is separately tested (`tests/test_plan_validator.py`) and out
+  of scope here. Every single-clause Alexa-style request ("play X", "open
+  music", "pause", "play my gym playlist", ...) uses the deterministic
+  music router instead.
+
 Self-improvement pipeline (autonomous bug-fix attempts), all under
 `brain/improvement_*.py`:
 `improvement_observer.py` (captures real-execution evidence) →

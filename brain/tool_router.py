@@ -57,6 +57,7 @@ from tools.window import (
     find_application_window,
     bring_hwnd_to_foreground,
 )
+from tools.music import apple_music_provider as music
 
 
 def execute_tool(
@@ -269,7 +270,48 @@ def execute_tool(
             arguments["x"],
             arguments["y"],
         )
-        
+
         return result
+
+    music_no_arg_tools = {
+        "open_music": music.open_music,
+        "music_pause": music.music_pause,
+        "music_resume": music.music_resume,
+        "music_stop": music.music_stop,
+        "music_next": music.music_next,
+        "music_previous": music.music_previous,
+        "music_restart_track": music.music_restart_track,
+        "music_shuffle_on": music.music_shuffle_on,
+        "music_shuffle_off": music.music_shuffle_off,
+        "music_repeat_on": music.music_repeat_on,
+        "music_repeat_off": music.music_repeat_off,
+        "music_add_to_library": music.music_add_to_library,
+        "music_add_to_favorites": music.music_add_to_favorites,
+        "music_artist_more": music.music_artist_more,
+    }
+    if tool_name in music_no_arg_tools:
+        return music_no_arg_tools[tool_name]()
+
+    if tool_name == "music_now_playing":
+        return music.music_now_playing(arguments.get("aspect", "song"))
+
+    if tool_name == "music_queue_add":
+        return music.music_queue_add(arguments.get("song"), arguments.get("contextual", False))
+
+    if tool_name == "music_queue_next":
+        return music.music_queue_next(arguments.get("song"), arguments.get("contextual", False))
+
+    if tool_name == "music_play":
+        return music.music_play(
+            arguments["intent"],
+            song=arguments.get("song"),
+            artist=arguments.get("artist"),
+            album=arguments.get("album"),
+            playlist=arguments.get("playlist"),
+            mood=arguments.get("mood"),
+            scope=arguments.get("scope"),
+            contextual=arguments.get("contextual", False),
+            shuffle=arguments.get("shuffle", False),
+        )
 
     return {"success":False,"message":f"Unknown tool: {tool_name}","error":"unknown_tool"}

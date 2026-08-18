@@ -1,0 +1,11 @@
+{
+  "task_id": "api_misuse_retry_contract",
+  "category": "api_misuse",
+  "description": "DataSyncService.sync() is crashing with a ValueError instead of successfully syncing data from a flaky source that recovers after a couple of failures. retry_util.py's retry() function is correct, already well-tested, and must NOT be modified -- its contract is that max_attempts is the TOTAL number of attempts and must be >= 1. Find the actual bug: a caller is misusing retry()'s contract.",
+  "fixture_dir": "api_misuse_retry_contract",
+  "hidden_test_path": "hidden_test.py",
+  "visible_test_paths": ["tests/test_data_sync.py"],
+  "timeout_seconds": 120.0,
+  "constraints": ["do not modify retry_util.py"],
+  "metadata": {}
+}

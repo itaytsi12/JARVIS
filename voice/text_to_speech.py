@@ -14,12 +14,20 @@ _pyttsx3_available = False
 _chatterbox_provider = None
 _chatterbox_available = False
 _openai_provider = None
+_elevenlabs_provider = None
+_elevenlabs_available = False
 _SPEAKER_LOCK=threading.Lock()
 
 try:
 	_openai_provider = importlib.import_module('voice.tts.openai_tts')
 except Exception:
 	_openai_provider = None
+
+try:
+	_elevenlabs_provider = importlib.import_module('voice.tts.elevenlabs_tts')
+	_elevenlabs_available = True
+except Exception:
+	_elevenlabs_provider = None
 
 # Try chatterbox provider module under voice/tts
 try:
@@ -50,7 +58,7 @@ def _init_pyttsx3():
 
 def _configured_provider() -> str:
 	value = os.getenv("TTS_PROVIDER", "auto").strip().lower()
-	if value not in {"auto", "openai", "chatterbox", "pyttsx3"}:
+	if value not in {"auto", "openai", "chatterbox", "pyttsx3", "elevenlabs"}:
 		print(f"Unknown TTS_PROVIDER={value!r}; using auto")
 		return "auto"
 	return value
@@ -63,8 +71,14 @@ def _openai_is_available() -> bool:
 	)
 
 
+def _elevenlabs_is_available() -> bool:
+	return bool(_elevenlabs_available and _elevenlabs_provider is not None and _elevenlabs_provider.is_available())
+
+
 def _provider_order() -> list[str]:
 	configured = _configured_provider()
+	if configured == "elevenlabs":
+		return ["elevenlabs", "openai", "chatterbox", "pyttsx3"]
 	if configured == "openai":
 		return ["openai", "pyttsx3"]
 	if configured == "chatterbox":
@@ -73,6 +87,8 @@ def _provider_order() -> list[str]:
 		return ["pyttsx3"]
 
 	providers = []
+	if _elevenlabs_is_available():
+		providers.append("elevenlabs")
 	if (
 		_chatterbox_available
 		and _chatterbox_provider is not None
@@ -87,6 +103,8 @@ def _provider_order() -> list[str]:
 
 def _active_provider() -> str:
 	for provider in _provider_order():
+		if provider == "elevenlabs" and _elevenlabs_is_available():
+			return provider
 		if provider == "openai" and _openai_is_available():
 			return provider
 		if provider == "chatterbox" and _chatterbox_available:
@@ -98,6 +116,7 @@ def _active_provider() -> str:
 
 def _provider_label(provider: str) -> str:
 	return {
+		"elevenlabs": "ElevenLabs streaming",
 		"openai": "OpenAI cedar",
 		"chatterbox": "Chatterbox local",
 		"pyttsx3": "pyttsx3 fallback",
@@ -113,17 +132,17 @@ def start_background() -> None:
 	print(f"TTS provider: {_provider_label(_active_provider())}")
 
 
-def speak(text: str, max_speech_chars: int = 300, lang: Optional[str] = None) -> dict:
+def speak(text: str, max_speech_chars: int = 300, lang: Optional[str] = None, on_first_audio_chunk=None) -> dict:
 	started=time.perf_counter()
 	with acquire_action_resource("speak_response") as resource_info:
 		with _SPEAKER_LOCK:
 			wait_ms=(time.perf_counter()-started)*1000
-			result=_speak_unlocked(text,max_speech_chars,lang)
+			result=_speak_unlocked(text,max_speech_chars,lang,on_first_audio_chunk)
 			result["resource"]="speaker";result["resource_wait_ms"]=round(wait_ms,3);result["cross_process_lock"]=bool(resource_info.get("cross_process"))
 			return result
 
 
-def _speak_unlocked(text: str, max_speech_chars: int = 300, lang: Optional[str] = None) -> dict:
+def _speak_unlocked(text: str, max_speech_chars: int = 300, lang: Optional[str] = None, on_first_audio_chunk=None) -> dict:
 	"""Speak locally with Chatterbox, using pyttsx3 only on failure.
 
 	For long texts, speak a short summary and leave full text for the terminal.
@@ -140,7 +159,14 @@ def _speak_unlocked(text: str, max_speech_chars: int = 300, lang: Optional[str] 
 
 	attempted=[]
 	for provider in _provider_order():
-		if provider == "chatterbox" and _chatterbox_available and _chatterbox_provider is not None:
+		if provider == "elevenlabs" and _elevenlabs_is_available():
+			attempted.append(provider)
+			try:
+				_elevenlabs_provider.speak(to_speak, lang=lang or 'en', on_first_audio_chunk=on_first_audio_chunk)
+				return {"success":True,"provider":"elevenlabs","spoken_chars":len(to_speak),"attempted_providers":attempted,"fallback_from":attempted[:-1]}
+			except Exception as e:
+				print(f"ElevenLabs TTS failed: {e} -- falling back")
+		elif provider == "chatterbox" and _chatterbox_available and _chatterbox_provider is not None:
 			attempted.append(provider)
 			try:
 				_chatterbox_provider.speak(to_speak, lang=lang or 'en')
@@ -169,6 +195,8 @@ def _speak_unlocked(text: str, max_speech_chars: int = 300, lang: Optional[str] 
 
 def stop() -> None:
 	"""Stop current playback without disabling future speech."""
+	if _elevenlabs_provider is not None and hasattr(_elevenlabs_provider,"stop"):
+		_elevenlabs_provider.stop()
 	if _openai_provider is not None and hasattr(_openai_provider,"stop"):
 		_openai_provider.stop()
 	if _chatterbox_provider is not None and hasattr(_chatterbox_provider,"stop"):

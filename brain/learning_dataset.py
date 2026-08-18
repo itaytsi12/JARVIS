@@ -100,6 +100,12 @@ def _real_teacher_example(job: LearningJob, package: LearningPackage) -> Dataset
         "diff_summary": package.diff_summary,
         "before_behavior": package.before_behavior,
         "after_behavior": package.after_behavior,
+        # Part A, Phase A9: a student-fail/teacher-success example is the
+        # highest-value kind of teacher row -- a future training pass can
+        # prioritize/oversample rows where this is True. Purely additive;
+        # absent any special handling, this is inert extra metadata.
+        "high_value": job.high_value,
+        "high_value_reason": job.high_value_reason,
     }
     example_id = stable_hash({"kind": "real_teacher", "job": job.learning_job_id, "payload": payload})[:32]
     return DatasetExample(example_id, DataQualityLabel.REAL_VERIFIED_TEACHER.value, job.learning_job_id, None, payload)

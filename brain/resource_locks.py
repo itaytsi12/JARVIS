@@ -8,7 +8,21 @@ from contextlib import contextmanager
 DESKTOP_INPUT_TOOLS={"type_text","press_key","click_at","click_ui_element","focus_application","minimize_window","maximize_window","restore_window","close_window","send_whatsapp_message","save_current_document","save_active_document"}
 BROWSER_TOOLS={"open_website","browser_open_url","browser_click_first_result","browser_click","browser_type","browser_select","browser_scroll","browser_go_back","browser_go_forward","browser_fullscreen"}
 SPEAKER_TOOLS={"speak_response"}
-_LOCKS={"action_plan":threading.RLock(),"desktop_input":threading.RLock(),"browser_session":threading.RLock(),"speaker":threading.RLock()}
+# tools/browser_authenticated.py's AuthenticatedBrowserSession is a SEPARATE
+# CDP attachment from the generic BROWSER_TOOLS one above
+# (tools/browser_agent.py's ephemeral, unauthenticated browser) -- distinct
+# lock so ordinary web browsing and authenticated-session use never
+# serialize behind each other. Every tool that drives the shared
+# authenticated session (Apple Music today; a future WhatsApp Web/Gmail/
+# Calendar tool reuses the SAME session and MUST be added to this same set)
+# shares one lock, so concurrent commands (e.g. a speculative "open music"
+# racing the final "pause") never touch the same Playwright page object
+# from two threads at once.
+AUTHENTICATED_BROWSER_TOOLS={"open_music","music_pause","music_resume","music_stop","music_next","music_previous",
+             "music_restart_track","music_shuffle_on","music_shuffle_off","music_repeat_on","music_repeat_off",
+             "music_add_to_library","music_add_to_favorites","music_now_playing","music_artist_more",
+             "music_queue_add","music_queue_next","music_play"}
+_LOCKS={"action_plan":threading.RLock(),"desktop_input":threading.RLock(),"browser_session":threading.RLock(),"speaker":threading.RLock(),"authenticated_browser":threading.RLock()}
 _DYNAMIC_LOCKS=weakref.WeakValueDictionary();_DYNAMIC_GUARD=threading.Lock()
 WAIT_OBJECT_0=0;WAIT_ABANDONED=0x80;WAIT_TIMEOUT=0x102
 
@@ -18,6 +32,7 @@ def resource_for_tool(tool):
     if tool in DESKTOP_INPUT_TOOLS:return "desktop_input"
     if tool in BROWSER_TOOLS:return "browser_session"
     if tool in SPEAKER_TOOLS:return "speaker"
+    if tool in AUTHENTICATED_BROWSER_TOOLS:return "authenticated_browser"
     return None
 
 

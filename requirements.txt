@@ -7,3 +7,6 @@ soundfile
 pyttsx3
 Pillow
 pyyaml
+requests
+websocket-client
+numpy

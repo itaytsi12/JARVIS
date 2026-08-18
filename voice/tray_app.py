@@ -155,6 +155,8 @@ def run_tray() -> int:
         "Runtime entrypoint: pid=%s ppid=%s executable=%r argv=%r cwd=%r main=%r project_root=%r",
         os.getpid(),os.getppid(),sys.executable,sys.argv,os.getcwd(),str(Path(sys.argv[0]).resolve()),str(PROJECT_ROOT),
     )
+    from .startup_validation import log_provider_status
+    log_provider_status()
     instance = SingleInstance()
     if not instance.acquire():
         return 0

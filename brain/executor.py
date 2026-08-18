@@ -47,6 +47,23 @@ class Executor:
         except Exception as e:
             return ToolResult(False,action.tool,f"Failed to execute {action.tool}.",error=str(e))
 
+    def execute_action_unlocked_plan(
+        self,
+        action: Action,
+    ) -> ToolResult:
+        """Like `execute_action`, but assumes the CALLER already holds the
+        process-wide "action_plan" resource lock for the whole plan's
+        duration (e.g. `AgentRuntime`'s Part H parallel-independent-action
+        execution, where the lock is acquired once by the plan's owning
+        thread before any worker thread exists). Re-acquiring that same
+        RLock from a different worker thread would block/time out --
+        RLock reentrancy is per-thread, not per-plan. The per-tool
+        resource lock is still taken as normal."""
+        try:
+            with acquire_action_resource(action.tool):return self._execute_action_unlocked(action)
+        except Exception as e:
+            return ToolResult(False,action.tool,f"Failed to execute {action.tool}.",error=str(e))
+
     def _execute_action_unlocked(
         self,
         action: Action,

@@ -63,7 +63,7 @@ class CaptureAssistant(AlwaysOnAssistant):
     def _start_command_warmup(self):
         pass
 
-    def _process_capture(self, frames):
+    def _process_capture(self, frames, **kwargs):
         self.processed = bool(frames)
         self.mic_released_before_processing = not self.stream.active
         self._set_state(AssistantState.PROCESSING)

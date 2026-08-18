@@ -170,6 +170,8 @@ def _start_stt_warmup() -> None:
 
 
 def run_voice_loop():
+    from .startup_validation import log_provider_status
+    log_provider_status()
     start_background()
     _start_stt_warmup()
     print("Voice mode: push-to-talk. Press Ctrl+C to stop.")

@@ -83,6 +83,8 @@ class TaskResult:
     tool_calls: int
     agent_exit_status: str
     error: str | None = None
+    test_added: bool | None = None
+    structural_change_detected: bool | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -120,11 +122,27 @@ def _run_task(task: BenchmarkTask, agent: CodingAgent, fixtures_root: Path, *, s
         _git(workspace, "commit", "-qm", "initial fixture state")
         base_commit = _git(workspace, "rev-parse", "HEAD").stdout.strip()
 
+        original_line_count = None
+        if task.structural_check_path:
+            check_file = workspace / task.structural_check_path
+            if check_file.exists():
+                original_line_count = len([ln for ln in check_file.read_text(encoding="utf-8").splitlines() if ln.strip()])
+
         agent_result = agent.run(task.description, CodingAgentConstraints(workspace=str(workspace), timeout_seconds=task.timeout_seconds))
         tool_calls = getattr(agent_result, "model_calls", 0) or 0
 
         diff = analyze_diff(str(workspace), base_commit)
         patch_applied = diff.change_scope != "none"
+
+        test_added: bool | None = None
+        if task.require_new_test:
+            test_added = bool(diff.generated_tests)
+
+        structural_change_detected: bool | None = None
+        if task.structural_check_path and original_line_count is not None:
+            check_file = workspace / task.structural_check_path
+            new_line_count = len([ln for ln in check_file.read_text(encoding="utf-8").splitlines() if ln.strip()]) if check_file.exists() else 0
+            structural_change_detected = (original_line_count - new_line_count) >= task.min_line_reduction
 
         acceptance_passed: bool | None = None
         hidden_source = fixtures_root / task.fixture_dir / "harness" / task.hidden_test_path
@@ -147,12 +165,16 @@ def _run_task(task: BenchmarkTask, agent: CodingAgent, fixtures_root: Path, *, s
             except Exception:
                 regression_passed = False
 
-        solved = bool(patch_applied and acceptance_passed is True and regression_passed is not False)
+        solved = bool(
+            patch_applied and acceptance_passed is True and regression_passed is not False
+            and test_added is not False and structural_change_detected is not False
+        )
         return TaskResult(
             task.task_id, task.category, solved, patch_applied, acceptance_passed, regression_passed,
             iterations=1, runtime_seconds=time.perf_counter() - started, tool_calls=tool_calls,
             agent_exit_status=agent_result.exit_status,
             error=agent_result.error if agent_result.exit_status != "completed" else None,
+            test_added=test_added, structural_change_detected=structural_change_detected,
         )
     except Exception as exc:
         return TaskResult(task.task_id, task.category, False, False, None, None, 0, time.perf_counter() - started, 0, "crashed", f"{type(exc).__name__}: {exc}")

@@ -108,7 +108,18 @@ data/*.sqlite3-wal
 data/*.sqlite3-shm
 exports/*.jsonl
 
+# Music: local playback state/history DB, playlist name cache, and the
+# dedicated persistent Apple Music Web Chrome automation profile (this is
+# real, live browser session state -- never commit it).
+data/music_state.db
+data/music_state.db-*
+data/music_cache/
+data/browser_profiles/
+
 # =========================
 # Autonomous improvement worktrees
 # =========================
 .jarvis-improvement-worktrees/
+
+
+data/jarvis_real_dataset_v1/

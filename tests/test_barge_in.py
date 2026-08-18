@@ -15,7 +15,7 @@ class BargeInTests(unittest.TestCase):
         openai.stop.assert_called_once();chatterbox.stop.assert_called_once();engine.stop.assert_called_once()
     def test_wake_word_during_tts_requests_stop_and_enters_listening(self):
         class Capture(AlwaysOnAssistant):
-            def _process_capture(self,frames):self._stop.set()
+            def _process_capture(self,frames,**kwargs):self._stop.set()
         quiet=np.zeros(1280,dtype=np.int16);loud=np.full(1280,2000,dtype=np.int16)
         states=[];assistant=Capture(wake_engine=FakeWakeEngine(),stream_factory=lambda:FakeStream([quiet,loud]+[quiet]*15),clock=StepClock(),state_callback=lambda state,detail:states.append(state));assistant.state=AssistantState.SPEAKING;assistant.silence_seconds=.2
         with patch("voice.text_to_speech.stop") as stop:assistant._audio_session()

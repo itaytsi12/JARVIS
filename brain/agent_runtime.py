@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from brain.executor import Executor
 from brain.models import Action, ActionRisk, Plan, PlanStatus, ToolResult
+from brain.safe_tools import CONTEXT_INDEPENDENT_TOOLS
 from brain.session_context import SessionContext
 from security.safety import may_auto_execute
 from tools.browser_agent import BrowserAgent, HumanActionRequired
@@ -32,6 +35,19 @@ NON_RETRYABLE_TOOLS={
 RETRYABLE_READ_ONLY_TOOLS={"wait_for_window","verify_file","exists","list_files","read_text_file","find_file","search_text","active_window","inspect_window","get_time","get_date","get_day"}
 
 
+def _all_actions_independent(actions: list[Action]) -> bool:
+    """Part H: a plan is safe to run concurrently only when EVERY action is
+    both explicitly dependency-free (`depends_on` empty -- e.g. "open
+    Chrome, then navigate, then click" always sets this) and its tool is in
+    `CONTEXT_INDEPENDENT_TOOLS` (self-contained: reads no session state a
+    sibling action writes). A single-action plan gains nothing from the
+    parallel path, so it stays on the ordinary sequential one."""
+    return len(actions) >= 2 and all(
+        not action.depends_on and not action.optional and action.tool in CONTEXT_INDEPENDENT_TOOLS
+        for action in actions
+    )
+
+
 class AgentRuntime:
     def __init__(self, context: SessionContext | None = None, browser: BrowserAgent | None = None, trace: bool = True, memory=None, session_id=None):
         self.context = context or SessionContext()
@@ -42,6 +58,7 @@ class AgentRuntime:
         self.session_id = session_id or (memory.start_session() if memory else None)
         self.context.memory = memory
         self.context.session_id = self.session_id
+        self._context_lock = threading.Lock()
 
     def _log(self, message: str) -> None:
         if self.trace:
@@ -66,6 +83,9 @@ class AgentRuntime:
         results = []
         self._log(f"[PLAN] Goal: {plan.safe_goal()}")
         self._log(f"[PLAN] {len(plan.actions)} steps")
+        if _all_actions_independent(plan.actions):
+            self._log("[PLAN] All steps are independent -- executing concurrently")
+            return self._execute_plan_parallel(plan, cancellation_token, action_observer)
         while plan.current_action_index < len(plan.actions):
             index = plan.current_action_index
             action = plan.actions[index]
@@ -106,14 +126,91 @@ class AgentRuntime:
             plan.status = PlanStatus.COMPLETED
         return results
 
-    def _execute_with_retry(self, action: Action, cancellation_token=None) -> ToolResult:
+    def _execute_plan_parallel(self, plan: Plan, cancellation_token=None, action_observer=None) -> list[ToolResult]:
+        """Part H: run every action in `plan` concurrently instead of one
+        at a time. Only ever reached when `_all_actions_independent(plan.actions)`
+        already confirmed every action's tool is in `CONTEXT_INDEPENDENT_TOOLS`
+        (self-contained: no action reads state a sibling writes) and has no
+        `depends_on` wiring -- genuinely dependent plans (e.g. open a
+        browser, then navigate, then click) always take the sequential path
+        above, completely unchanged. Reuses the exact same per-action
+        retry/resource-lock/high-impact-confirmation logic as the
+        sequential path; only the scheduling is different. `self.context`
+        mutations are serialized behind `self._context_lock` since multiple
+        actions may finish at the same time."""
+        results_by_index: dict[int, ToolResult] = {}
+        needs_confirmation = threading.Event()
+
+        def run_one(index: int, action: Action) -> None:
+            if action_observer is not None:
+                action_observer("prepared", index, action, None, self.context)
+            if cancellation_token is not None and cancellation_token.cancelled:
+                result = ToolResult(False, action.tool, "Task cancelled.", error="cancelled")
+            elif not may_auto_execute(action):
+                result = ToolResult(False, action.tool, "High-impact action requires confirmation.", error="human_confirmation_required")
+                needs_confirmation.set()
+            else:
+                # `plan_lock_held=True`: `AgentRuntime.execute()` already
+                # holds the process-wide "action_plan" resource lock for
+                # this whole plan's duration (acquired once, from THIS
+                # method's caller's thread, before any worker thread
+                # existed). `Executor.execute_action`'s own internal
+                # re-acquisition of that same lock is reentrant only for
+                # the thread that first took it -- a worker thread here
+                # would block/timeout trying to take it again. Skip that
+                # redundant re-acquisition; the per-tool resource lock
+                # below is still taken as normal.
+                result = self._execute_with_retry(action, cancellation_token, plan_lock_held=True)
+            with self._context_lock:
+                self.context.previous_action = action.tool
+                self.context.previous_result = result.message
+                if result.success:
+                    self._update_context(action, result)
+            results_by_index[index] = result
+            if action_observer is not None:
+                action_observer("result", index, action, result, self.context)
+
+        with ThreadPoolExecutor(max_workers=min(8, len(plan.actions)), thread_name_prefix="jarvis-parallel-action") as pool:
+            futures = [pool.submit(run_one, index, action) for index, action in enumerate(plan.actions)]
+            for future in futures:
+                future.result()
+
+        results = [results_by_index[index] for index in range(len(plan.actions))]
+        for index, result in enumerate(results):
+            if result.success:
+                plan.completed_actions.append(index)
+            elif plan.failed_action is None:
+                plan.failed_action = index
+                plan.failure_information = result.error or result.message
+        plan.current_action_index = len(plan.actions)
+        if all(result.success for result in results):
+            plan.status = PlanStatus.COMPLETED
+        elif needs_confirmation.is_set():
+            plan.status = PlanStatus.PAUSED
+        else:
+            plan.status = PlanStatus.FAILED
+        return results
+
+    def _execute_with_retry(self, action: Action, cancellation_token=None, plan_lock_held: bool = False) -> ToolResult:
         attempts = action.max_attempts or (3 if action.tool in RETRYABLE_READ_ONLY_TOOLS and action.risk is ActionRisk.SAFE else 1)
         last = None;attempt_history=[]
         for attempt in range(attempts):
             self._log(f"[{self.context.current_plan.current_action_index + 1}/{len(self.context.current_plan.actions)}] {action.tool} {sanitize_action_arguments(action.tool,action.args)}")
             try:
                 with acquire_action_resource(action.tool,cancellation_token) as resource_info:
-                    last = self._execute_action(action,cancellation_token) if cancellation_token is not None else self._execute_action(action)
+                    # Preserve the exact historical call arity when neither
+                    # new argument is in play, since test subclasses (e.g.
+                    # tests/test_agent_runtime.py's FailingRuntime) override
+                    # `_execute_action(self, action)` with that narrower
+                    # signature.
+                    if cancellation_token is not None and plan_lock_held:
+                        last = self._execute_action(action,cancellation_token,plan_lock_held)
+                    elif cancellation_token is not None:
+                        last = self._execute_action(action,cancellation_token)
+                    elif plan_lock_held:
+                        last = self._execute_action(action,plan_lock_held=plan_lock_held)
+                    else:
+                        last = self._execute_action(action)
             except HumanActionRequired as exc:
                 self.context.current_plan.status = PlanStatus.PAUSED
                 return ToolResult(False, action.tool, "Human action required.", error=str(exc))
@@ -130,7 +227,7 @@ class AgentRuntime:
                 time.sleep(0.05)
         return last
 
-    def _execute_action(self, action: Action, cancellation_token=None) -> ToolResult:
+    def _execute_action(self, action: Action, cancellation_token=None, plan_lock_held: bool = False) -> ToolResult:
         tool, args = action.tool, action.args
         if tool == "type_text":
             if os.getenv("DEBUG_REFERENCE_RESOLUTION","false").lower() in {"1","true","yes","on"}:
@@ -218,7 +315,7 @@ class AgentRuntime:
             return ToolResult(False, tool, "Save dialog did not create the file.", error="verification_failed")
         if tool.startswith("browser_"):
             return self._browser_action(tool, args)
-        result = self.executor.execute_action(action)
+        result = self.executor.execute_action_unlocked_plan(action) if plan_lock_held else self.executor.execute_action(action)
         return result
 
     def _browser_action(self, tool: str, args: dict) -> ToolResult:

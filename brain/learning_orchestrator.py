@@ -91,12 +91,20 @@ def handle_verified_teacher_success(
     experience_store: ExperienceStore | None = None,
     timeout_seconds: float | None = None,
     cancellation_token: CancellationToken | None = None,
+    high_value: bool = False,
+    high_value_reason: str | None = None,
 ) -> LearningOfferOutcome:
     """Call this once for every completed `ImprovementAttempt` (not only
     successful ones) -- Phase 2's eligibility gate and Phase 5's dedup both
     run through `evaluate_learning_offer` here, so most attempts return
     immediately with `offered=False` and never touch voice/approval at all.
     Never raises for an ordinary ineligible/declined/timed-out outcome.
+
+    `high_value`/`high_value_reason` (Part A, Phase A9): set by
+    `brain/improvement_student_teacher.py` when this teacher fix followed a
+    genuine, verified local-student failure on the SAME task -- the
+    highest-value kind of teacher example. Purely additive metadata on the
+    created job; never changes whether an offer is made or approved.
     """
     job_store = job_store or get_learning_job_store()
     experience_store = experience_store or get_experience_store()
@@ -120,6 +128,7 @@ def handle_verified_teacher_success(
         subsystem=attempt.subsystem, gap_type=attempt.gap_type, claude_teacher_used=True,
         verification_evidence={"acceptance_gates": attempt.acceptance_gates, "evaluator_reason": sanitize_text(attempt.evaluator_reason or "")},
         approval_requested_at=_now(), approval_source="voice", fingerprint=decision.fingerprint,
+        high_value=high_value, high_value_reason=sanitize_text(high_value_reason) if high_value_reason else None,
     )
 
     if outcome_value == "APPROVED":

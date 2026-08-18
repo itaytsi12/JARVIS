@@ -78,6 +78,30 @@ def route_command(command: str) -> dict:
         return {"type": "stop_learning"}
     if text.rstrip(".?!,;:") in {"learning status", "what is the learning status", "what's the learning status", "status of learning"}:
         return {"type": "learning_status"}
+
+    # Deterministic, first-class music routing (see brain/music_intent.py).
+    # Checked before the generic "open X" / multi-step fallbacks below so
+    # "open music"/"open apple music" never falls through to
+    # open_application (Apple Music's desktop app is unreliable on this
+    # machine -- Apple Music Web is the default provider) and so a "play X"
+    # request never gets treated as an unrelated multi-step plan.
+    from brain.music_intent import route_music_command
+    music_route = route_music_command(command)
+    if music_route is not None:
+        return music_route
+
+    # Deterministic coding-task routing (Part A, Phase A1): a genuine
+    # coding/self-improvement request goes to the student-first pipeline
+    # (brain/improvement_student_teacher.py), never through the local
+    # intent model or cloud planner. Checked before any of the general
+    # fallback paths below so a free-form coding sentence never gets
+    # misrouted as a question or an unrelated tool call. See
+    # brain/coding_task_intent.py::is_coding_task for the (deliberately
+    # conservative) eligibility rule -- ordinary commands never match it.
+    from brain.coding_task_intent import is_coding_task
+    if is_coding_task(command):
+        return {"type": "coding_task", "task": command}
+
     if re.fullmatch(r"(?:make it (?:much )?shorter|shorten that|only (?:tell|give) me (?:the )?(?:top )?\d+)",text.rstrip(".?!,;:")):
         return {"type":"correct_interrupted_response","instruction":text.rstrip(".?!,;:")}
     recipient_correction=re.fullmatch(r"(?:don't send it to \S+,\s*)?send it to (.+?) instead",text.rstrip(".?!;:"))

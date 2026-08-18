@@ -207,6 +207,9 @@ class AlwaysOnAssistant:
         capture = []
         listen_started = last_speech = None
         speech_after_wake = False
+        from .voice_perf import VoiceInteractionTimer
+        perf = VoiceInteractionTimer(clock=self.clock)
+        realtime = None
         self.wake_engine.reset()
         if self.state is not AssistantState.SPEAKING or self._stop.is_set():
             self._set_state(AssistantState.IDLE, "Wake word ready" if self.wake_enabled else "Wake word disabled")
@@ -233,6 +236,8 @@ class AlwaysOnAssistant:
                         # The ring belongs to the earlier command/listening phase.
                         # Reusing it here can feed stale user/TTS audio into STT.
                         capture=[];listen_started,last_speech,speech_after_wake=now,None,False
+                        perf=VoiceInteractionTimer(clock=self.clock);perf.mark("wake_detected",now)
+                        realtime=self._start_realtime_stt(perf)
                         self._set_state(AssistantState.LISTENING,"Waiting for correction or command")
                     continue
                 if self.state is AssistantState.IDLE:
@@ -251,12 +256,17 @@ class AlwaysOnAssistant:
                         self._start_command_warmup()
                         capture = list(ring)
                         listen_started, last_speech, speech_after_wake = now, None, False
+                        perf = VoiceInteractionTimer(clock=self.clock)
+                        perf.mark("wake_detected", now)
+                        realtime = self._start_realtime_stt(perf)
                         self._set_state(AssistantState.LISTENING)
                         self._perf("recording_started", now)
                     continue
                 if self.state is not AssistantState.LISTENING:
                     continue
                 capture.append(frame)
+                if realtime is not None:
+                    realtime.feed(frame.tobytes())
                 rms = float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
                 if rms >= self.speech_rms:
                     speech_after_wake, last_speech = True, now
@@ -271,11 +281,20 @@ class AlwaysOnAssistant:
 
         self._restart.clear()
         if self._stop.is_set():
+            if realtime is not None:
+                realtime.close()
             return
         if not capture or not speech_after_wake:
+            if realtime is not None:
+                realtime.close()
             self._set_state(AssistantState.IDLE, "No command heard")
             return
-        self._process_capture(capture)
+        elevenlabs_transcript = None
+        ledger = realtime.ledger if realtime is not None else None
+        if realtime is not None:
+            commit_timeout = float(os.getenv("ELEVENLABS_STT_COMMIT_TIMEOUT", "5.0"))
+            elevenlabs_transcript = realtime.commit_and_close(timeout=commit_timeout)
+        self._process_capture(capture, elevenlabs_transcript=elevenlabs_transcript, ledger=ledger, perf=perf)
         self._stop.wait(self.cooldown_seconds)
         self.wake_engine.reset()
         if self.state is not AssistantState.SPEAKING or self._stop.is_set():
@@ -405,21 +424,98 @@ class AlwaysOnAssistant:
             timeout_seconds=timeout_seconds, question=question, cancellation_token=cancellation_token,
         )
 
-    def _process_capture(self, frames) -> None:
-        import numpy as np
-        import soundfile as sf
+    def _elevenlabs_stt_enabled(self) -> bool:
+        from .elevenlabs_realtime_stt import is_configured
+        return is_configured()
 
-        audio = np.concatenate(frames).astype("float32") / 32768.0
-        temp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        path = Path(temp.name)
-        temp.close()
+    def _start_realtime_stt(self, perf):
+        """Open an ElevenLabs realtime STT session for the utterance that
+        just started (Part A/M): only ever called right after a wake event,
+        never while idle, and always closed by the caller once the
+        interaction ends. Returns None (never raises) if ElevenLabs STT is
+        not configured/enabled or fails to start -- the caller's existing
+        Whisper-based capture path is entirely unaffected either way."""
+        if not self._elevenlabs_stt_enabled():
+            return None
         try:
+            from .realtime_capture import RealtimeSTTController
+            controller = RealtimeSTTController(
+                perf=perf, on_speculative_action=self._on_speculative_action,
+                sample_rate=self.wake_engine.sample_rate,
+            )
+            controller.start()
+            return controller
+        except Exception:
+            self.log.exception("Failed to start ElevenLabs realtime STT session")
+            return None
+
+    def _on_speculative_action(self, action) -> None:
+        """Invoked (from the ElevenLabs receive thread) the moment a
+        partial transcript resolves into a stable, SAFE, deterministic
+        action (Part B). Acknowledgement speech and the actual action
+        execution are dispatched on two independent threads so neither
+        blocks the other or the STT receive thread itself (Part E)."""
+        self.log.info("Speculative partial action: tool=%s", action.route.get("tool"))
+        ack_text = self._speculative_ack_text(action.route)
+        if ack_text and not self.muted:
+            self._start_speech_task(ack_text, "en", None)
+        threading.Thread(
+            target=self._run_speculative_action, args=(action,),
+            name="jarvis-speculative-exec", daemon=True,
+        ).start()
+
+    def _run_speculative_action(self, action) -> None:
+        try:
+            from brain.agent import run_agent
+            action.result = run_agent(action.partial_text, route=action.route)
+        except Exception:
+            self.log.exception("Speculative action execution failed")
+
+    @staticmethod
+    def _speculative_ack_text(route: dict) -> str:
+        tool = route.get("tool")
+        if tool in {"open_application", "open_website"}:
+            return "Opening it now, sir."
+        if tool in {"volume_up", "volume_down", "mute_volume"}:
+            return "Right away, sir."
+        return "On it, sir."
+
+    @staticmethod
+    def _command_needs_planning(command: str, route: dict) -> bool:
+        """Part J: reuses the exact predicate `brain.agent.run_agent`
+        itself uses to decide whether task planning/cloud calls are
+        needed -- no new heuristic invented -- plus the router's own
+        explicit "this always needs an LLM" route types."""
+        try:
+            from brain.task_planner import should_use_task_planner
+            return route.get("type") in {"plan", "tools", "ai"} or should_use_task_planner(command)
+        except Exception:
+            return route.get("type") in {"plan", "tools", "ai"}
+
+    def _process_capture(self, frames, *, elevenlabs_transcript: str | None = None, ledger=None, perf=None) -> None:
+        import numpy as np
+
+        from .voice_perf import VoiceInteractionTimer
+        if perf is None:
+            perf = VoiceInteractionTimer(clock=self.clock)
+        transcript = (elevenlabs_transcript or "").strip() or None
+        path = None
+        if transcript is None:
+            import soundfile as sf
+            audio = np.concatenate(frames).astype("float32") / 32768.0
+            temp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            path = Path(temp.name)
+            temp.close()
             sf.write(path, audio, self.wake_engine.sample_rate)
+        try:
             self._set_state(AssistantState.PROCESSING, "Transcribing")
-            from .speech_to_text import transcribe_audio
-            self._perf("stt_started")
-            transcript = transcribe_audio(str(path))
-            self._perf("stt_completed")
+            if transcript is not None:
+                self.log.info("Using ElevenLabs realtime committed transcript (Whisper skipped)")
+            else:
+                from .speech_to_text import transcribe_audio
+                self._perf("stt_started")
+                transcript = transcribe_audio(str(path))
+                self._perf("stt_completed")
             self.log.info("Transcribed command: %s", _redact_for_log(transcript))
             command, _ = normalize_transcript(transcript)
             self._perf("normalization_completed")
@@ -441,6 +537,29 @@ class AlwaysOnAssistant:
             self._perf("intent_started")
             question_pipeline_started = time.perf_counter()
             route = route_command(command)
+            perf.mark("committed_transcript")
+            if ledger is not None and ledger.has_fired_anything():
+                from brain.speculative_execution import reconcile_final_route, reconcile_local_plan_actions
+                if route.get("type") == "local_plan":
+                    remaining_actions = reconcile_local_plan_actions(ledger, route.get("actions") or [])
+                    if not remaining_actions:
+                        self.log.info("Final command fully satisfied by an earlier speculative partial action")
+                        recorder.record(EventType.TASK_COMPLETED, {"success": True, "verified": True, "reason": "already_completed_by_speculative_partial_action"}, interaction_id)
+                        recorder.finalize(interaction_id, success=True, verified=True, response="Already completed from an earlier action.")
+                        self._set_state(AssistantState.IDLE, "Wake word ready" if self.wake_enabled else "Wake word disabled")
+                        perf.mark("interaction_finished");perf.log_summary()
+                        return
+                    route = {**route, "actions": remaining_actions}
+                else:
+                    reconciled_route, matched = reconcile_final_route(ledger, route)
+                    if reconciled_route is None and matched is not None:
+                        self.log.info("Final command fully satisfied by an earlier speculative partial action")
+                        recorder.record(EventType.TASK_COMPLETED, {"success": True, "verified": True, "reason": "already_completed_by_speculative_partial_action"}, interaction_id)
+                        recorder.finalize(interaction_id, success=True, verified=True, response="Already completed from an earlier action.")
+                        self._set_state(AssistantState.IDLE, "Wake word ready" if self.wake_enabled else "Wake word disabled")
+                        perf.mark("interaction_finished");perf.log_summary()
+                        return
+                    route = reconciled_route
             from brain.request_intent import classify_request_kind
             request_kind=classify_request_kind(command)
             self.log.info("Request kind: kind=%s confidence=%.3f reason=%s",request_kind.kind.value,request_kind.confidence,request_kind.reason)
@@ -460,26 +579,67 @@ class AlwaysOnAssistant:
             if route.get("type") == "learning_status":
                 self._learning_status_task(interaction_id)
                 return
+            if route.get("type") == "coding_task":
+                self._start_coding_task(route.get("task") or command, interaction_id)
+                return
             if (re.match(r"^(?:send|message|tell)\s+",command,re.I) and route.get("type")!="revise_whatsapp_recipient") or (route.get("type")=="tool" and route.get("tool")=="analyze_screen"):
                 self._start_cancellable_action_task(command,route,interaction_id,transcript)
                 return
+            needs_planning = self._command_needs_planning(command, route)
+            from .voice_language import is_hebrew_mode
+            hebrew_mode = is_hebrew_mode()
+            if hebrew_mode:
+                # Language UX rule: TTS speaks English only, always. A
+                # Hebrew-mode command's action (which DOES receive/preserve
+                # the exact recognized Hebrew entities -- see
+                # brain/music_intent.py) must never have its Hebrew
+                # payload spoken back, translated, or transliterated. The
+                # generic ack starts immediately, concurrently with the
+                # action below -- never waits for it to finish.
+                if not self.muted:
+                    from .response_formatter import generic_acknowledgement
+                    perf.mark("acknowledgement_tts_request")
+                    self._start_speech_task(generic_acknowledgement(), "en", None)
+            elif needs_planning and not self.muted:
+                perf.mark("acknowledgement_tts_request")
+                self._start_speech_task("I'll check that, sir.", "en", None)
             self._perf("execution_started")
+            if needs_planning:
+                perf.mark("planner_started")
             execution_outcome = {}
-            response = run_agent(command, route=route, interaction_id=interaction_id, original_user_text=transcript, execution_outcome=execution_outcome)
+            response = run_agent(command, route=route, interaction_id=interaction_id, original_user_text=transcript, execution_outcome=execution_outcome, speculative_ledger=ledger)
+            if needs_planning:
+                perf.mark("planner_finished")
+            perf.mark("final_action_finished")
             self._perf("execution_completed")
             if self._stop.is_set():
                 return
             response_text = response.get("message") if isinstance(response, dict) else str(response)
             self.log.info("Final action result: %s", _redact_for_log(response_text))
-            lang = detect_dominant_language(transcript)
-            spoken = format_spoken_response(command, route, response_text, lang=lang, execution=execution_outcome)
+            if hebrew_mode:
+                # Success: the immediate generic ack above already covered
+                # it -- no additional speech (never speak twice for the
+                # same outcome). Failure: exactly ONE short, generic,
+                # English follow-up -- never the contextual message, which
+                # could contain the recognized Hebrew text.
+                if execution_outcome.get("success"):
+                    lang, spoken = "en", None
+                else:
+                    from .response_formatter import generic_failure_message
+                    lang, spoken = "en", generic_failure_message()
+            else:
+                lang = detect_dominant_language(transcript)
+                spoken = format_spoken_response(command, route, response_text, lang=lang, execution=execution_outcome)
             self._perf("formatter_completed")
             self.log.info("Formatter result / final spoken response: %s",_redact_for_log(spoken))
             if not self.muted and spoken:
+                perf.mark("final_tts_started")
                 self._start_speech_task(spoken,lang,interaction_id)
                 self._perf("tts_dispatched")
+            perf.mark("interaction_finished")
+            perf.log_summary()
         finally:
-            if not self.debug_audio:
+            if path is not None and not self.debug_audio:
                 path.unlink(missing_ok=True)
 
     def _start_question_task(self, command, route, interaction_id, transcript, question_pipeline_started) -> None:
@@ -713,3 +873,78 @@ class AlwaysOnAssistant:
                 self._start_speech_task("I couldn't check the learning status, sir.", "en", interaction_id)
 
         threading.Thread(target=work, name="jarvis-learning-status", daemon=True).start()
+
+    def _start_coding_task(self, task, interaction_id=None) -> None:
+        """A genuine coding/self-improvement request (Part A of the
+        student-first production runtime): deterministically matched in
+        `brain/router.py` via `brain.coding_task_intent.is_coding_task`
+        (ordinary commands never reach here). Runs
+        `brain.improvement_student_teacher.run_coding_task` -- ACTIVE local
+        student first, Claude teacher fallback, existing voice-approved
+        learning trigger on verified teacher success -- on a background
+        thread, never blocking the audio/wake-word loop.
+
+        Shares `self._learning_token`/`self._learning_lock` with
+        "start learning": both are GPU-bound background AI work on this
+        machine, so they're deliberately mutually exclusive (and "stop
+        learning" already cancels either one)."""
+        from brain.task_supervisor import CancellationToken, register_interactive_task, unregister_interactive_task
+
+        with self._learning_lock:
+            if self._learning_token is not None and not self._learning_token.cancelled:
+                self._start_speech_task("I'm already working on something, sir. Say stop learning if you'd like me to stop first.", "en", interaction_id)
+                return
+            token = CancellationToken()
+            self._learning_token = token
+        task_id = register_interactive_task(token)
+        self._start_speech_task("Let me look into that, sir.", "en", interaction_id)
+
+        def work() -> None:
+            try:
+                from pathlib import Path
+
+                from brain.improvement_student_teacher import run_coding_task
+
+                repository_root = str(Path(__file__).resolve().parent.parent)
+                result = run_coding_task(
+                    task, repository_root=repository_root,
+                    request_approval=self.request_learning_approval,
+                    cancellation_token=token,
+                )
+                self.log.info("[coding-task] %s", result.to_dict())
+
+                spoken = self._coding_task_result_speech(result)
+                if spoken and not self._stop.is_set():
+                    self._start_speech_task(spoken, "en", interaction_id)
+            except Exception:
+                self.log.exception("coding task failed")
+                if not self._stop.is_set():
+                    self._start_speech_task("I ran into a problem working on that, sir.", "en", interaction_id)
+            finally:
+                unregister_interactive_task(task_id)
+                with self._learning_lock:
+                    if self._learning_token is token:
+                        self._learning_token = None
+
+        threading.Thread(target=work, name="jarvis-coding-task", daemon=True).start()
+
+    @staticmethod
+    def _coding_task_result_speech(result) -> str | None:
+        """The exact confirmation phrases this pipeline's voice UX was
+        designed around (see CLAUDE.md's voice-approved-learning section):
+        "Do you want me to learn how to do that, sir?" already got spoken
+        (and answered) inside `request_learning_approval`, called from
+        within `run_coding_task` itself -- this is only the follow-up
+        wrap-up line."""
+        if result.solved_by == "student":
+            return "I fixed it myself, sir."
+        if result.solved_by == "teacher":
+            offer = result.learning_offer
+            if offer is not None and offer.offered:
+                if offer.approval_outcome == "APPROVED":
+                    return "I've added that to my learning queue, sir."
+                if offer.approval_outcome == "DECLINED":
+                    return "Understood, sir."
+                return None  # TIMED_OUT/CANCELLED -> silently return to normal state
+            return "It's fixed and verified, sir."
+        return "I wasn't able to fix that, sir."

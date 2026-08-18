@@ -52,6 +52,19 @@ class BenchmarkTask:
     visible_test_paths: list[str] = field(default_factory=list)
     timeout_seconds: float = 120.0
     constraints: list[str] = field(default_factory=list)
+    # `test_writing` category: the hidden acceptance test alone is not
+    # enough -- a patch that fixes behavior but adds no test must not score
+    # as solved. Checked against `DiffAnalysis.generated_tests` (already
+    # computed by `brain.improvement_diff_analysis.analyze_diff`).
+    require_new_test: bool = False
+    # `refactoring` category: passing tests alone is not enough -- a
+    # no-op "fix" must not score as solved. `min_line_reduction` is a
+    # mechanical, implementation-agnostic proxy for "a real structural
+    # change happened" (checked against `structural_check_path`'s line
+    # count before vs. after), deliberately not tied to one exact refactor
+    # shape.
+    structural_check_path: str | None = None
+    min_line_reduction: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
     schema_version: int = BENCHMARK_SCHEMA_VERSION
 

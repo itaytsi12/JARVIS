@@ -1,0 +1,11 @@
+{
+  "task_id": "multi_class_bug_pricing_cache",
+  "category": "multi_class_bug",
+  "description": "PricingService.get_current_price(product_id) should always reflect the latest price after PricingService.update_price(product_id, new_price) is called, but it currently keeps returning the OLD price because ProductCache is never told the price changed. Fix the bug across the relevant classes (Product in domain.py, ProductRepository in repository.py, ProductCache in cache.py, PricingService in service.py) WITHOUT simply removing/bypassing the cache -- caching must still avoid re-fetching from the repository for products whose price hasn't changed.",
+  "fixture_dir": "multi_class_bug_pricing_cache",
+  "hidden_test_path": "hidden_test.py",
+  "visible_test_paths": ["tests/test_pricing_service.py"],
+  "timeout_seconds": 150.0,
+  "constraints": ["caching for unrelated/unchanged products must still work"],
+  "metadata": {"production_files": 4}
+}
