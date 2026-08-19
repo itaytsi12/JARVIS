@@ -79,6 +79,36 @@ def route_command(command: str) -> dict:
     if text.rstrip(".?!,;:") in {"learning status", "what is the learning status", "what's the learning status", "status of learning"}:
         return {"type": "learning_status"}
 
+    # Explicit long-term memory instruction. Checked before the coding-task
+    # and music routes so "remember that the bug is in music_intent" is
+    # stored as a fact rather than treated as a coding task, and before the
+    # question classifier so it is never answered from the web. Only an
+    # EXPLICIT instruction routes here -- ordinary statements still reach
+    # the normal routes and are handled by the passive extraction in
+    # memory/long_term.py.
+    remember_match = re.match(
+        r"^(?:please\s+)?(?:remember|note|keep in mind)(?:\s+that|\s+this)?[:,]?\s+(?P<text>.+)$",
+        command.strip(),
+        re.I,
+    )
+    if remember_match and remember_match.group("text").strip():
+        return {"type": "remember", "text": remember_match.group("text").strip().rstrip(".")}
+
+    # Explicit agent invocation. A deliberate prefix, not a guess: an
+    # ordinary request is escalated to the agent by brain/agent.py only
+    # when the deterministic routes genuinely cannot handle it, so this
+    # exists for when the user WANTS the agent regardless.
+    # The verb stays IN the goal for the "work on/figure out" phrasings --
+    # "figure out why the tests fail" is the task; "why the tests fail"
+    # alone reads as a question.
+    agent_match = re.match(
+        r"^(?:agent[:,]?\s+|jarvis[, ]+agent[:,]?\s+|jarvis[, ]+(?=(?:work on|figure out|take care of)\b))(?P<goal>.+)$",
+        command.strip(),
+        re.I,
+    )
+    if agent_match and agent_match.group("goal").strip():
+        return {"type": "agent_task", "goal": agent_match.group("goal").strip()}
+
     # Deterministic, first-class music routing (see brain/music_intent.py).
     # Checked before the generic "open X" / multi-step fallbacks below so
     # "open music"/"open apple music" never falls through to

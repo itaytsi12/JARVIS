@@ -1,0 +1,422 @@
+"""The agent loop: goal -> context -> act -> observe -> adapt -> verify.
+
+This is JARVIS's own runtime. A model provider only ever answers ONE turn
+at a time (`providers.base.ModelProvider.complete`); everything that makes
+the behaviour agentic -- deciding the next action, feeding back the real
+observation, retrying, giving up, and deciding whether the goal was
+actually met -- happens here, in JARVIS, so it is identical whichever
+provider is plugged in and can be tested with no provider at all.
+
+Safety limits (all configurable, none so tight that ordinary multi-step
+work fails):
+
+- `max_agent_steps` (default 25): total model turns.
+- `max_action_retries` (default 2): repeats of the SAME failing tool call
+  with the same arguments; the third identical attempt is refused with an
+  explicit observation telling the model to change approach.
+- `max_consecutive_failures` (default 4): unbroken run of failing tool
+  calls before the loop stops and reports honestly.
+- `agent_task_timeout` (default 900s): wall-clock ceiling.
+
+Cancellation is checked before every model call and before every tool
+call, so "cancel" takes effect within one step rather than at the end.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable
+
+from brain.context_builder import BuiltContext, ContextBuilder
+from brain.models import ToolResult
+from brain.tool_catalog import ToolCatalog, get_tool_catalog
+from config import get_config
+from memory.episodic import StepRecord
+from providers.base import (
+    Message,
+    ModelResponse,
+    ProviderError,
+    ProviderRateLimited,
+    ProviderUnavailable,
+    ToolCall,
+    ToolOutcome,
+    ToolSpec,
+    Usage,
+)
+from skills.base import Skill
+
+log = logging.getLogger("jarvis.agent")
+
+# How a run ended. These are the honest outcomes -- there is no "assumed
+# success" among them.
+COMPLETED = "completed"
+NO_PROVIDER = "no_provider"
+STEP_LIMIT = "step_limit"
+TIMEOUT = "timeout"
+CANCELLED = "cancelled"
+FAILURE_LIMIT = "failure_limit"
+PROVIDER_ERROR = "provider_error"
+
+
+@dataclass
+class AgentLimits:
+    max_steps: int
+    max_action_retries: int
+    max_consecutive_failures: int
+    timeout_seconds: float
+
+    @classmethod
+    def from_config(cls) -> "AgentLimits":
+        config = get_config()
+        return cls(
+            max_steps=config.max_agent_steps,
+            max_action_retries=config.max_action_retries,
+            max_consecutive_failures=config.max_consecutive_failures,
+            timeout_seconds=config.agent_task_timeout,
+        )
+
+
+@dataclass
+class AgentRun:
+    """Everything that happened, and how it ended."""
+
+    goal: str
+    answer: str = ""
+    success: bool = False
+    verified: bool = False
+    stop_reason: str = ""
+    steps: list[StepRecord] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    retries: int = 0
+    model_calls: int = 0
+    usage: Usage = field(default_factory=lambda: Usage(reported=False))
+    estimated_cost_usd: float | None = None
+    duration_ms: float = 0.0
+    provider: str | None = None
+    model: str | None = None
+    context: BuiltContext | None = None
+    skills: list[str] = field(default_factory=list)
+
+    @property
+    def tool_calls(self) -> int:
+        return len(self.steps)
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "goal": self.goal,
+            "success": self.success,
+            "verified": self.verified,
+            "stop_reason": self.stop_reason,
+            "steps": len(self.steps),
+            "retries": self.retries,
+            "errors": len(self.errors),
+            "model_calls": self.model_calls,
+            "input_tokens": self.usage.input_tokens,
+            "output_tokens": self.usage.output_tokens,
+            "estimated_cost_usd": self.estimated_cost_usd,
+            "duration_ms": round(self.duration_ms, 1),
+            "provider": self.provider,
+            "model": self.model,
+            "skills": list(self.skills),
+        }
+
+
+ProgressCallback = Callable[[str, dict[str, Any]], None]
+
+
+class AgentLoop:
+    def __init__(
+        self,
+        provider: Any,
+        catalog: ToolCatalog | None = None,
+        *,
+        limits: AgentLimits | None = None,
+        context_builder: ContextBuilder | None = None,
+        progress: ProgressCallback | None = None,
+    ):
+        self.provider = provider
+        self.catalog = catalog or get_tool_catalog()
+        self.limits = limits or AgentLimits.from_config()
+        self.context_builder = context_builder or ContextBuilder()
+        self.progress = progress
+
+    # ------------------------------------------------------------------
+    def run(
+        self,
+        goal: str,
+        *,
+        context: BuiltContext,
+        skills: Iterable[Skill] = (),
+        tool_specs: Iterable[ToolSpec] | None = None,
+        cancellation_token: Any = None,
+        task: Any = None,
+    ) -> AgentRun:
+        started = time.perf_counter()
+        run = AgentRun(goal=goal, context=context, skills=[skill.name for skill in skills])
+        run.provider = getattr(self.provider, "name", None)
+        run.model = getattr(self.provider, "model", None)
+
+        if self.provider is None or not self.provider.is_available():
+            run.stop_reason = NO_PROVIDER
+            run.answer = (
+                "I can't work on that right now, sir. No reasoning model is configured -- "
+                "set ANTHROPIC_API_KEY to enable it."
+            )
+            run.duration_ms = (time.perf_counter() - started) * 1000
+            return run
+
+        specs = list(tool_specs) if tool_specs is not None else self.catalog.specs()
+        messages: list[Message] = [Message.user(context.user_prompt)]
+        attempts: dict[str, int] = {}
+        consecutive_failures = 0
+        deadline = started + self.limits.timeout_seconds
+
+        for step_number in range(self.limits.max_steps):
+            if _is_cancelled(cancellation_token):
+                return self._stop(run, started, CANCELLED, "I stopped that, sir.")
+            if time.perf_counter() > deadline:
+                return self._stop(
+                    run,
+                    started,
+                    TIMEOUT,
+                    self._partial_answer(run, "I ran out of time on that, sir."),
+                )
+
+            try:
+                response = self._call_model(messages, context.system_prompt, specs)
+            except ProviderUnavailable as exc:
+                run.errors.append(str(exc))
+                return self._stop(run, started, NO_PROVIDER, "I can't reach the reasoning model right now, sir.")
+            except ProviderError as exc:
+                run.errors.append(f"{type(exc).__name__}: {exc}")
+                if isinstance(exc, ProviderRateLimited):
+                    message = "The reasoning model is rate limited right now, sir."
+                else:
+                    message = "The reasoning model failed on that request, sir."
+                return self._stop(run, started, PROVIDER_ERROR, self._partial_answer(run, message))
+
+            run.model_calls += 1
+            _accumulate(run, response)
+            self._emit("model_turn", {"step": step_number, "text": response.text[:200], "tool_calls": len(response.tool_calls)})
+
+            if not response.tool_calls:
+                # The model produced a final answer. It is only reported as
+                # a success when nothing in this run is still an unresolved
+                # failure -- see `_conclude`.
+                return self._conclude(run, started, response)
+
+            messages.append(response.as_message())
+            outcomes: list[ToolOutcome] = []
+            for call in response.tool_calls:
+                if _is_cancelled(cancellation_token):
+                    return self._stop(run, started, CANCELLED, "I stopped that, sir.")
+
+                signature = _signature(call)
+                attempts[signature] = attempts.get(signature, 0) + 1
+                attempt = attempts[signature]
+                if attempt > self.limits.max_action_retries + 1:
+                    outcome_text = (
+                        f"Refused: {call.name} has already been tried {attempt - 1} times with these exact "
+                        "arguments and failed each time. Change the approach or report that you are blocked."
+                    )
+                    outcomes.append(ToolOutcome(call.id, outcome_text, is_error=True))
+                    run.errors.append(f"{call.name}:repeated_failure")
+                    consecutive_failures += 1
+                    self._record_step(run, call, None, outcome_text, attempt, response.text)
+                    continue
+
+                if attempt > 1:
+                    run.retries += 1
+
+                result = self.catalog.execute(call.name, call.arguments, cancellation_token=cancellation_token)
+                observation = self.context_builder.bound_observation(_observation_text(result))
+                outcomes.append(ToolOutcome(call.id, observation, is_error=not result.success))
+                self._record_step(run, call, result, observation, attempt, response.text)
+                self._emit(
+                    "tool_result",
+                    {"tool": call.name, "success": result.success, "error": result.error, "attempt": attempt},
+                )
+                if result.success:
+                    consecutive_failures = 0
+                    attempts[signature] = 0
+                else:
+                    consecutive_failures += 1
+                    if result.error:
+                        run.errors.append(f"{call.name}:{result.error}")
+                if task is not None:
+                    task.observe(call.name, observation[:500], success=result.success)
+                    task.current_step = len(run.steps)
+
+            messages.append(Message.tool_results(outcomes))
+
+            if consecutive_failures >= self.limits.max_consecutive_failures:
+                return self._stop(
+                    run,
+                    started,
+                    FAILURE_LIMIT,
+                    self._partial_answer(run, "I couldn't get that working, sir."),
+                )
+
+        return self._stop(
+            run,
+            started,
+            STEP_LIMIT,
+            self._partial_answer(run, "I reached my step limit before finishing that, sir."),
+        )
+
+    # ------------------------------------------------------------------
+    def _call_model(self, messages: list[Message], system: str, specs: list[ToolSpec]) -> ModelResponse:
+        return self.provider.complete(messages, system=system, tools=specs)
+
+    def _record_step(
+        self,
+        run: AgentRun,
+        call: ToolCall,
+        result: ToolResult | None,
+        observation: str,
+        attempt: int,
+        thought: str,
+    ) -> None:
+        data = result.data if result is not None and isinstance(result.data, dict) else {}
+        run.steps.append(
+            StepRecord(
+                index=len(run.steps),
+                tool=call.name,
+                arguments=_safe_arguments(call.arguments),
+                success=bool(result.success) if result is not None else False,
+                verified=bool(data.get("verified", False)),
+                observation=observation[:2000],
+                error=(result.error if result is not None else "refused_repeated_failure"),
+                duration_ms=float(data.get("duration_ms", 0.0) or 0.0),
+                attempt=attempt,
+                thought=(thought or "")[:500],
+            )
+        )
+
+    def _conclude(self, run: AgentRun, started: float, response: ModelResponse) -> AgentRun:
+        """Finish on a model turn that produced no tool call.
+
+        Success is judged from the RUN, not from the model's tone: if the
+        last thing any tool did was fail, this did not succeed, whatever
+        the closing sentence says.
+        """
+        run.answer = response.text.strip() or "Done, sir."
+        run.stop_reason = COMPLETED
+        acting_steps = [step for step in run.steps if step.tool not in {"recall_memory"}]
+        last_failed = bool(acting_steps) and not acting_steps[-1].success
+        run.success = not last_failed
+        # "Verified" is stricter: the FINAL observable state was
+        # independently confirmed by the tool that produced it. Earlier
+        # failures are normal in agentic work -- reproducing a bug is a
+        # failing step on purpose -- so they do not disqualify a run whose
+        # last step genuinely succeeded and was confirmed. A run with no
+        # tool calls at all (a pure answer) is never marked verified.
+        run.verified = bool(acting_steps) and acting_steps[-1].success and acting_steps[-1].verified
+        run.duration_ms = (time.perf_counter() - started) * 1000
+        self._emit("finished", run.describe())
+        log.info("Agent run finished: %s", run.describe())
+        return run
+
+    def _stop(self, run: AgentRun, started: float, reason: str, answer: str) -> AgentRun:
+        run.stop_reason = reason
+        run.answer = answer
+        run.success = False
+        run.verified = False
+        run.duration_ms = (time.perf_counter() - started) * 1000
+        self._emit("finished", run.describe())
+        log.info("Agent run stopped: %s", run.describe())
+        return run
+
+    def _partial_answer(self, run: AgentRun, prefix: str) -> str:
+        """Report real partial progress instead of a bare failure."""
+        done = [step for step in run.steps if step.success]
+        if not done:
+            return prefix
+        last = done[-1]
+        return f"{prefix} I got as far as {last.tool.replace('_', ' ')}."
+
+    def _emit(self, stage: str, payload: dict[str, Any]) -> None:
+        if self.progress is None:
+            return
+        try:
+            self.progress(stage, payload)
+        except Exception:
+            log.exception("Agent progress callback failed")
+
+
+def _is_cancelled(token: Any) -> bool:
+    return token is not None and bool(getattr(token, "cancelled", False))
+
+
+def _signature(call: ToolCall) -> str:
+    try:
+        arguments = json.dumps(call.arguments, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        arguments = str(call.arguments)
+    return f"{call.name}:{arguments}"
+
+
+def _safe_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Bound long argument values before they are stored in an episode."""
+    safe: dict[str, Any] = {}
+    for key, value in (arguments or {}).items():
+        if isinstance(value, str) and len(value) > 500:
+            safe[key] = value[:500] + f"... [{len(value) - 500} more characters]"
+        else:
+            safe[key] = value
+    return safe
+
+
+def _observation_text(result: ToolResult) -> str:
+    """Turn a `ToolResult` into what the model should actually read.
+
+    Structured fields the model can act on (stdout, contents, matches) are
+    surfaced explicitly; a failure always leads with the error code so it
+    cannot be mistaken for success.
+    """
+    data = result.data if isinstance(result.data, dict) else {}
+    parts: list[str] = []
+    if not result.success:
+        parts.append(f"FAILED ({result.error or 'unknown_error'}): {result.message}")
+    elif result.message:
+        parts.append(result.message)
+
+    for key in ("stdout", "stderr"):
+        value = data.get(key)
+        if value:
+            parts.append(f"{key}:\n{value}")
+    if data.get("exit_code") is not None:
+        parts.append(f"exit_code: {data['exit_code']}")
+    # Several tools already put their content in `message`. Send the file
+    # body once: prefer the line-numbered form, and if EITHER form is
+    # already present skip both, so the model never reads the same file
+    # twice in one observation.
+    contents = [str(data[key]) for key in ("numbered_contents", "contents") if data.get(key)]
+    if contents and not any(item in parts for item in contents):
+        parts.append(contents[0])
+    for key in ("items", "matches", "files", "project_markers", "entry_points", "top_level_directories"):
+        value = data.get(key)
+        if value:
+            parts.append(f"{key}: {json.dumps(value, default=str)[:2000]}")
+    if not parts:
+        parts.append("The tool completed but reported no detail.")
+    return "\n".join(parts)
+
+
+def _accumulate(run: AgentRun, response: ModelResponse) -> None:
+    # `reported` means "every provider turn told us its token counts". The
+    # first turn sets it; later turns can only take it away -- starting
+    # from the AgentRun default (False, meaning "no calls yet, so unknown")
+    # would otherwise make it permanently False.
+    first_call = run.model_calls <= 1
+    run.usage.reported = response.usage.reported if first_call else (run.usage.reported and response.usage.reported)
+    run.usage.input_tokens += response.usage.input_tokens
+    run.usage.output_tokens += response.usage.output_tokens
+    run.usage.cache_creation_tokens += response.usage.cache_creation_tokens
+    run.usage.cache_read_tokens += response.usage.cache_read_tokens
+    if response.estimated_cost_usd is not None:
+        run.estimated_cost_usd = round((run.estimated_cost_usd or 0.0) + response.estimated_cost_usd, 8)
+    if response.model:
+        run.model = response.model

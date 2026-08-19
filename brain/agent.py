@@ -133,8 +133,101 @@ def _is_deterministic_music_route(route: dict | None) -> bool:
     return isinstance(tool, str) and (tool == "open_music" or tool.startswith("music_"))
 
 
+def _active_agent_tasks():
+    """Running agent tasks, or an empty list if the manager isn't up yet.
+
+    Never raises: this only ever decorates a status answer, and a broken
+    status lookup must not turn "what are you doing?" into an error.
+    """
+    try:
+        from tasks.manager import get_task_manager
+        from tasks.models import TaskStatus
+
+        return [task for task in get_task_manager().active() if task.status is TaskStatus.RUNNING]
+    except Exception:
+        runtime_log.exception("Could not read agent task state for the status answer")
+        return []
+
+
+def _cancel_agent_tasks(reason: str = "user_cancelled") -> int:
+    """Cancel every running agent task. Never raises, for the same reason."""
+    try:
+        from tasks.manager import get_task_manager
+
+        return get_task_manager().cancel_all(reason)
+    except Exception:
+        runtime_log.exception("Could not cancel agent tasks")
+        return 0
+
+
+def _agent_escalation_available() -> bool:
+    """Can a genuinely agentic request be handled right now?
+
+    False whenever no model provider is configured -- which is the normal
+    state until an API key is added -- so every deterministic local route
+    below behaves exactly as it always has, with or without Claude.
+    """
+    try:
+        from config import get_config
+        from providers.registry import get_agent_provider
+
+        if not get_config().agent_escalation_enabled:
+            return False
+        return get_agent_provider() is not None
+    except Exception:
+        runtime_log.exception("Agent availability check failed; staying on the local path")
+        return False
+
+
+def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, cancellation_token=None) -> str:
+    """Hand a goal to the agent runtime (brain/agent_service.py).
+
+    Records the same dataset events as every other route so an agentic
+    interaction is not a blind spot in the training data.
+    """
+    from brain.agent_service import run_agent_task
+
+    execution_meta["route_type"] = "agent_task"
+    execution_meta["route_source"] = "agent_runtime"
+    recorder.record(
+        EventType.REASONING_REQUEST,
+        {"operation": "agent_loop", "request": sanitize_user_request(goal)},
+        iid,
+    )
+    outcome = run_agent_task(
+        goal,
+        runtime=agent_runtime,
+        cancellation_token=cancellation_token,
+        session_context=agent_runtime.context,
+    )
+    run = outcome.run
+    execution_meta["success"] = outcome.success
+    execution_meta["verified"] = outcome.verified
+    execution_meta["model_calls"] = execution_meta.get("model_calls", 0) + run.model_calls
+    execution_meta["cloud_ms"] = execution_meta.get("cloud_ms", 0.0) + run.duration_ms
+    execution_meta["agent_episode_id"] = outcome.episode_id
+    recorder.record(
+        EventType.REASONING_RESPONSE,
+        {
+            "operation": "agent_loop",
+            "model": run.model,
+            "provider": run.provider,
+            "model_calls": run.model_calls,
+            "input_tokens": run.usage.input_tokens,
+            "output_tokens": run.usage.output_tokens,
+            "estimated_cost_usd": run.estimated_cost_usd,
+            "stop_reason": run.stop_reason,
+            "steps": len(run.steps),
+            "success": outcome.success,
+        },
+        iid,
+    )
+    runtime_log.info("Agent runtime handled request: %s", outcome.describe())
+    return outcome.answer
+
+
 def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execution_meta: dict, cancellation_token=None,original_user_text: str | None=None,speculative_ledger=None) -> str:
-    control_types={"cancel_read_only_task","task_status","resume_interrupted_response","correct_interrupted_response","revise_whatsapp_recipient"}
+    control_types={"cancel_read_only_task","task_status","resume_interrupted_response","correct_interrupted_response","revise_whatsapp_recipient","remember","agent_task"}
     if route is None and re.match(r"^(?:stop|cancel|never mind|continue|make it|shorten that|only (?:tell|give)|(?:don't send it|send it).+instead)",command,re.I):
         route=route_command(command)
     use_task_planner=(
@@ -231,6 +324,13 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
             execution_meta["block_reason"]="clarification_required";execution_meta["block_errors"]=["clarification_required"]
             recorder.record(EventType.TASK_BLOCKED,{"reason":"clarification_required"},iid)
             return plan.context["clarification"]
+        if _agent_escalation_available():
+            # The deterministic planner genuinely could not represent this
+            # request. That is exactly the "local understanding is
+            # insufficient" condition the agent runtime exists for --
+            # rather than telling the user no, hand it to the agent.
+            runtime_log.info("Escalating to agent runtime: no complete local plan")
+            return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token)
         execution_meta["block_reason"]="missing_local_plan";execution_meta["block_errors"]=["missing_local_plan"]
         return "I couldn't create a safe local plan for that task."
 
@@ -247,10 +347,52 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
     if route_source=="cloud_intent_router":
         recorder.record(EventType.REASONING_REQUEST,{"operation":"cloud_intent_router","model":route.get("model","gpt-5-mini"),"model_calls":route.get("model_calls",1),"input_tokens":route.get("input_tokens",0),"output_tokens":route.get("output_tokens",0),"fallback_reason":route.get("fallback_reason")},iid)
 
+    # -------------------------
+    # Escalation to the agent runtime
+    # -------------------------
+    # `plan`, `ai` and `coding_task` are precisely the routes that mean
+    # "the deterministic local layer could not resolve this". They are the
+    # right place -- and the only place -- to hand a request to the real
+    # agent loop. Every deterministic route above is untouched, so simple
+    # commands stay fast and never involve a model.
+    #
+    # `_agent_escalation_available()` is False whenever no provider is
+    # configured, so with no API key this whole block is inert and the
+    # pre-existing single-shot planner path below runs exactly as before.
+    if route["type"] in {"plan", "ai", "coding_task"} and _agent_escalation_available():
+        goal = route.get("task") or route.get("message") or original_user_text or command
+        runtime_log.info("Escalating to agent runtime from route_type=%s", route["type"])
+        return _run_agent_with_loop(goal, recorder, iid, execution_meta, cancellation_token)
+
+    if route["type"] == "remember":
+        # Explicit "remember that ..." -- a local, deterministic write to
+        # long-term memory. No model call, and it works with no API key.
+        from memory.agent_memory import get_agent_memory
+
+        action=Action("remember_fact",{"text":route["text"]})
+        prepared=_record_prepared_actions(recorder,iid,[action],agent_runtime.context)
+        try:
+            record=get_agent_memory().remember_explicitly(route["text"])
+            result=ToolResult(True,action.tool,"I'll remember that, sir.",{"verified":True,"memory_id":record.memory_id,"kind":record.kind})
+        except Exception as exc:
+            result=ToolResult(False,action.tool,"I couldn't store that, sir.",{"verified":True},f"{type(exc).__name__}: {exc}")
+        _record_action_results(recorder,iid,[action],[result],prepared,agent_runtime.context)
+        execution_meta["success"]=result.success;execution_meta["verified"]=result.success
+        execution_meta["executed_actions"]=[action];execution_meta["executed_results"]=[result]
+        return result.message
+
+    if route["type"] == "agent_task":
+        # Explicitly requested agent run. Without a configured provider
+        # this reports that honestly instead of silently doing nothing.
+        return _run_agent_with_loop(route.get("goal") or command, recorder, iid, execution_meta, cancellation_token)
+
     if route["type"] == "cancel_read_only_task":
         action=Action("cancel_active_task",{})
         prepared=_record_prepared_actions(recorder,iid,[action],agent_runtime.context)
-        cancelled = cancel_read_only_tasks()
+        # "Cancel" must reach BOTH task systems: the pre-existing read-only
+        # scheduler and the agent task manager. Cancelling only one of them
+        # would leave a long agent run going after the user said stop.
+        cancelled = cancel_read_only_tasks() + _cancel_agent_tasks()
         if cancelled:
             agent_runtime.context.pending_messaging_recipient=None
             agent_runtime.context.pending_messaging_message=None
@@ -264,8 +406,19 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         action=Action("inspect_task_status",{})
         prepared=_record_prepared_actions(recorder,iid,[action],agent_runtime.context)
         summary=active_interactive_task_summary()
+        # Agent tasks live in the newer tasks/ manager, which the older
+        # read-only scheduler above knows nothing about. "What are you
+        # doing?" must account for both, or a long agent run looks like
+        # nothing is happening.
+        agent_tasks=_active_agent_tasks()
+        summary["agent_tasks"]=[task.to_dict(include_observations=False) for task in agent_tasks]
+        summary["total"]+=len(agent_tasks)
         count=summary["total"]
-        response="No interactive tasks are running." if count==0 else f"{count} interactive task{' is' if count==1 else 's are'} running."
+        if agent_tasks:
+            goals="; ".join(task.goal for task in agent_tasks[:2])
+            response=f"I'm working on: {goals}." if count==len(agent_tasks) else f"{count} tasks are running, including: {goals}."
+        else:
+            response="No interactive tasks are running." if count==0 else f"{count} interactive task{' is' if count==1 else 's are'} running."
         result=ToolResult(True,action.tool,response,{**summary,"verified":True})
         _record_action_results(recorder,iid,[action],[result],prepared,agent_runtime.context)
         execution_meta["success"]=True;execution_meta["verified"]=True

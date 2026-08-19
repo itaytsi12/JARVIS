@@ -35,6 +35,47 @@ Command flow, top to bottom:
   `whatsapp.py`, etc.). This is the only place OS/browser/app automation
   should live.
 
+### Agent runtime (Claude as a provider, not as the architecture)
+
+A second, additive layer sits above the deterministic router for requests
+the local layer genuinely cannot resolve. Full detail is in
+`docs/AGENT_ARCHITECTURE.md`; the invariants that matter here:
+
+- **Claude is optional.** `brain/agent.py::_agent_escalation_available()`
+  returns False whenever no provider is configured, and every
+  deterministic route then behaves exactly as it did before. Do not add
+  code that assumes a provider exists.
+- **The loop lives in JARVIS.** `brain/agent_loop.py::AgentLoop` owns
+  plan/act/observe/retry/verify. `providers/base.py::ModelProvider.complete`
+  is deliberately SINGLE-TURN. Do not move the loop into a vendor SDK
+  helper (the Anthropic SDK's `tool_runner` is deliberately unused).
+- **One vendor import.** `providers/anthropic_provider.py` is the only
+  module allowed to import `anthropic`. Everything else uses the neutral
+  types in `providers/base.py`.
+- **One tool dispatch point.** New tools are implemented in `tools/`,
+  dispatched in `brain/tool_router.py::execute_tool`, and DESCRIBED in
+  `brain/tool_catalog.py::DEFINITIONS`. The catalog adds schemas and
+  descriptions; it never becomes a second executor.
+- **One `ToolResult`.** The catalog returns the pre-existing
+  `brain/models.py::ToolResult`. Never invent a second result type.
+- **Success is not verification.** `AgentRun.verified` requires the final
+  acting step to have independently confirmed its own outcome. An edit is
+  never a fix; only a fresh passing run is.
+- **Memory is two things.** `memory/memory_manager.py` (entities/sessions,
+  pre-existing, untouched) and `memory/agent_memory.py` (conversation,
+  long-term, episodic). They share a process, not a database file.
+  `memory/long_term.py::extract_memories` decides what is worth keeping --
+  "open YouTube" never becomes a memory; "remember that ..." always does.
+- **UI work is serialized.** `tasks/manager.py` runs `TaskKind.CONCURRENT`
+  tasks in parallel but only ever one `TaskKind.EXCLUSIVE_UI` task, on
+  top of (not instead of) `brain/resource_locks.py`.
+- **Cost is never guessed.** `config/pricing.py` returns `None` for an
+  unpriced model and `providers/usage.py` stores `NULL`, so "unknown" and
+  "free" stay distinguishable.
+- **Tests never spend money.** `tests/conftest.py` clears every external
+  credential for the whole suite; the only real Claude call in the repo is
+  `scripts/test_claude_agent.py --run`, which is never auto-discovered.
+
 ### Overlapping realtime voice pipeline (ElevenLabs)
 
 JARVIS's always-on voice loop (`voice/background_assistant.py`'s

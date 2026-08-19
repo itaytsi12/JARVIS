@@ -1,3 +1,7 @@
+# Main JARVIS runtime environment.
+# See requirements-agent.txt (.venv-agent), training/requirements-intent.txt
+# (.venv-intent) and training/requirements-code-model.txt (.venv-code-model)
+# for the other, deliberately separate virtualenvs.
 openai
 python-dotenv
 psutil
@@ -10,3 +14,5 @@ pyyaml
 requests
 websocket-client
 numpy
+anthropic>=0.70,<1  # Claude provider (providers/anthropic_provider.py)
+scipy>=1.11  # voice/audio_input.py resampling

@@ -32,6 +32,75 @@ def _correct_fix_agent() -> FakeCodingAgent:
             )
         elif (workspace / "strings_util.py").exists():
             (workspace / "strings_util.py").write_text('def reverse_words(sentence):\n    return " ".join(reversed(sentence.split()))\n')
+        elif (workspace / "service.py").exists() and (workspace / "cache.py").exists():
+            # multi_class_bug_pricing_cache: the repository is updated but
+            # the read-through cache is never told, so reads stay stale.
+            # Invalidating that one product keeps caching intact for every
+            # other product, which the hidden test specifically checks.
+            (workspace / "service.py").write_text(
+                'class PricingService:\n'
+                '    """Coordinates ProductRepository (source of truth) and ProductCache\n'
+                '    (read-through cache) so callers get fast reads without ever seeing a\n'
+                '    stale price."""\n\n'
+                "    def __init__(self, repository, cache):\n"
+                "        self.repository = repository\n"
+                "        self.cache = cache\n\n"
+                "    def update_price(self, product_id, new_price) -> None:\n"
+                "        self.repository.update_price(product_id, new_price)\n"
+                "        self.cache.invalidate(product_id)\n\n"
+                "    def get_current_price(self, product_id):\n"
+                "        return self.cache.get_price(product_id)\n"
+            )
+        elif (workspace / "task_manager.py").exists():
+            # state_management_bug_task_manager: enforce the single-running-
+            # task invariant in the coordinator, without removing the
+            # ability to pause one task and start or resume another.
+            (workspace / "task_manager.py").write_text(
+                "from task_state import Task, TaskState\n\n\n"
+                "class TaskManager:\n"
+                '    """Coordinates many Task objects. Invariant: at most one task\n'
+                '    may be RUNNING at any given time (a single-worker scheduler)."""\n\n'
+                "    def __init__(self):\n"
+                "        self.tasks = {}\n"
+                "        self.active_task_id = None\n\n"
+                "    def create_task(self, task_id):\n"
+                "        task = Task(task_id)\n"
+                "        self.tasks[task_id] = task\n"
+                "        return task\n\n"
+                "    def running_task_ids(self):\n"
+                "        return [tid for tid, task in self.tasks.items() if task.state == TaskState.RUNNING]\n\n"
+                "    def _require_no_running_task(self, task_id):\n"
+                "        running = [tid for tid in self.running_task_ids() if tid != task_id]\n"
+                "        if running:\n"
+                '            raise ValueError(f"task {running[0]} is already running")\n\n'
+                "    def start_task(self, task_id):\n"
+                "        self._require_no_running_task(task_id)\n"
+                "        self.tasks[task_id].start()\n"
+                "        self.active_task_id = task_id\n\n"
+                "    def pause_active_task(self):\n"
+                "        if self.active_task_id is None:\n"
+                "            return\n"
+                "        self.tasks[self.active_task_id].pause()\n"
+                "        self.active_task_id = None\n\n"
+                "    def resume_task(self, task_id):\n"
+                "        self._require_no_running_task(task_id)\n"
+                "        self.tasks[task_id].resume()\n"
+                "        self.active_task_id = task_id\n\n"
+                "    def complete_active_task(self):\n"
+                "        if self.active_task_id is None:\n"
+                '            raise ValueError("no active task to complete")\n'
+                "        self.tasks[self.active_task_id].complete()\n"
+                "        self.active_task_id = None\n"
+            )
+        elif (workspace / "data_sync.py").exists():
+            # api_misuse_retry_contract: the caller passed max_attempts=0,
+            # which retry() correctly rejects. Fix the CALLER (retry_util.py
+            # must not be touched) and give it enough total attempts to
+            # outlast a source that fails twice.
+            source = (workspace / "data_sync.py").read_text()
+            (workspace / "data_sync.py").write_text(
+                source.replace("max_attempts=0", "max_attempts=3")
+            )
     return FakeCodingAgent(apply=apply)
 
 

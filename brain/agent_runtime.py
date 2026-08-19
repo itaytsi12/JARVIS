@@ -49,7 +49,15 @@ def _all_actions_independent(actions: list[Action]) -> bool:
 
 
 class AgentRuntime:
-    def __init__(self, context: SessionContext | None = None, browser: BrowserAgent | None = None, trace: bool = True, memory=None, session_id=None):
+    def __init__(self, context: SessionContext | None = None, browser: BrowserAgent | None = None, trace: bool | None = None, memory=None, session_id=None):
+        # `trace` prints a per-step plan trace to stdout. It used to default
+        # to True, which floods the terminal during ordinary agent work; it
+        # now follows JARVIS_DEBUG instead. Callers that pass an explicit
+        # value (every test does) are unaffected.
+        if trace is None:
+            from config import get_config
+
+            trace = get_config().debug
         self.context = context or SessionContext()
         self.browser = browser or BrowserAgent()
         self.executor = Executor()

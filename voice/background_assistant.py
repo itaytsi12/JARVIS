@@ -585,6 +585,22 @@ class AlwaysOnAssistant:
             if (re.match(r"^(?:send|message|tell)\s+",command,re.I) and route.get("type")!="revise_whatsapp_recipient") or (route.get("type")=="tool" and route.get("tool")=="analyze_screen"):
                 self._start_cancellable_action_task(command,route,interaction_id,transcript)
                 return
+            if self._is_agent_route(route):
+                # A multi-step agent run can take minutes. Running it on this
+                # capture thread would block the microphone for its whole
+                # duration; the cancellable-action path runs it off-thread and
+                # registers a token, so the user can still speak -- and can say
+                # "cancel" -- while it works.
+                self.log.info("Dispatching to the agent runtime off the capture thread: route=%s", route.get("type"))
+                if not self.muted:
+                    from .response_formatter import generic_acknowledgement
+                    from .voice_language import resolve_utterance_language
+                    if resolve_utterance_language(transcript) == "he":
+                        self._start_speech_task(generic_acknowledgement(), "en", None)
+                    else:
+                        self._start_speech_task("I'll work on that, sir.", "en", None)
+                self._start_cancellable_action_task(command,route,interaction_id,transcript)
+                return
             needs_planning = self._command_needs_planning(command, route)
             # Bilingual voice UX: VOICE_LANGUAGE (auto/en/he) controls STT
             # INPUT only -- the ACTUAL per-utterance input language (what
@@ -715,6 +731,25 @@ class AlwaysOnAssistant:
             finally:
                 if self.state is AssistantState.SPEAKING:self._set_state(AssistantState.IDLE,"Wake word ready" if self.wake_enabled else "Wake word disabled")
         threading.Thread(target=work,name="jarvis-speech",daemon=True).start()
+
+    @staticmethod
+    def _is_agent_route(route) -> bool:
+        """Will `run_agent` hand this request to the agent runtime?
+
+        Mirrors `brain/agent.py::_run_agent_impl`'s escalation condition
+        rather than guessing: an explicit `agent_task`, or one of the
+        "local routing could not resolve this" routes at a moment when a
+        provider is genuinely configured. With no API key this is always
+        False, so the voice path is byte-for-byte unchanged.
+        """
+        route_type = (route or {}).get("type")
+        if route_type == "agent_task":
+            return True
+        if route_type not in {"plan", "ai"}:
+            return False
+        from brain.agent import _agent_escalation_available
+
+        return _agent_escalation_available()
 
     def _start_cancellable_action_task(self,command,route,interaction_id,transcript):
         def work():

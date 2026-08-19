@@ -13,6 +13,7 @@ from tools.system import (
     close_foreground_window,
 )
 from tools.files import (
+    create_directory,
     open_known_folder,
     open_path,
     list_files,
@@ -58,6 +59,8 @@ from tools.window import (
     bring_hwnd_to_foreground,
 )
 from tools.music import apple_music_provider as music
+from tools.terminal import run_command
+from tools.code import check_syntax, edit_code, inspect_project, read_code, search_code
 
 
 def execute_tool(
@@ -155,6 +158,7 @@ def execute_tool(
         "move_path": lambda: move_path(arguments["source"], arguments["destination"]),
         "find_file": lambda: find_file(arguments["path"], arguments["name"]),
         "search_text": lambda: search_text(arguments["path"], arguments["query"]),
+        "create_directory": lambda: create_directory(arguments["path"]),
     }
     if tool_name in file_tools:
         return file_tools[tool_name]()
@@ -313,5 +317,27 @@ def execute_tool(
             contextual=arguments.get("contextual", False),
             shuffle=arguments.get("shuffle", False),
         )
+
+    # Terminal + code tools (see tools/terminal.py and tools/code.py). These
+    # are what the agent runtime's coding skill is built from; they are
+    # dispatched here rather than in a second table so there stays exactly
+    # one tool dispatch point in JARVIS.
+    if tool_name == "run_command":
+        return run_command(
+            arguments["command"],
+            arguments.get("working_directory"),
+            arguments.get("timeout"),
+            arguments.get("approved", False),
+        )
+
+    code_tools = {
+        "inspect_project": lambda: inspect_project(arguments["path"], arguments.get("max_files", 200)),
+        "read_code": lambda: read_code(arguments["path"], arguments.get("start_line", 1), arguments.get("end_line"), arguments.get("max_lines", 400)),
+        "edit_code": lambda: edit_code(arguments["path"], arguments["old_text"], arguments["new_text"], arguments.get("expect_unique", True)),
+        "check_syntax": lambda: check_syntax(arguments["path"]),
+        "search_code": lambda: search_code(arguments["path"], arguments["query"], arguments.get("max_results", 60), arguments.get("suffixes")),
+    }
+    if tool_name in code_tools:
+        return code_tools[tool_name]()
 
     return {"success":False,"message":f"Unknown tool: {tool_name}","error":"unknown_tool"}

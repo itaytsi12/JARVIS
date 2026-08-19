@@ -134,6 +134,10 @@ def compose_contextual_ack(route: dict | None) -> str:
         return _ack_for_tool(route.get("tool"), route.get("arguments") or {}) or _FALLBACK_ACK
     if rtype in ("plan", "ai"):
         return "I'll check that, sir."
+    if rtype == "remember":
+        return "I'll remember that, sir."
+    if rtype == "agent_task":
+        return "I'll work on that, sir."
     if rtype == "local_plan":
         actions = route.get("actions") or []
         if actions:
@@ -284,6 +288,13 @@ def _format_spoken_response_base(command: str, route: dict, response_text: str, 
         return response_text
     if rtype in {"resume_interrupted_response","correct_interrupted_response"}:
         return _sanitize_for_speech(response_text)
+    if rtype in {"agent_task", "remember"}:
+        # The agent runtime already produces one short, user-facing English
+        # sentence (brain/agent_loop.py's system prompt requires exactly
+        # that), and it is the only description of what actually happened
+        # -- flattening it to "Okay." below would throw away the entire
+        # answer. It is still sanitized, so URLs/JSON never reach TTS.
+        return _sanitize_for_speech(response_text) or "Done."
 
     # If language not provided, attempt to detect from command
     if lang is None:

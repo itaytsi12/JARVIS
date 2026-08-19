@@ -123,3 +123,15 @@ data/browser_profiles/
 
 
 data/jarvis_real_dataset_v1/
+
+# =========================
+# Agent runtime local state
+# =========================
+# Real captured runtime data, not disposable cache -- but it contains the
+# user's actual requests and desktop state, so it stays local. Back it up
+# rather than committing it. See memory/episodic.py.
+data/jarvis_agent.sqlite3
+data/jarvis_agent.sqlite3-*
+data/jarvis_usage.sqlite3
+data/jarvis_usage.sqlite3-*
+data/episodes/

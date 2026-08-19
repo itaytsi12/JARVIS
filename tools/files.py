@@ -193,3 +193,30 @@ def search_text(path: str, query: str) -> dict:
 		except (UnicodeDecodeError, OSError):
 			continue
 	return {"success": True,"verified":True, "matches": matches}
+
+
+def create_directory(path: str) -> dict:
+	"""Create a directory (and any missing parents).
+
+	Succeeds quietly when the directory already exists -- that is the
+	desired end state, not an error -- but says which case happened so a
+	caller is never misled about whether it created anything.
+	"""
+	p = Path(path).expanduser().resolve()
+	if p.is_file():
+		return {"success": False, "message": "A file already exists at that path.", "error": "path_is_file", "path": str(p)}
+	already = p.is_dir()
+	try:
+		p.mkdir(parents=True, exist_ok=True)
+	except OSError as exc:
+		return {"success": False, "message": "The directory could not be created.", "error": str(exc), "path": str(p)}
+	created = p.is_dir()
+	return {
+		"success": created,
+		"verified": created,
+		"created": created and not already,
+		"already_existed": already,
+		"message": (f"{p} already exists." if already else f"Created {p}.") if created else "Directory creation could not be verified.",
+		"path": str(p),
+		"error": None if created else "verification_failed",
+	}
