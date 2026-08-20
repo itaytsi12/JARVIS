@@ -135,3 +135,7 @@ data/jarvis_agent.sqlite3-*
 data/jarvis_usage.sqlite3
 data/jarvis_usage.sqlite3-*
 data/episodes/
+
+# Cached installed-application index (tools/app_index.py) -- rebuildable
+# local machine state, never something to commit.
+data/app_index_cache.json
