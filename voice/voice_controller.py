@@ -5,7 +5,7 @@ import tempfile
 from threading import Thread
 from typing import Any, Callable, Optional, Tuple
 
-from brain.agent import run_agent
+from brain.agent import run_agent, agent_runtime
 from brain.router import route_command
 
 from .listener import listen_push_to_talk, is_available as listener_available
@@ -98,7 +98,7 @@ def one_round_push_to_talk():
     recorder.record(EventType.NORMALIZED_REQUEST,{"normalized_text":safe_command,"final_interpreted_command":safe_command},interaction_id)
 
     try:
-        route = route_command(cleaned)
+        route = route_command(cleaned, context=agent_runtime.context)
     except Exception:
         route = None
 
@@ -137,7 +137,6 @@ def one_round_push_to_talk():
 
     # Speak in background so Ctrl+C can stop further loops quickly
     print("Speaking... (Ctrl+C to interrupt)")
-    from brain.agent import agent_runtime
     from .speech_journal import begin_speech,finish_speech
     agent_runtime.context.interrupted_response=spoken
     speech_journal=begin_speech(lang,len(spoken),interaction_id)

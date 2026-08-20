@@ -9,6 +9,7 @@ from brain.local_intent_model import route_with_local_model
 from brain.request_intent import RequestKind, classify_request_kind
 from brain.request_complexity import assess_complexity, looks_like_simple_target
 from providers.registry import agent_escalation_available
+from brain.context_router import route_with_context
 
 def looks_like_math(text: str) -> bool:
     math_pattern = r"^[\d\s\.\+\-\*\/\%\(\)]+$"
@@ -70,7 +71,7 @@ def _escalation_helps(complexity) -> bool:
     return True
 
 
-def route_command(command: str) -> dict:
+def route_command(command: str, context=None) -> dict:
     text = command.lower().strip()
 
     if text.rstrip(".?!,;:") in {
@@ -94,6 +95,22 @@ def route_command(command: str) -> dict:
         return {"type": "cancel_read_only_task"}
     if text.rstrip(".?!,;:") == "continue":
         return {"type":"resume_interrupted_response"}
+
+    # -------------------------
+    # Generalized conversational context (brain/context_resolver.py,
+    # brain/context_router.py): elliptical follow-ups ("close it", "run
+    # it"), corrections ("no, I meant Telegram"), "do it again", ordinal
+    # result references ("open the second one"), and search continuations
+    # ("search for X instead"). Only attempted when a SessionContext was
+    # supplied -- every caller that doesn't pass one (most tests,
+    # brain/speculative_execution.py) keeps today's behavior unchanged, and
+    # a caller that DOES pass one falls straight through to every pattern
+    # below whenever nothing contextual matched.
+    # -------------------------
+    if context is not None:
+        contextual_route = route_with_context(text, command, context)
+        if contextual_route is not None:
+            return contextual_route
 
     # Deterministic voice-approved continual learning commands (never routed
     # through the local intent model or the cloud planner -- see

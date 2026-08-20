@@ -156,6 +156,7 @@ class AgentLoop:
         tool_specs: Iterable[ToolSpec] | None = None,
         cancellation_token: Any = None,
         task: Any = None,
+        session_context: Any = None,
     ) -> AgentRun:
         started = time.perf_counter()
         run = AgentRun(goal=goal, context=context, skills=[skill.name for skill in skills])
@@ -248,6 +249,16 @@ class AgentLoop:
                     run.retries += 1
 
                 result = self.catalog.execute(call.name, call.arguments, cancellation_token=cancellation_token)
+                if session_context is not None:
+                    # Feeds the same structured short-term context a
+                    # deterministic plan's tool calls do (section 16) --
+                    # e.g. a `run_command` pytest failure list becomes a
+                    # `last_result_set` a later "fix the first one" can
+                    # resolve against, regardless of which execution path
+                    # (deterministic plan vs. agent loop) actually ran it.
+                    from brain.context_resolver import observe_tool_result
+
+                    observe_tool_result(session_context, call.name, call.arguments, result)
                 observation = self.context_builder.bound_observation(_observation_text(result))
                 outcomes.append(ToolOutcome(call.id, observation, is_error=not result.success))
                 self._record_step(run, call, result, observation, attempt, response.text)
