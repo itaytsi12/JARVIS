@@ -10,6 +10,7 @@ from pathlib import Path
 
 from tools.window import find_application_window,find_top_window_for_pid
 from tools.windows_process import hidden_process_kwargs
+from tools.app_resolver import resolve_app_name
 
 
 log = logging.getLogger("jarvis.applications")
@@ -27,7 +28,7 @@ def _start_apps_catalog() -> list[dict]:
     with _START_APPS_LOCK:
         if _START_APPS_CACHE is not None and now-_START_APPS_CACHE_AT<ttl:return list(_START_APPS_CACHE)
         script="Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress"
-        result=subprocess.run(["powershell.exe","-NoProfile","-NonInteractive","-Command",script],text=True,capture_output=True,timeout=4,**hidden_process_kwargs())
+        result=subprocess.run(["powershell.exe","-NoProfile","-NonInteractive","-Command",script],text=True,capture_output=True,timeout=8,**hidden_process_kwargs())
         if result.returncode or not result.stdout.strip():items=[]
         else:
             payload=json.loads(result.stdout);items=payload if isinstance(payload,list) else [payload]
@@ -86,6 +87,46 @@ def _resolve_whatsapp_command() -> list[str] | None:
     return [str(next((path for path in candidates if path.is_file()),""))] if any(path.is_file() for path in candidates) else None
 
 
+_SAFE_DIRECT_SUFFIXES = {".exe", ".lnk", ".bat", ".cmd"}
+
+
+def _resolve_direct_path(raw_name: str) -> list[str] | None:
+    """Support an explicit, already-existing safe executable/shortcut path.
+
+    Never touches PATH, the registry, or fuzzy matching -- only fires when
+    the caller supplied a real file on disk with a known-safe suffix, so
+    this can never turn arbitrary spoken text into a shell command.
+    """
+    candidate = (raw_name or "").strip().strip('"')
+    if not candidate:
+        return None
+    try:
+        path = Path(candidate)
+        if path.suffix.lower() not in _SAFE_DIRECT_SUFFIXES or not path.is_file():
+            return None
+    except OSError:
+        return None
+    if path.suffix.lower() == ".lnk":
+        return ["explorer.exe", str(path)]
+    return [str(path)]
+
+
+def _command_from_resolution(resolution) -> list[str] | None:
+    if resolution.launch_type == "uwp":
+        if not resolution.app_user_model_id:
+            return None
+        return ["explorer.exe", f"shell:AppsFolder\\{resolution.app_user_model_id}"]
+    if resolution.launch_type == "shortcut":
+        if not resolution.launch_target:
+            return None
+        return ["explorer.exe", resolution.launch_target]
+    if resolution.launch_type in ("exe", "path"):
+        if not resolution.launch_target:
+            return None
+        return [resolution.launch_target, *resolution.arguments]
+    return None
+
+
 def _wait_for_visible_window(app_name,pid,timeout=6.0):
     deadline=time.perf_counter()+timeout
     while time.perf_counter()<deadline:
@@ -97,6 +138,7 @@ def _wait_for_visible_window(app_name,pid,timeout=6.0):
 
 
 def open_application(app_name: str) -> dict:
+    original_name = app_name
     app_name = app_name.lower().strip()
 
     if app_name in VS_CODE_ALIASES:
@@ -116,9 +158,36 @@ def open_application(app_name: str) -> dict:
     }
 
     command = _resolve_vscode_command() if app_name == "vscode" else _resolve_whatsapp_command() if app_name=="whatsapp" else apps.get(app_name)
+
+    verify_name = app_name
+    resolution = None
+    if not command:
+        command = _resolve_direct_path(original_name)
     if not command:
         executable=shutil.which(app_name) or shutil.which(f"{app_name}.exe")
         command=executable or _resolve_start_app_command(app_name)
+    if not command:
+        resolution = resolve_app_name(app_name)
+        if resolution.success:
+            command = _command_from_resolution(resolution)
+            # The exe stem is a far better hint for tools.window's
+            # process-name-based verification than the human display name
+            # (e.g. "Command Prompt" -> "cmd", "Visual Studio Code" ->
+            # "Code") -- fall back to the display name only when no
+            # executable name could be recovered for this entry.
+            if resolution.executable_name:
+                verify_name = Path(resolution.executable_name).stem
+            else:
+                verify_name = resolution.resolved_name or app_name
+        elif resolution.resolution_method == "ambiguous":
+            candidates = resolution.candidates
+            return {
+                "success": False,
+                "verified": False,
+                "message": f"I found more than one application matching '{original_name}', sir: {', '.join(candidates[:5])}. Please be more specific.",
+                "error": "ambiguous_application",
+                "candidates": candidates,
+            }
 
     if command:
         try:
@@ -134,12 +203,12 @@ def open_application(app_name: str) -> dict:
             except Exception:
                 pid = None
 
-            shell_activation=isinstance(command,list) and len(command)>1 and str(command[0]).lower().endswith("explorer.exe") and str(command[1]).lower().startswith("shell:appsfolder\\")
+            shell_activation=isinstance(command,list) and len(command)>1 and str(command[0]).lower().endswith("explorer.exe")
             if shell_activation:pid=None
 
-            
 
-            hwnd=_wait_for_visible_window(app_name,pid)
+
+            hwnd=_wait_for_visible_window(verify_name,pid)
             if not hwnd:
                 return {"success":False,"verified":False,"message":f"Started {app_name}, but no responsive window appeared.","error":"application_window_unverified","pid":pid}
 
@@ -152,6 +221,11 @@ def open_application(app_name: str) -> dict:
                 "pid": pid,
                 "hwnd": hwnd,
             }
+            if resolution is not None and resolution.success:
+                result["resolved_name"] = resolution.resolved_name
+                result["resolution_method"] = resolution.resolution_method
+                result["confidence"] = resolution.confidence
+                result["source"] = resolution.source
             log.info("Application subprocess started: app=%s pid=%s", app_name, pid)
             return result
         except Exception as e:
