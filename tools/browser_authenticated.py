@@ -154,7 +154,19 @@ class AuthenticatedBrowserSession:
     """One reused connection to the user's own remote-debugging-enabled
     Chrome. Never launches a browser itself -- only attaches to one
     that's already running (see `launch_chrome_for_jarvis` for the
-    separate, explicit, human-driven launch step)."""
+    separate, explicit, human-driven launch step).
+
+    THREADING: every method here assumes it is already running on this
+    session's Playwright worker thread (`tools/playwright_runtime.py`).
+    `brain/tool_router.py::execute_tool` moves the WHOLE tool call there
+    before anything below is reached, which is the only hop -- these
+    methods must never hop themselves, because several of them hold
+    `self._lock` (an RLock, and RLock reentrancy is per-thread) across
+    calls to each other, so a second hop from inside the lock would
+    deadlock against the caller still holding it. Standalone entry points
+    (`--diagnose`, `--launch`, the music diagnose CLI) run on a process
+    whose main thread has no other Playwright instance, so they are safe
+    as they are."""
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
         self.host = host

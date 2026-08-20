@@ -18,7 +18,29 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+#: The repository root, derived from THIS file's location -- never from the
+#: process's working directory.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+#: Load `.env` from the project root explicitly.
+#:
+#: A bare `load_dotenv()` searches upward from the CURRENT WORKING
+#: DIRECTORY, so JARVIS's configuration silently depended on where the
+#: process happened to be started. Launched from anywhere but the
+#: repository root -- a Task Scheduler entry, a shortcut, another
+#: application importing `config` -- nothing was found, `get_config()`
+#: cached a config with no API key and the DEFAULT `agent_model`, and the
+#: later explicit `load_dotenv(PROJECT_ROOT / ".env")` in
+#: `voice/tray_app.py::run_tray` could not undo it (the config is cached,
+#: and `load_dotenv` never overrides an already-set variable). The result
+#: was "Complex request, but no agent provider is configured" with a
+#: perfectly valid key sitting in `.env`.
+#:
+#: This is also the ONE place `.env` is loaded. Other modules must not call
+#: `load_dotenv` themselves: a second, CWD-relative load re-introduces
+#: exactly the ordering hazard above, and which file wins then depends on
+#: import order.
+load_dotenv(PROJECT_ROOT / ".env")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 

@@ -103,9 +103,14 @@ def main():
     parser.add_argument("--status", action="store_true", help="Print configuration, provider, memory and task status")
     args = parser.parse_args()
 
-    from config import configure_logging
+    from config import configure_logging, log_startup_status
 
     configure_logging()
+    # Whether the agent provider is usable -- and, when it is not, WHY --
+    # is reported here, before any mode starts. Every mode below goes
+    # through this one call, so the typed, voice, agent and tray runtimes
+    # all use identical provider configuration and identical reporting.
+    log_startup_status()
 
     if args.status:
         print(json.dumps(runtime_status(), indent=2))

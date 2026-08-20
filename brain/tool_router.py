@@ -67,6 +67,29 @@ def execute_tool(
     tool_name: str,
     arguments: dict
 ):
+    """The single tool dispatch point.
+
+    Playwright-driving tools are run on their session's dedicated worker
+    thread (`tools/playwright_runtime.py`) instead of on the caller's. The
+    sync Playwright API leaves a RUNNING asyncio loop on whichever thread
+    starts it, so a second sync-Playwright session on that thread fails with
+    "It looks like you are using Playwright Sync API inside the asyncio loop"
+    -- the live failure on "Open Music." / "Play Israeli playlist." -- and
+    sync page objects are bound to their creating thread regardless. Routing
+    the WHOLE tool call (not just the connect) keeps every page interaction
+    it performs on that one thread.
+
+    Non-browser tools are unaffected: `run_for_tool` calls them inline.
+    """
+    from tools.playwright_runtime import run_for_tool
+
+    return run_for_tool(tool_name, _execute_tool_impl, tool_name, arguments)
+
+
+def _execute_tool_impl(
+    tool_name: str,
+    arguments: dict
+):
     t0 = time.perf_counter()
     if tool_name == "open_application":
         result = open_application(

@@ -27,13 +27,24 @@ def log_provider_status() -> None:
     from voice.speech_to_text import is_available as whisper_available
     from voice import text_to_speech as tts
 
+    from voice.voice_language import expected_input_languages, get_voice_language, stt_language_code
+
     stt_line = "ElevenLabs realtime" if elevenlabs_stt_configured() else "Whisper (local)"
     tts_line = tts._provider_label(tts._active_provider())
     voice_id_configured = bool(os.getenv("ELEVENLABS_VOICE_ID"))
+    # Report the RESOLVED language policy, not just the configured mode:
+    # "he" recognizes English too, and only a single-language mode forces a
+    # code on a provider (see voice/voice_language.py). A live failure was
+    # invisible precisely because the mode name alone said nothing about
+    # what the fallback would actually do.
+    mode = get_voice_language()
+    forced = stt_language_code(mode)
 
     lines = (
         f"STT provider: {stt_line}",
         f"TTS provider: {tts_line}",
+        f"Voice input language: mode={mode} recognizes={'/'.join(expected_input_languages(mode))} "
+        f"forced_language={forced or 'auto-detect (both providers)'}",
         f"JARVIS voice: {'configured' if voice_id_configured else 'not configured'}",
         f"Whisper fallback: {'available' if whisper_available() else 'unavailable'}",
         f"TTS fallback: {'available' if _tts_fallback_available() else 'unavailable'}",

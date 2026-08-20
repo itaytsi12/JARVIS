@@ -7,23 +7,59 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from config import log_startup_status
+
 from .background_assistant import AlwaysOnAssistant, AssistantState
 from .single_instance import SingleInstance
+
+
+log = logging.getLogger("jarvis.tray")
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "jarvis_background.log"
 
+# Every AssistantState must have an entry here. A state added to the enum
+# without one used to raise KeyError from `make_icon` -- confirmed live for
+# INTERRUPTED_LISTENING during barge-in, where the runtime entered a
+# perfectly valid state and only the TRAY crashed. `UNKNOWN_STATE_COLOR`
+# below makes that impossible to repeat: a colour is a cosmetic detail, and
+# a missing one must never be able to take down the notification-area icon.
 STATE_COLORS = {
     AssistantState.IDLE: "#2474d2",
     AssistantState.WAKE_DETECTED: "#18a558",
     AssistantState.LISTENING: "#18a558",
+    # Barge-in: the user interrupted JARVIS mid-sentence and it is now
+    # listening again. Same listening green, brightened, so it is
+    # distinguishable from an ordinary wake at a glance.
+    AssistantState.INTERRUPTED_LISTENING: "#00c853",
+    AssistantState.WAITING_FOR_LEARNING_APPROVAL: "#00a3a3",
     AssistantState.PROCESSING: "#f39c12",
     AssistantState.EXECUTING: "#f39c12",
     AssistantState.SPEAKING: "#8e44ad",
     AssistantState.ERROR: "#d63031",
 }
+
+# Defensive fallback for a state this module has not been taught about --
+# a future enum member, or a caller passing something unexpected.
+UNKNOWN_STATE_COLOR = "#2474d2"
+
+
+def state_color(state, disabled: bool = False) -> str:
+    """The tray colour for `state`, never raising.
+
+    Rendering the tray icon is not a place where correctness is worth a
+    crash: an unmapped state degrades to the idle colour (and is logged
+    once so it still gets noticed) instead of killing the icon thread.
+    """
+    if disabled:
+        return "#777777"
+    color = STATE_COLORS.get(state)
+    if color is None:
+        log.warning("No tray colour for state %r; using the default", getattr(state, "value", state))
+        return UNKNOWN_STATE_COLOR
+    return color
 
 
 def configure_logging() -> None:
@@ -39,7 +75,7 @@ def configure_logging() -> None:
 def make_icon(state: AssistantState, disabled: bool = False):
     from PIL import Image, ImageDraw, ImageFont
 
-    color = "#777777" if disabled else STATE_COLORS[state]
+    color = state_color(state, disabled)
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     draw.ellipse((3, 3, 61, 61), fill=color, outline="white", width=3)
@@ -148,9 +184,17 @@ class TrayApplication:
 
 
 def run_tray() -> int:
-    from dotenv import load_dotenv
-    load_dotenv(PROJECT_ROOT / ".env")
+    # `.env` is loaded from the project root by `config/settings.py`, which
+    # `configure_logging` imports -- there is deliberately no second
+    # `load_dotenv` here. The old one ran AFTER `main.py` had already
+    # imported `config` and cached `get_config()`, so it populated
+    # `os.environ` too late to affect anything and merely looked like the
+    # configuration was being handled.
     configure_logging()
+    # Requirements 6/7: say plainly whether the agent provider is usable,
+    # and why not when it isn't. The SAME function the typed runtime calls
+    # (`main.py`), so the two can never report different things.
+    log_startup_status()
     logging.getLogger("jarvis.background").info(
         "Runtime entrypoint: pid=%s ppid=%s executable=%r argv=%r cwd=%r main=%r project_root=%r",
         os.getpid(),os.getppid(),sys.executable,sys.argv,os.getcwd(),str(Path(sys.argv[0]).resolve()),str(PROJECT_ROOT),

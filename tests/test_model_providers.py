@@ -259,6 +259,19 @@ class UsageTrackingTests(unittest.TestCase):
             tracked.complete([Message.user("x")])
         self.assertEqual(self.store.for_task("t3").failures, 1)
 
+    def test_a_failed_call_is_not_counted_as_an_unpriced_call(self):
+        """A failure records cost_usd=NULL because nothing was billed --
+        that must not make a fully priced model report as unpriced."""
+        provider = ScriptedProvider([])
+        tracked = TrackedProvider(provider, self.store, task_id="t6")
+        with self.assertRaises(ProviderUnavailable):
+            tracked.complete([Message.user("x")])
+        summary = self.store.for_task("t6")
+        self.assertEqual(summary.failures, 1)
+        self.assertEqual(summary.unpriced_calls, 0)
+        self.assertTrue(summary.cost_is_complete)
+        self.assertEqual(tracked.summary().unpriced_calls, 0)
+
     def test_tracked_provider_is_transparent(self):
         provider = ScriptedProvider([text_response("hi")], model="m")
         tracked = TrackedProvider(provider, self.store)

@@ -7,13 +7,17 @@ Three supported modes for the whole STT pipeline:
   Neither STT provider is told to force a single language; the actual
   language of each committed transcript is determined locally afterward
   (see `detect_input_language` below).
-- `"en"`: English speech only (forced).
-- `"he"`: Hebrew speech only (forced).
+- `"en"`: English speech only (forced) -- the ONLY single-language mode.
+- `"he"`: Hebrew expected, English still recognized. Not "force Hebrew":
+  JARVIS's own command vocabulary is English, so a Hebrew-speaking user
+  still says "open Spotify" (see `EXPECTED_INPUT_LANGUAGES`).
 
 Every STT provider (`voice/elevenlabs_realtime_stt.py`'s realtime Scribe
 session, `voice/speech_to_text.py`'s local Whisper fallback) reads this SAME
-value rather than each hardcoding or guessing its own language, so the two
-providers can never disagree about which language(s) are expected.
+value -- through `expected_input_languages`/`stt_language_code`, never by
+interpreting the mode name itself -- so the two providers can never disagree
+about which language(s) are expected, and the fallback provider can never be
+stricter than the primary one.
 
 This is deliberately about STT INPUT only. Spoken OUTPUT stays English
 regardless of `VOICE_LANGUAGE` -- see `TTS_LANGUAGE`/`get_tts_language`
@@ -28,9 +32,29 @@ import re
 SUPPORTED_LANGUAGES: dict[str, str] = {
     "auto": "Auto (English/Hebrew)",
     "en": "English",
-    "he": "Hebrew",
+    "he": "Hebrew (English also recognized)",
 }
 DEFAULT_LANGUAGE = "auto"
+
+#: Which languages each mode must be ABLE to recognize, as opposed to which
+#: one it EXPECTS. The distinction matters because JARVIS's own command
+#: vocabulary is English: the wake phrase is "Hey Jarvis", spoken output is
+#: hard-policy English (`get_tts_language`), and `brain/router.py`'s command
+#: grammar is English with only a small Hebrew subset. A Hebrew-speaking
+#: user therefore issues English commands routinely -- confirmed live, where
+#: `VOICE_LANGUAGE=he` forced the Whisper fallback to `language="he"` and
+#: turned ordinary English commands into Hebrew transliterations that no
+#: route could match.
+#:
+#: So `"he"` means "Hebrew is expected, English is still recognized", not
+#: "transcribe every sound as Hebrew". Only `"en"` names exactly one
+#: language, and only a single-language mode is ever allowed to FORCE a
+#: language code on a provider (see `stt_language_code`).
+EXPECTED_INPUT_LANGUAGES: dict[str, tuple[str, ...]] = {
+    "auto": ("en", "he"),
+    "en": ("en",),
+    "he": ("he", "en"),
+}
 
 #: TTS is a hard, separate policy from STT input -- see `get_tts_language`.
 _SUPPORTED_TTS_LANGUAGES = {"en"}
@@ -88,6 +112,34 @@ def is_english_mode() -> bool:
     return get_voice_language() == "en"
 
 
+def expected_input_languages(mode: str | None = None) -> tuple[str, ...]:
+    """Every language the STT layer must be able to recognize in `mode`.
+
+    See `EXPECTED_INPUT_LANGUAGES` for why forced `"he"` still includes
+    English. Callers use this instead of comparing against the mode name,
+    so a new mode never has to be special-cased in two providers.
+    """
+    return EXPECTED_INPUT_LANGUAGES[mode if mode is not None else get_voice_language()]
+
+
+def stt_language_code(mode: str | None = None) -> str | None:
+    """The language code to FORCE on an STT provider, or None for
+    per-utterance detection.
+
+    One rule, shared by every provider: force a language only when the
+    configuration expects exactly one. Anything else uses the provider's
+    own detection (ElevenLabs `include_language_detection=true`, Whisper
+    `language=None`), because forcing one of several possible languages is
+    precisely what corrupts the others.
+
+    This also guarantees the two providers can never disagree about which
+    language(s) are expected -- they ask the same function rather than each
+    interpreting `VOICE_LANGUAGE` themselves.
+    """
+    languages = expected_input_languages(mode)
+    return languages[0] if len(languages) == 1 else None
+
+
 #: Hebrew block (U+0590-U+05FF), same range already used by
 #: `brain/music_intent.py`'s `_HEBREW_CHAR` -- one canonical detector
 #: rather than two independently-maintained regexes.
@@ -105,11 +157,18 @@ def detect_input_language(text: str) -> str:
 
 
 def resolve_utterance_language(text: str) -> str:
-    """The actual input language for one committed utterance: the forced
-    language in `"en"`/`"he"` mode, or the detected language in `"auto"`
-    mode. This is the value callers (ack composition, routing diagnostics)
-    should store per-interaction -- never the raw configured mode itself."""
-    mode = get_voice_language()
-    if mode == "auto":
-        return detect_input_language(text)
-    return mode
+    """The actual input language for one committed utterance.
+
+    Uses the same single-language rule as `stt_language_code`: the
+    configured language is only assumed when the mode expects exactly one
+    (`"en"`), and is otherwise detected from the text. That keeps this
+    honest in `"he"` mode, where an English command genuinely can be
+    recognized (see `EXPECTED_INPUT_LANGUAGES`) and must not be treated as
+    Hebrew by the acknowledgement/response policy.
+
+    This is the value callers (ack composition, routing diagnostics) should
+    store per-interaction -- never the raw configured mode itself."""
+    forced = stt_language_code()
+    if forced is not None:
+        return forced
+    return detect_input_language(text)

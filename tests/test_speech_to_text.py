@@ -116,13 +116,32 @@ class TranscribeLanguageParamTests(unittest.TestCase):
         self.assertEqual(captured["language"], "en")
         self.assertIsNotNone(captured["initial_prompt"])
 
-    def test_hebrew_mode_passes_language_he_never_forces_english(self):
+    def test_hebrew_mode_detects_per_utterance_and_never_forces_english(self):
+        """`"he"` expects Hebrew but must still recognize English commands.
+
+        Forcing `language="he"` here was the live bug: an English command
+        came back as a Hebrew transliteration that no route could match.
+        The fallback must not be stricter than the ElevenLabs primary, so
+        it auto-detects; `language="en"` is never forced either.
+        """
         captured = {}
-        with patch.dict(os.environ, {"VOICE_LANGUAGE": "he"}, clear=False), \
-             patch.object(stt, "_get_model", return_value=self._fake_model(captured)):
+        with patch.dict(os.environ, {"VOICE_LANGUAGE": "he"}, clear=False),              patch.object(stt, "_get_model", return_value=self._fake_model(captured)):
             stt.transcribe_audio("fake.wav")
-        self.assertEqual(captured["language"], "he")
-        self.assertNotEqual(captured["language"], "en")
+        self.assertIsNone(captured["language"])
+
+    def test_auto_mode_detects_per_utterance(self):
+        captured = {}
+        with patch.dict(os.environ, {"VOICE_LANGUAGE": "auto"}, clear=False),              patch.object(stt, "_get_model", return_value=self._fake_model(captured)):
+            stt.transcribe_audio("fake.wav")
+        self.assertIsNone(captured["language"])
+
+    def test_no_mode_ever_passes_the_literal_string_auto(self):
+        for mode in ("auto", "en", "he"):
+            with self.subTest(mode=mode):
+                captured = {}
+                with patch.dict(os.environ, {"VOICE_LANGUAGE": mode}, clear=False),                      patch.object(stt, "_get_model", return_value=self._fake_model(captured)):
+                    stt.transcribe_audio("fake.wav")
+                self.assertNotEqual(captured["language"], "auto")
 
     def test_hebrew_mode_omits_the_english_initial_prompt(self):
         # The English initial_prompt is an English-phrasing hint -- keeping

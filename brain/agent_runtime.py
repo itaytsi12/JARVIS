@@ -327,6 +327,16 @@ class AgentRuntime:
         return result
 
     def _browser_action(self, tool: str, args: dict) -> ToolResult:
+        """Browser actions are the agent runtime's own dispatch path (they
+        never reach `brain/tool_router.py::execute_tool`), so they need the
+        same Playwright-thread isolation applied here: sync Playwright leaves
+        a running asyncio loop on its thread and binds its page objects to it
+        (see `tools/playwright_runtime.py`)."""
+        from tools.playwright_runtime import run_for_tool
+
+        return run_for_tool(tool, self._browser_action_impl, tool, args)
+
+    def _browser_action_impl(self, tool: str, args: dict) -> ToolResult:
         # This "before" snapshot is a diagnostic aid for the verification
         # comparison below, not the action itself -- a page that's already
         # dead (or dies while reading it) degrades to no prior URL rather

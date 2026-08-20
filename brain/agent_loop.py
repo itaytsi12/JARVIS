@@ -112,6 +112,10 @@ class AgentRun:
             "steps": len(self.steps),
             "retries": self.retries,
             "errors": len(self.errors),
+            # The COUNT alone made a real provider failure undebuggable
+            # from the run summary; the message itself is what says
+            # whether the key, the model id, or the request was at fault.
+            "last_error": self.errors[-1] if self.errors else None,
             "model_calls": self.model_calls,
             "input_tokens": self.usage.input_tokens,
             "output_tokens": self.usage.output_tokens,
@@ -188,9 +192,22 @@ class AgentLoop:
                 response = self._call_model(messages, context.system_prompt, specs)
             except ProviderUnavailable as exc:
                 run.errors.append(str(exc))
+                log.error("Agent run has no usable provider: %s", exc)
                 return self._stop(run, started, NO_PROVIDER, "I can't reach the reasoning model right now, sir.")
             except ProviderError as exc:
                 run.errors.append(f"{type(exc).__name__}: {exc}")
+                # Logged here as well as in the provider: without it a real
+                # 401/404 from the API is indistinguishable from any other
+                # failure once it has become the generic PROVIDER_ERROR
+                # stop reason.
+                log.error(
+                    "Agent run failed at the model call: step=%s provider=%s model=%s %s: %s",
+                    step_number,
+                    run.provider,
+                    run.model,
+                    type(exc).__name__,
+                    exc,
+                )
                 if isinstance(exc, ProviderRateLimited):
                     message = "The reasoning model is rate limited right now, sir."
                 else:

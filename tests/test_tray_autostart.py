@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 from scripts import autostart
 from voice.background_assistant import AssistantState
 from voice.single_instance import SingleInstance
-from voice.tray_app import STATE_COLORS,TrayApplication,make_icon,tray_title
+from voice.tray_app import STATE_COLORS,TrayApplication,make_icon,state_color,tray_title
 from tools.windows_process import hidden_process_kwargs
 
 
@@ -47,6 +47,46 @@ class TrayActionTests(unittest.TestCase):
                 self.assertGreater(sum(pixel[:3]==(255,255,255) and pixel[3]>0 for pixel in center),40)
         disabled=make_icon(AssistantState.IDLE,disabled=True)
         self.assertIn((119,119,119),[pixel[:3] for pixel in disabled.get_flattened_data() if pixel[3]])
+
+    def test_every_assistant_state_renders_without_raising(self):
+        """A state that reached the runtime but not STATE_COLORS used to
+        raise KeyError from the tray -- confirmed live for
+        INTERRUPTED_LISTENING during barge-in, where only the tray broke.
+        Every enum member must render, enabled and disabled."""
+        for state in AssistantState:
+            with self.subTest(state=state):
+                self.assertIn(state, STATE_COLORS)
+                self.assertIsNotNone(make_icon(state))
+                self.assertIsNotNone(make_icon(state, disabled=True))
+                self.assertLessEqual(len(tray_title(state, state.value)), 127)
+
+    def test_barge_in_state_is_supported(self):
+        self.assertIn(AssistantState.INTERRUPTED_LISTENING, STATE_COLORS)
+        self.assertNotEqual(
+            STATE_COLORS[AssistantState.INTERRUPTED_LISTENING],
+            STATE_COLORS[AssistantState.IDLE],
+        )
+
+    def test_the_tray_callback_survives_a_barge_in_state_change(self):
+        """The live crash path: the runtime entered INTERRUPTED_LISTENING
+        during barge-in and `TrayApplication._state_changed` raised KeyError
+        while re-rendering the icon."""
+        tray = TrayApplication()
+        tray.icon = Mock()
+        for state in AssistantState:
+            with self.subTest(state=state):
+                tray._state_changed(state, "Speech interrupted")
+        self.assertTrue(tray.icon.update_menu.called)
+
+    def test_an_unmapped_state_falls_back_instead_of_crashing(self):
+        """A future enum member must degrade to a default colour: the tray
+        icon is cosmetic and must never be able to kill the icon thread."""
+        class FutureState:
+            value = "SOME_FUTURE_STATE"
+
+        self.assertIsNotNone(state_color(FutureState()))
+        self.assertIsNotNone(make_icon(FutureState()))
+        self.assertEqual(state_color(FutureState(), disabled=True), "#777777")
 
     def test_windows_tooltip_is_bounded(self):
         self.assertLessEqual(len(tray_title(AssistantState.ERROR, "x" * 500)), 127)

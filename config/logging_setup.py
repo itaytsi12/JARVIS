@@ -153,28 +153,76 @@ def describe_runtime() -> dict[str, Any]:
     }
 
 
-def log_startup_status(logger: logging.Logger | None = None) -> dict[str, Any]:
+_STARTUP_LOGGED = False
+
+
+def log_startup_status(logger: logging.Logger | None = None, force: bool = False) -> dict[str, Any]:
+    """Report, once per process, whether the agent provider is usable.
+
+    Called by BOTH entry points -- `main.py::main()` (typed, voice, agent,
+    dry-run) and `voice/tray_app.py::run_tray()` -- so the tray and the
+    typed runtime can never report, or use, different provider
+    configuration. The second call is a no-op unless `force` is passed.
+
+    This exists because the failure it reports was completely silent. The
+    live tray ran in `.venv-agent`, which had a valid `ANTHROPIC_API_KEY`
+    and `JARVIS_AGENT_MODEL` but no `anthropic` package installed;
+    `providers/anthropic_provider.py::is_available()` correctly returned
+    False with `unavailable_reason="anthropic_sdk_not_installed"`, and
+    that reason was computed, stored -- and never logged by anyone. All
+    the user saw was "no agent provider is configured" followed by a
+    cloud-planner fallback and a failure.
+
+    So: a key present with no usable provider is a MISCONFIGURATION and is
+    logged at ERROR with the real reason. No key at all is a normal,
+    supported state and stays at INFO. Nothing here ever prints the key --
+    only whether one is present.
+    """
+    global _STARTUP_LOGGED
     logger = logger or logging.getLogger("jarvis")
     status = describe_runtime()
+    if _STARTUP_LOGGED and not force:
+        return status
+    _STARTUP_LOGGED = True
+
+    config = get_config()
     providers = status["providers"]
     active = providers.get("active_provider")
-    if active:
-        logger.info("Agent provider active: %s (%s)", active, providers.get("active_model"))
-    else:
-        reasons = [
+    key_present = config.has_anthropic_credentials
+    logger.info(
+        "Agent provider configured: %s; provider=%s model=%s api_key_present=%s",
+        "yes" if active else "no",
+        active or "-",
+        providers.get("active_model") or config.agent_model,
+        "yes" if key_present else "no",
+    )
+    if not active:
+        reasons = ", ".join(
             f"{entry.get('provider')}={entry.get('unavailable_reason')}"
             for entry in providers.get("providers", [])
             if not entry.get("available")
-        ]
-        logger.info(
-            "No agent provider available; local commands only. %s",
-            ", ".join(reasons) or "no providers registered",
-        )
+        ) or "no providers registered"
+        if key_present:
+            # Requirement: never degrade silently. A key IS configured, so
+            # something is genuinely broken -- say what, at ERROR.
+            logger.error(
+                "An API key is configured but NO agent provider could be initialized (%s). "
+                "Complex requests will fall back to the local planner until this is fixed. "
+                "If this says anthropic_sdk_not_installed, this interpreter (%s) is missing the "
+                "SDK -- install requirements-agent.txt into it.",
+                reasons,
+                sys.executable,
+            )
+        else:
+            logger.info(
+                "No agent provider available; local commands only. %s", reasons
+            )
     logger.info(
-        "Runtime: debug=%s data_dir=%s max_agent_steps=%s max_concurrent_tasks=%s",
+        "Runtime: debug=%s data_dir=%s max_agent_steps=%s max_concurrent_tasks=%s python=%s",
         status["debug"],
         status["data_dir"],
         status["max_agent_steps"],
         status["max_concurrent_tasks"],
+        sys.executable,
     )
     return status

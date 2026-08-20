@@ -97,6 +97,66 @@ def get_agent_provider() -> Any | None:
     return None
 
 
+def agent_escalation_available() -> bool:
+    """Can a request that the deterministic layer cannot resolve be handed
+    to a real agent runtime right now?
+
+    False whenever escalation is disabled or no provider is configured --
+    the normal state until an API key is added -- so every deterministic
+    local route behaves exactly as it always has, with or without Claude
+    ("Claude is optional", docs/AGENT_ARCHITECTURE.md).
+
+    Lives here rather than in `brain/agent.py` because `brain/router.py`
+    needs the same answer and must not import the agent module (circular),
+    and because two independently-maintained copies of this predicate is
+    exactly how the router and the runtime would start to disagree about
+    where a request is going.
+
+    Never raises: a broken availability check must degrade to "no agent",
+    never take down routing.
+    """
+    try:
+        if not get_config().agent_escalation_enabled:
+            return False
+        return get_agent_provider() is not None
+    except Exception:
+        log.exception("Agent availability check failed; treating the agent as unavailable")
+        return False
+
+
+def agent_unavailable_reason() -> str | None:
+    """Why the agent cannot be used right now, or None when it can.
+
+    The reason already existed on the provider
+    (`unavailable_reason() == "anthropic_sdk_not_installed"`) and was simply
+    never surfaced anywhere a person would see it -- the live tray reported
+    only "no agent provider is configured" while a valid key was loaded.
+    Callers that degrade to a lesser path use this to say WHY they did.
+
+    Log-safe: reason codes only, never the key.
+    """
+    try:
+        config = get_config()
+        if not config.agent_enabled:
+            return "agent_disabled"
+        if not config.agent_escalation_enabled:
+            return "escalation_disabled"
+        if get_agent_provider() is not None:
+            return None
+        reasons = []
+        for name in config.provider_order:
+            provider = get_provider(name)
+            if provider is None:
+                reasons.append(f"{name}=construction_failed")
+                continue
+            if not provider.is_available():
+                reasons.append(f"{name}={provider.unavailable_reason()}")
+        return ", ".join(reasons) or "no_providers_registered"
+    except Exception as exc:
+        log.exception("Could not determine why the agent is unavailable")
+        return f"availability_check_failed:{type(exc).__name__}"
+
+
 def provider_status() -> dict[str, Any]:
     """A log-safe report of every registered provider -- what is
     configured, what is usable, and why anything unusable is unusable."""
@@ -132,6 +192,8 @@ __all__ = [
     "register_provider",
     "get_provider",
     "get_agent_provider",
+    "agent_escalation_available",
+    "agent_unavailable_reason",
     "available_providers",
     "provider_status",
     "reset_providers_for_tests",

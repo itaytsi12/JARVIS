@@ -8,7 +8,6 @@ from datetime import datetime,timezone
 from concurrent.futures import CancelledError,TimeoutError as FutureTimeoutError
 from urllib.parse import parse_qs, urlparse
 
-from dotenv import load_dotenv
 from openai import OpenAI
 
 from brain.router import route_command
@@ -26,7 +25,13 @@ from brain.web_answer import get_web_answer_service
 from brain.task_supervisor import ReadOnlyPriority,ReadOnlyTaskCancelled,active_interactive_task_summary,cancel_read_only_tasks,get_read_only_task_scheduler,wait_for_interactive_tasks
 
 
-load_dotenv()
+# `.env` is loaded exactly once, from the project root, by
+# `config/settings.py` -- importing it here is what guarantees that has
+# happened before the environment is read below. A local `load_dotenv()`
+# call would search upward from the CURRENT WORKING DIRECTORY instead,
+# which is how the runtime silently ended up with no API key when it was
+# started from anywhere but the repository root.
+import config  # noqa: F401  -- imported for its .env loading side effect
 
 
 client = OpenAI(
@@ -166,17 +171,15 @@ def _agent_escalation_available() -> bool:
     False whenever no model provider is configured -- which is the normal
     state until an API key is added -- so every deterministic local route
     below behaves exactly as it always has, with or without Claude.
-    """
-    try:
-        from config import get_config
-        from providers.registry import get_agent_provider
 
-        if not get_config().agent_escalation_enabled:
-            return False
-        return get_agent_provider() is not None
-    except Exception:
-        runtime_log.exception("Agent availability check failed; staying on the local path")
-        return False
+    Delegates to `providers.registry.agent_escalation_available` so the
+    router and the runtime can never disagree about whether the agent is
+    reachable (`brain/router.py` needs the same answer and cannot import
+    this module).
+    """
+    from providers.registry import agent_escalation_available
+
+    return agent_escalation_available()
 
 
 def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, cancellation_token=None) -> str:
@@ -188,6 +191,11 @@ def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, ca
     from brain.agent_service import run_agent_task
 
     execution_meta["route_type"] = "agent_task"
+    # Keep WHY this became an agent request (the router's `complexity_guard`
+    # / `local_context_question` / `no_deterministic_route`, or the planner
+    # fallback's `escalated_from`) instead of overwriting it with the
+    # destination -- the destination is already `route_type`.
+    execution_meta.setdefault("escalated_from", execution_meta.get("route_source"))
     execution_meta["route_source"] = "agent_runtime"
     recorder.record(
         EventType.REASONING_REQUEST,
@@ -204,8 +212,28 @@ def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, ca
     execution_meta["success"] = outcome.success
     execution_meta["verified"] = outcome.verified
     execution_meta["model_calls"] = execution_meta.get("model_calls", 0) + run.model_calls
-    execution_meta["cloud_ms"] = execution_meta.get("cloud_ms", 0.0) + run.duration_ms
+    # Split the run's wall clock into the two halves the latency profile
+    # actually distinguishes: time inside tools, and everything else (model
+    # turns plus loop overhead). Reporting the whole run as `cloud_ms` made
+    # a slow TOOL look like a slow model.
+    tool_ms = sum(step.duration_ms for step in run.steps)
+    execution_meta["tool_execution_ms"] = execution_meta.get("tool_execution_ms", 0.0) + tool_ms
+    execution_meta["cloud_ms"] = execution_meta.get("cloud_ms", 0.0) + max(0.0, run.duration_ms - tool_ms)
     execution_meta["agent_episode_id"] = outcome.episode_id
+    # Which model actually did the work, so the consolidated performance
+    # line can name it instead of only counting calls.
+    execution_meta["provider"] = run.provider
+    execution_meta["model"] = run.model
+    execution_meta["agent_steps"] = len(run.steps)
+    # Which tools actually ran. Agent steps are not `Action`/`ToolResult`
+    # pairs, so they never reach `execution_meta["executed_actions"]` --
+    # without this a caller can see that a model was called but not what it
+    # did, which is precisely the thing worth verifying.
+    execution_meta["agent_tools"] = [step.tool for step in run.steps]
+    execution_meta["stop_reason"] = run.stop_reason
+    execution_meta["estimated_cost_usd"] = run.estimated_cost_usd
+    execution_meta["input_tokens"] = run.usage.input_tokens
+    execution_meta["output_tokens"] = run.usage.output_tokens
     recorder.record(
         EventType.REASONING_RESPONSE,
         {
@@ -228,14 +256,31 @@ def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, ca
 
 def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execution_meta: dict, cancellation_token=None,original_user_text: str | None=None,speculative_ledger=None) -> str:
     control_types={"cancel_read_only_task","task_status","resume_interrupted_response","correct_interrupted_response","revise_whatsapp_recipient","remember","agent_task"}
-    if route is None and re.match(r"^(?:stop|cancel|never mind|continue|make it|shorten that|only (?:tell|give)|(?:don't send it|send it).+instead)",command,re.I):
-        route=route_command(command)
+    # The route is resolved BEFORE any planner decision, always.
+    #
+    # `should_use_task_planner(command)` is a text heuristic that knows
+    # nothing about what the router decided. Evaluating it while `route`
+    # was still None meant the typed entry point (`main.py`, which calls
+    # `run_agent(command)` with no route) never called `route_command` at
+    # all for any command that heuristic liked -- so the whole-request
+    # complexity guard, the music router and every other deterministic
+    # route were simply skipped there, and the request fell into the
+    # legacy planner. Confirmed live: "Tell me what files are in the
+    # JARVIS project folder. Do not modify anything." went task planner ->
+    # cloud planner -> "I couldn't create a safe local plan for that
+    # task.", never reaching the agent runtime.
+    #
+    # Routing first is also what makes the typed and the voice paths
+    # behave identically: `voice/background_assistant.py` has always
+    # routed before calling `run_agent`.
+    if route is None:
+        route = _timed(execution_meta,"routing_ms",lambda: route_command(command))
     use_task_planner=(
-        (not route or route.get("type") not in control_types)
+        route.get("type") not in control_types
         and not _is_deterministic_music_route(route)
         and should_use_task_planner(command)
     )
-    runtime_log.info("Runtime decision: %s; command=%r; agent_runtime_id=%s context_id=%s", "task_planner" if use_task_planner else "deterministic_router", _command_for_log(command), id(agent_runtime), id(agent_runtime.context))
+    runtime_log.info("Runtime decision: %s; route=%s/%s; command=%r; agent_runtime_id=%s context_id=%s", "task_planner" if use_task_planner else "deterministic_router", route.get("type"), route.get("route_source") or "-", _command_for_log(command), id(agent_runtime), id(agent_runtime.context))
     if use_task_planner:
         execution_meta["route_type"] = "task_plan"
         execution_meta["route_source"] = "deterministic_planner"
@@ -255,6 +300,23 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                     execution_meta["block_reason"]="app_identification_uncertain";execution_meta["block_errors"]=["app_identification_uncertain"]
                     runtime_log.info("Cloud planner invoked: false; app identification is uncertain")
                     return "I couldn't confidently identify the music application. Please say its exact name."
+                # The rule-based local planner could not represent this
+                # request. The legacy answer was to spend an OpenAI
+                # planning call and, when that plan failed validation too,
+                # to give up ("I couldn't build a complete validated
+                # plan..."). A real agent runtime is strictly more capable
+                # than a one-shot plan generator here -- it can look, act,
+                # observe the actual result and adapt -- so when one is
+                # configured the request goes there instead of paying for
+                # a plan that is about to be rejected. Confirmed live as
+                # 15-30s of legacy cloud planning before a failure reply.
+                #
+                # With no provider configured, the cloud-planner fallback
+                # below runs exactly as it always has.
+                if _agent_escalation_available():
+                    runtime_log.info("Escalating to agent runtime instead of the cloud planner: incomplete local plan (reason=%s)",completeness.get("reason"))
+                    execution_meta["escalated_from"]="incomplete_local_plan"
+                    return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token)
                 cloud_goal=original_user_text or command
                 runtime_log.info("Cloud planner invoked: true; full_goal=%r",_command_for_log(cloud_goal))
                 execution_meta["route_type"]="plan";execution_meta["route_source"]="cloud_planner";execution_meta["model_calls"]+=1
@@ -304,6 +366,12 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                 execution_meta["block_reason"]="app_identification_uncertain";execution_meta["block_errors"]=["app_identification_uncertain"]
                 runtime_log.info("Completeness decision: incomplete; cloud planner invoked: false; app identification uncertain")
                 return "I couldn't confidently identify the music application. Please say its exact name."
+            # Same rule as the incomplete-plan branch above: an available
+            # agent runtime supersedes the legacy cloud planner.
+            if _agent_escalation_available():
+                runtime_log.info("Escalating to agent runtime instead of the cloud planner: no local plan for %d clauses",len(missing_completeness.get("clauses") or []))
+                execution_meta["escalated_from"]="missing_local_plan"
+                return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token)
             cloud_goal=original_user_text or command;runtime_log.info("Completeness decision: incomplete; cloud planner invoked: true; full_goal=%r",_command_for_log(cloud_goal))
             execution_meta["route_type"]="plan";execution_meta["route_source"]="cloud_planner";execution_meta["model_calls"]+=1
             proposed=_timed(execution_meta,"cloud_ms",lambda: create_plan(cloud_goal));cloud_actions,validation_errors=validate_generated_actions(proposed)
@@ -334,8 +402,6 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         execution_meta["block_reason"]="missing_local_plan";execution_meta["block_errors"]=["missing_local_plan"]
         return "I couldn't create a safe local plan for that task."
 
-    if route is None:
-        route = route_command(command)
     execution_meta["route_type"] = route["type"]
     route_source=route.get("route_source") or ("web_answer" if route["type"]=="question" else "cloud_planner" if route["type"]=="plan" else "cloud_intent_router" if route["type"] in {"tools","ai"} else "deterministic_router")
     execution_meta["route_source"]=route_source
@@ -382,9 +448,40 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         return result.message
 
     if route["type"] == "agent_task":
-        # Explicitly requested agent run. Without a configured provider
-        # this reports that honestly instead of silently doing nothing.
-        return _run_agent_with_loop(route.get("goal") or command, recorder, iid, execution_meta, cancellation_token)
+        # An INFERRED escalation -- the whole-request complexity guard, a
+        # question that needs local tools, or nothing deterministic matching
+        # (see brain/router.py) -- is JARVIS's own judgement that no single
+        # local action covers the request, not an instruction from the user.
+        # `route_source` is set for exactly those; an EXPLICIT "agent: ..."
+        # request has none.
+        #
+        # With no provider configured there is nothing to escalate TO, so an
+        # inferred escalation degrades to the planner exactly as the request
+        # would have routed before these guards existed -- the "Claude is
+        # optional" invariant. An explicit request still reports honestly
+        # instead, because silently doing something else would misrepresent
+        # it. (The router already gates most of these on availability; this
+        # also covers a provider becoming unavailable between the two.)
+        if route.get("route_source") and not _agent_escalation_available():
+            # Say WHY, not just that. "No agent provider is configured"
+            # was true but misleading in the live failure: the key WAS
+            # configured; the interpreter running the tray had no
+            # `anthropic` package (see providers/registry.py's
+            # `agent_unavailable_reason`).
+            from providers.registry import agent_unavailable_reason
+
+            runtime_log.warning(
+                "Complex request, but the agent runtime is unavailable (%s); falling back to the planner: %s",
+                agent_unavailable_reason() or "unknown",
+                route.get("complexity"),
+            )
+            route = {"type": "plan", "message": route.get("goal") or command}
+            execution_meta["route_type"] = "plan"
+            execution_meta["route_source"] = "cloud_planner"
+            execution_meta["agent_escalation_declined"] = "no_provider"
+        else:
+            runtime_log.info("Routing to agent runtime (%s): %s", route.get("route_source") or "explicit", route.get("complexity"))
+            return _run_agent_with_loop(route.get("goal") or command, recorder, iid, execution_meta, cancellation_token)
 
     if route["type"] == "cancel_read_only_task":
         action=Action("cancel_active_task",{})
@@ -648,6 +745,13 @@ def _resource_wait_ms(execution_meta: dict) -> float:
     return next((float(_result_data(r).get("plan_resource_wait_ms",0.0) or 0.0) for r in results),0.0)
 
 
+def _cost_for_log(execution_meta: dict) -> str:
+    if "estimated_cost_usd" not in execution_meta:
+        return "-"
+    cost = execution_meta["estimated_cost_usd"]
+    return "unknown" if cost is None else f"{cost:.6f}"
+
+
 def _log_request_performance(execution_meta: dict, request_started: float, failed: bool) -> None:
     """One consolidated per-request timing line -- not one line per stage,
     to avoid log spam. Fields follow the stage names requested for latency
@@ -656,11 +760,24 @@ def _log_request_performance(execution_meta: dict, request_started: float, faile
     total_ms=(time.perf_counter()-request_started)*1000
     resource_wait_ms=_resource_wait_ms(execution_meta)
     runtime_log.info(
-        "Request performance: route_type=%s route_source=%s planning_ms=%.1f cloud_ms=%.1f tool_execution_ms=%.1f resource_wait_ms=%.1f model_calls=%s total_request_ms=%.1f success=%s",
+        "Request performance: route_type=%s route_source=%s escalated_from=%s provider=%s model=%s "
+        "routing_ms=%.1f planning_ms=%.1f cloud_ms=%.1f tool_execution_ms=%.1f resource_wait_ms=%.1f "
+        "model_calls=%s agent_steps=%s input_tokens=%s output_tokens=%s estimated_cost_usd=%s "
+        "total_request_ms=%.1f success=%s",
         execution_meta.get("route_type"),execution_meta.get("route_source"),
+        execution_meta.get("escalated_from") or "-",
+        execution_meta.get("provider") or "-",execution_meta.get("model") or "-",
+        execution_meta.get("routing_ms",0.0),
         execution_meta.get("planning_ms",0.0),execution_meta.get("cloud_ms",0.0),
         execution_meta.get("tool_execution_ms",0.0),resource_wait_ms,
-        execution_meta.get("model_calls",0),total_ms,not failed,
+        execution_meta.get("model_calls",0),execution_meta.get("agent_steps","-"),
+        execution_meta.get("input_tokens","-"),execution_meta.get("output_tokens","-"),
+        # Three distinct states, never collapsed: "-" no model was called
+        # at all, "unknown" the model has no known price (config/pricing.py
+        # returns None and providers/usage.py stores NULL for exactly this
+        # reason), or the real figure. None of them is 0.0.
+        _cost_for_log(execution_meta),
+        total_ms,not failed,
     )
 
 
@@ -813,6 +930,13 @@ def _build_execution_outcome(execution_meta, overall_success):
         "cloud_ms": execution_meta.get("cloud_ms", 0.0),
         "tool_execution_ms": execution_meta.get("tool_execution_ms", 0.0),
         "model_calls": execution_meta.get("model_calls", 0),
+        # Agent-path evidence. Agent steps are not Action/ToolResult pairs
+        # so they cannot appear in `actions` above; without these a caller
+        # can see that a model was called but not what it actually did.
+        "agent_tools": list(execution_meta.get("agent_tools") or []),
+        "agent_steps": execution_meta.get("agent_steps", 0),
+        "provider": execution_meta.get("provider"),
+        "model": execution_meta.get("model"),
     }
 
 

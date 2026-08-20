@@ -9,9 +9,12 @@ If faster-whisper is not installed, the module raises ImportError when used.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import Optional
+
+log = logging.getLogger("jarvis.stt")
 
 _MODEL = None
 _MODEL_LOCK = threading.Lock()
@@ -40,15 +43,15 @@ def _get_model(model_size: Optional[str] = None):
 
 
 def _create_model(model_size: Optional[str] = None):
-		from .voice_language import get_voice_language, language_name
+		from .voice_language import expected_input_languages, get_voice_language, language_name
 		voice_language = get_voice_language()
-		# English keeps the historical English-optimized small model. Hebrew
-		# (or any future non-English mode) MUST use a multilingual model --
-		# the ".en" variants are English-only and cannot transcribe Hebrew at
-		# all, no matter what `language=` is passed to .transcribe(). Only
+		# The English-optimized ".en" model is only safe when English is the
+		# ONLY expected language: those variants cannot transcribe Hebrew at
+		# all, whatever `language=` is passed to .transcribe(). Any mode that
+		# expects more than one language gets the multilingual model. Only
 		# ever loads ONE model per process (the module-level singleton below
 		# is keyed by whichever size this resolves to), never both.
-		default_model = "small.en" if voice_language == "en" else "small"
+		default_model = "small.en" if expected_input_languages(voice_language) == ("en",) else "small"
 		model_size = model_size or os.getenv("WHISPER_MODEL", default_model)
 
 		# Prefer CPU by default to avoid cublas/cuda DLL errors on Windows
@@ -95,19 +98,25 @@ def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
 
 	Returns the recognized text (empty string on no speech).
 	"""
-	from .voice_language import get_voice_language
+	from .voice_language import get_voice_language, stt_language_code
 
 	model = _get_model(model_size)
 	voice_language = get_voice_language()
-	# The English initial_prompt is an English-phrasing hint -- steering
-	# Whisper toward it in Hebrew/auto mode would bias output back toward
-	# English, exactly what a non-English-only mode must not do.
-	initial_prompt = _ENGLISH_INITIAL_PROMPT if voice_language == "en" else None
 	# faster-whisper's `language=` expects a real ISO code or None (meaning
-	# "detect per-segment") -- "auto" is this project's own mode name, not
-	# a real Whisper language code, so it must never be passed through
-	# literally (that would raise/misbehave inside faster-whisper).
-	whisper_language = None if voice_language == "auto" else voice_language
+	# "detect per-segment"). `stt_language_code` is the SINGLE shared rule
+	# both STT providers use: force a code only when the configuration
+	# expects exactly one language. This is what stops the Whisper FALLBACK
+	# from being stricter than the ElevenLabs primary -- confirmed live,
+	# where `VOICE_LANGUAGE=he` forced `language="he"` here and turned
+	# English commands into Hebrew transliterations no route could match.
+	# ("auto" is this project's own mode name, never a Whisper code, and
+	# is never passed through literally.)
+	whisper_language = stt_language_code(voice_language)
+	# The English initial_prompt is an English-phrasing hint. It is only
+	# safe when English is the sole expected language; in a bilingual mode
+	# it would bias output back toward English.
+	initial_prompt = _ENGLISH_INITIAL_PROMPT if whisper_language == "en" else None
+	log.info("[STT] whisper_fallback voice_language_mode=%s forced_language=%s", voice_language, whisper_language or "auto-detect")
 
 	segments, info = model.transcribe(
 		path,

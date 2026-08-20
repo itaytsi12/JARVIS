@@ -2,10 +2,15 @@ from __future__ import annotations
 import logging,os,re,time,threading
 from collections import OrderedDict
 from dataclasses import dataclass,field
-from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()
+# `.env` is loaded exactly once, from the project root, by
+# `config/settings.py` -- importing it here is what guarantees that has
+# happened before the environment is read below. A local `load_dotenv()`
+# call would search upward from the CURRENT WORKING DIRECTORY instead,
+# which is how the runtime silently ended up with no API key when it was
+# started from anywhere but the repository root.
+import config  # noqa: F401  -- imported for its .env loading side effect
 
 FAILURE="I couldn't get a reliable answer from the web right now."
 @dataclass

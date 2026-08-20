@@ -240,13 +240,18 @@ class ElevenLabsSTTVoiceLanguageTests(unittest.TestCase):
             session.connect()
         self.assertIn("language_code=en", FakeWSApp.instances[0].url)
 
-    def test_hebrew_mode_requests_hebrew_language_code_not_english(self):
+    def test_hebrew_mode_detects_the_language_instead_of_forcing_one(self):
+        """`"he"` expects Hebrew but must still recognize English commands
+        (`voice/voice_language.py::EXPECTED_INPUT_LANGUAGES`), so the
+        realtime session asks Scribe to detect rather than forcing a code
+        -- the SAME rule the Whisper fallback follows, so the primary and
+        the fallback provider can never disagree."""
         with patch.dict(os.environ, {"VOICE_LANGUAGE": "he"}, clear=False):
             session = ElevenLabsRealtimeSTT(api_key="sk-test", ws_app_factory=_factory())
             session.connect()
         url = FakeWSApp.instances[0].url
-        self.assertIn("language_code=he", url)
-        self.assertNotIn("language_code=en", url)
+        self.assertIn("include_language_detection=true", url)
+        self.assertNotIn("language_code=", url)
 
     def test_missing_voice_language_env_defaults_to_auto(self):
         env = dict(os.environ)

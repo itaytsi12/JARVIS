@@ -19,6 +19,7 @@ detail this layer exists to keep out of the rest of JARVIS.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -171,6 +172,7 @@ class AnthropicProvider:
         try:
             response = client.messages.create(**request)
         except Exception as exc:  # translated below; never leaked raw
+            _log_provider_failure(exc, model_id)
             raise _translate_error(exc) from exc
         latency_ms = (time.perf_counter() - started) * 1000
 
@@ -222,6 +224,46 @@ class AnthropicProvider:
                 else None
             ),
         )
+
+
+_SECRET_PATTERN = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
+
+
+def _redact(text: str) -> str:
+    """Strip anything shaped like an API key before it reaches a log.
+
+    The SDK's own error text does not echo the key, but this layer is the
+    one place a credential is in scope, so redaction is unconditional
+    rather than dependent on the vendor never changing that.
+    """
+    return _SECRET_PATTERN.sub("sk-<redacted>", text)
+
+
+def _log_provider_failure(exc: Exception, model_id: str) -> None:
+    """Log the REAL SDK exception before it is translated.
+
+    Without this, a genuine 401/404/400 from the API reaches the agent
+    loop as a generic `provider_error` with no way to tell an invalid key
+    from an unknown model. Logs the exception class, HTTP status, the
+    API's own error type/message, and the request id -- never the key.
+    """
+    status = getattr(exc, "status_code", None)
+    request_id = getattr(exc, "request_id", None)
+    api_error_type = None
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        inner = body.get("error")
+        if isinstance(inner, dict):
+            api_error_type = inner.get("type")
+    log.error(
+        "Anthropic call failed: exception=%s status=%s api_error_type=%s model=%s request_id=%s message=%s",
+        type(exc).__name__,
+        status,
+        api_error_type,
+        model_id,
+        request_id,
+        _redact(str(getattr(exc, "message", None) or exc))[:500],
+    )
 
 
 def _extract_usage(raw: Any) -> Usage:

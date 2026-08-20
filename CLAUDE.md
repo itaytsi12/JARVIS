@@ -19,7 +19,12 @@ Command flow, top to bottom:
   MiniLM-classifier HTTP service on `127.0.0.1:5050`, degrades gracefully
   if that service isn't running), and `brain/local_planner.py`
   (`create_local_plan`, rule-based multi-step splitting) before falling
-  back to the cloud.
+  back to the cloud — or, when an agent provider is configured, to the
+  agent runtime instead (see the escalation invariant below).
+- `brain/request_complexity.py` — the whole-request complexity/coverage
+  guard the router consults before every free-form pattern. Not a router
+  and not a planner: a pure, offline assessment of whether ANY single
+  deterministic action could satisfy the entire request.
 - `brain/planner.py` — cloud LLM planner (`create_plan`, OpenAI). Used by
   `agent.py` when the local paths can't handle a request.
 - `brain/task_planner.py` — the multi-step **task** planner
@@ -69,6 +74,105 @@ the local layer genuinely cannot resolve. Full detail is in
 - **UI work is serialized.** `tasks/manager.py` runs `TaskKind.CONCURRENT`
   tasks in parallel but only ever one `TaskKind.EXCLUSIVE_UI` task, on
   top of (not instead of) `brain/resource_locks.py`.
+- **Escalation is decided once, in the router, before any planner.**
+  `brain/request_complexity.py::assess_complexity` is a pure, offline
+  whole-request assessment (reasoning required, operation count, software
+  domain, local-machine reference, scoping constraint) plus
+  `looks_like_simple_target`, the coverage guard for the router's
+  open-ended `(.+)` captures. `brain/router.py` consults it before every
+  free-form pattern and returns `{"type": "agent_task", "route_source":
+  ...}` for a request no single deterministic action can satisfy. Three
+  inferred sources exist: `complexity_guard`, `local_context_question`
+  (a QUESTION that needs filesystem/terminal tools -- the web-answer
+  service cannot see this machine), and `no_deterministic_route` (nothing
+  matched; the agent supersedes the gpt-5-mini intent classifier, so that
+  cloud call is skipped entirely). `brain/agent.py::_run_agent_impl`
+  ALWAYS resolves the route before deciding whether to use the task
+  planner -- `should_use_task_planner(command)` is a text heuristic that
+  knows nothing about the route, and evaluating it first meant the typed
+  entry point (`main.py`, `run_agent(command)` with no route) skipped
+  `route_command` altogether. That is what sent "Tell me what files are in
+  the JARVIS project folder. Do not modify anything." into the legacy
+  planner and back with "I couldn't create a safe local plan for that
+  task." Confirmed live.
+- **The agent runtime supersedes the legacy cloud planner, never the
+  other way round.** Both points in `brain/agent.py` where an incomplete
+  or missing local plan used to fall back to `brain/planner.py::create_plan`
+  now escalate to the agent runtime first when a provider is available
+  (`escalated_from=incomplete_local_plan` / `missing_local_plan` in the
+  performance log). The cloud-planner fallback is intact and unchanged
+  for the no-provider case.
+- **`providers/registry.py::agent_escalation_available()` is the single
+  answer to "is the agent reachable".** `brain/router.py` needs it and
+  cannot import `brain/agent.py` (circular);
+  `brain.agent._agent_escalation_available` delegates to it so the router
+  and the runtime can never disagree.
+- **Sync Playwright gets its own thread, per session.**
+  `tools/playwright_runtime.py`. `sync_playwright().start()` creates an
+  asyncio loop and leaves it RUNNING on the calling thread for the life of
+  that instance, so a second `start()` on that thread raises "It looks like
+  you are using Playwright Sync API inside the asyncio loop" -- the live
+  failure on "Open Music." / "Play Israeli playlist.", since JARVIS has two
+  independent sync sessions (`tools/browser_agent.py`'s ephemeral browser
+  and `tools/browser_authenticated.py`'s CDP attachment) started lazily on
+  whichever pooled thread called first. Each session now gets its own
+  worker thread (`BROWSER`, `AUTHENTICATED`), keyed off the resource names
+  `brain/resource_locks.py::resource_for_tool` already assigns so the two
+  do not serialize behind each other. The hop happens exactly ONCE, at the
+  dispatch boundary (`brain/tool_router.py::execute_tool` and
+  `brain/agent_runtime.py::_browser_action`) -- the session classes must
+  never hop themselves, because several of their methods hold a per-session
+  RLock across calls to each other and RLock reentrancy is per-thread.
+  Exceptions are re-raised on the calling thread unchanged; nothing is
+  suppressed.
+- **`VOICE_LANGUAGE=he` is bilingual, not "force Hebrew".**
+  `voice/voice_language.py::EXPECTED_INPUT_LANGUAGES` maps each mode to the
+  languages STT must RECOGNIZE, and `stt_language_code()` forces a language
+  code only when a mode expects exactly one (`"en"`). Both providers ask
+  that one function -- ElevenLabs sends `language_code` or
+  `include_language_detection=true`, Whisper passes the code or `None` --
+  so the fallback can never be stricter than the primary. Forcing
+  `language="he"` on the Whisper fallback turned ordinary English commands
+  into Hebrew transliterations no route could match; JARVIS's own command
+  vocabulary is English (the wake phrase, the hard English-only TTS policy,
+  `brain/router.py`'s grammar), so a Hebrew-mode user issues English
+  commands routinely. `resolve_utterance_language` follows the same rule.
+- **Every `AssistantState` must render in the tray.**
+  `voice/tray_app.py::state_color` returns a default (and logs) for an
+  unmapped state instead of raising: a missing colour is cosmetic and must
+  never kill the icon thread. `INTERRUPTED_LISTENING` (barge-in) and
+  `WAITING_FOR_LEARNING_APPROVAL` were missing from `STATE_COLORS` and
+  raised `KeyError` live while the runtime itself was working correctly.
+- **The runtime venv must carry the agent's own dependencies, and a
+  missing one must be loud.** `python main.py --tray` runs in
+  `.venv-agent`, which had a valid `ANTHROPIC_API_KEY` and
+  `JARVIS_AGENT_MODEL` but no `anthropic` package installed. That is not
+  an error anywhere: `providers/anthropic_provider.py::is_available()`
+  correctly returned False with
+  `unavailable_reason="anthropic_sdk_not_installed"`, `get_agent_provider()`
+  correctly returned None, and the live tray correctly degraded -- to the
+  legacy cloud planner, reporting only "no agent provider is configured"
+  while a perfectly good key was loaded. `requirements-agent.txt` now
+  declares `anthropic`, and `config/logging_setup.py::log_startup_status`
+  (called by BOTH `main.py::main()` and `voice/tray_app.py::run_tray()`,
+  once per process) reports `Agent provider configured: yes/no; provider=
+  model= api_key_present=` and escalates to **ERROR** whenever a key is
+  present but no provider could be initialized, naming the reason and the
+  interpreter. `providers/registry.py::agent_unavailable_reason()` gives
+  the same reason to `brain/agent.py` so a request-time fallback says WHY.
+  Neither ever prints the key.
+- **`.env` is loaded once, from the project root, by `config/settings.py`.**
+  A bare `load_dotenv()` searches upward from the CURRENT WORKING
+  DIRECTORY, so configuration depended on where the process was started:
+  launched from anywhere else, `get_config()` cached an empty key and the
+  DEFAULT `agent_model`, and `voice/tray_app.py`'s later explicit
+  `load_dotenv(PROJECT_ROOT / ".env")` could not undo it (the config is
+  cached, and `load_dotenv` never overrides an already-set variable).
+  `config/settings.py` now loads `PROJECT_ROOT / ".env"` explicitly, and
+  no other module calls `load_dotenv` at all -- `brain/agent.py`,
+  `brain/planner.py`, `brain/intent_router.py`, `brain/web_answer.py` and
+  `vision/screen_analyzer.py` import `config` for the side effect instead.
+  `tests/test_provider_wiring.py` enforces both rules.
 - **Cost is never guessed.** `config/pricing.py` returns `None` for an
   unpriced model and `providers/usage.py` stores `NULL`, so "unknown" and
   "free" stay distinguishable.

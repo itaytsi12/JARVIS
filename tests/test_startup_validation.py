@@ -35,15 +35,36 @@ class StartupValidationTests(unittest.TestCase):
         lines = [call.args[0] for call in printed.call_args_list]
         self.assertTrue(any("JARVIS voice: configured" in line for line in lines))
 
-    def test_reports_all_five_expected_lines(self):
+    def test_reports_every_expected_line(self):
         with patch("builtins.print") as printed:
             startup_validation.log_provider_status()
         lines = [call.args[0] for call in printed.call_args_list]
-        self.assertEqual(len(lines), 5)
-        self.assertTrue(any(line.startswith("STT provider:") for line in lines))
-        self.assertTrue(any(line.startswith("TTS provider:") for line in lines))
-        self.assertTrue(any(line.startswith("Whisper fallback:") for line in lines))
-        self.assertTrue(any(line.startswith("TTS fallback:") for line in lines))
+        self.assertEqual(len(lines), 6)
+        for prefix in (
+            "STT provider:",
+            "TTS provider:",
+            "Voice input language:",
+            "JARVIS voice:",
+            "Whisper fallback:",
+            "TTS fallback:",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertTrue(any(line.startswith(prefix) for line in lines))
+
+    def test_reports_the_resolved_language_policy_not_just_the_mode(self):
+        """The mode name alone said nothing about what the FALLBACK would do,
+        which is why forcing Hebrew on English commands was invisible."""
+        with patch.dict(os.environ, {"VOICE_LANGUAGE": "he"}, clear=False), patch("builtins.print") as printed:
+            startup_validation.log_provider_status()
+        line = next(l for l in [c.args[0] for c in printed.call_args_list] if l.startswith("Voice input language:"))
+        self.assertIn("mode=he", line)
+        self.assertIn("en", line)
+        self.assertIn("auto-detect", line)
+
+        with patch.dict(os.environ, {"VOICE_LANGUAGE": "en"}, clear=False), patch("builtins.print") as printed:
+            startup_validation.log_provider_status()
+        line = next(l for l in [c.args[0] for c in printed.call_args_list] if l.startswith("Voice input language:"))
+        self.assertIn("forced_language=en", line)
 
 
 if __name__ == "__main__":

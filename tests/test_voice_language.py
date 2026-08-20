@@ -57,11 +57,11 @@ class VoiceLanguageTests(unittest.TestCase):
 
     def test_language_name_mapping(self):
         self.assertEqual(language_name("en"), "English")
-        self.assertEqual(language_name("he"), "Hebrew")
+        self.assertIn("Hebrew", language_name("he"))
 
     def test_language_name_uses_configured_language_when_omitted(self):
         with patch.dict(os.environ, {"VOICE_LANGUAGE": "he"}, clear=False):
-            self.assertEqual(language_name(), "Hebrew")
+            self.assertIn("Hebrew", language_name())
 
     def test_tts_language_is_always_english_regardless_of_voice_language(self):
         for mode in ("auto", "en", "he"):
@@ -105,9 +105,45 @@ class ResolveUtteranceLanguageTests(unittest.TestCase):
         with patch.dict(os.environ, {"VOICE_LANGUAGE": "en"}, clear=False):
             self.assertEqual(resolve_utterance_language("פתח מוזיקה"), "en")
 
-    def test_forced_hebrew_mode_ignores_actual_english_text(self):
+    def test_hebrew_mode_still_recognizes_an_english_utterance_as_english(self):
+        """`"he"` is bilingual, not "everything is Hebrew".
+
+        JARVIS's command vocabulary is English, so a Hebrew-mode user still
+        says "open YouTube"; treating that as Hebrew would give it the
+        entity-free Hebrew acknowledgement instead of the contextual one.
+        """
         with patch.dict(os.environ, {"VOICE_LANGUAGE": "he"}, clear=False):
-            self.assertEqual(resolve_utterance_language("open YouTube"), "he")
+            self.assertEqual(resolve_utterance_language("open YouTube"), "en")
+            self.assertEqual(resolve_utterance_language("פתח יוטיוב"), "he")
+
+
+class SttLanguagePolicyTests(unittest.TestCase):
+    """One shared rule for BOTH STT providers: force a language code only
+    when the configuration expects exactly one language."""
+
+    def test_only_english_mode_forces_a_language_code(self):
+        from voice.voice_language import stt_language_code
+
+        with patch.dict(os.environ, {"VOICE_LANGUAGE": "en"}, clear=False):
+            self.assertEqual(stt_language_code(), "en")
+        for bilingual in ("auto", "he"):
+            with self.subTest(mode=bilingual), patch.dict(os.environ, {"VOICE_LANGUAGE": bilingual}, clear=False):
+                self.assertIsNone(stt_language_code())
+
+    def test_every_mode_can_recognize_english(self):
+        """The command grammar is English; no mode may exclude it."""
+        from voice.voice_language import expected_input_languages
+
+        for mode in ("auto", "en", "he"):
+            with self.subTest(mode=mode):
+                self.assertIn("en", expected_input_languages(mode))
+
+    def test_hebrew_is_preserved_where_it_is_configured(self):
+        from voice.voice_language import expected_input_languages
+
+        self.assertIn("he", expected_input_languages("he"))
+        self.assertIn("he", expected_input_languages("auto"))
+        self.assertEqual(expected_input_languages("he")[0], "he")
 
 
 if __name__ == "__main__":

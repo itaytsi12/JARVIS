@@ -10,7 +10,9 @@ Two pieces:
   each call, so cost tracking is not something a call site can forget.
 
 An unpriced model records `cost_usd = NULL`, never 0.0 -- "unknown" and
-"free" must stay distinguishable.
+"free" must stay distinguishable. A FAILED call also records NULL, but is
+not counted as unpriced: no call was billed, so it says nothing about
+whether the model's price is known.
 """
 from __future__ import annotations
 
@@ -167,7 +169,7 @@ class UsageStore:
             " COALESCE(SUM(cache_creation_tokens),0) AS cache_creation_tokens,"
             " COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,"
             " COALESCE(SUM(cost_usd),0) AS cost_usd,"
-            " SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) AS unpriced_calls,"
+            " SUM(CASE WHEN cost_usd IS NULL AND success=1 THEN 1 ELSE 0 END) AS unpriced_calls,"
             " SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failures"
             " FROM model_usage"
         ) + (f" WHERE {where}" if where else "")
@@ -286,7 +288,12 @@ class TrackedProvider:
             summary.cache_creation_tokens += record.cache_creation_tokens
             summary.cache_read_tokens += record.cache_read_tokens
             if record.cost_usd is None:
-                summary.unpriced_calls += 1
+                # A FAILED call has no cost because it never happened, not
+                # because the model has no known price. Counting it as
+                # unpriced made `cost_is_complete` false -- and a fully
+                # priced model look unpriced -- on any run that errored.
+                if record.success:
+                    summary.unpriced_calls += 1
             else:
                 summary.cost_usd = round(summary.cost_usd + record.cost_usd, 8)
             if not record.success:

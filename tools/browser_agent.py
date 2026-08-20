@@ -123,6 +123,15 @@ class BrowserAgent:
                 pass
 
     def _launch(self) -> None:
+        # THREADING: this must already be running on the BROWSER worker
+        # thread (`tools/playwright_runtime.py`).
+        # `sync_playwright().start()` leaves a RUNNING asyncio loop on
+        # whichever thread starts it, so a second sync-Playwright session
+        # there fails with "you are using Playwright Sync API inside the
+        # asyncio loop" -- the live failure on "Open Music." -- and sync page
+        # objects are bound to their creating thread regardless.
+        # `brain/agent_runtime.py::_browser_action` moves the whole action
+        # there before this is reached; that is the only hop.
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:

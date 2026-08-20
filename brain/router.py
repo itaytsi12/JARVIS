@@ -7,6 +7,8 @@ from tools.registry import WEBSITE_ALIASES, APP_ALIASES
 import urllib.parse
 from brain.local_intent_model import route_with_local_model
 from brain.request_intent import RequestKind, classify_request_kind
+from brain.request_complexity import assess_complexity, looks_like_simple_target
+from providers.registry import agent_escalation_available
 
 def looks_like_math(text: str) -> bool:
     math_pattern = r"^[\d\s\.\+\-\*\/\%\(\)]+$"
@@ -41,6 +43,31 @@ def clean_math_command(text: str) -> str:
     )
 
     return text.strip()
+
+
+#: The one complexity reason that names work ONLY the agent runtime can do:
+#: reading real files, listing real directories, running real commands.
+LOCAL_INSPECTION = "local_inspection_requires_tools"
+
+
+def _escalation_helps(complexity) -> bool:
+    """Would escalating this request to the agent actually gain anything?
+
+    `LOCAL_INSPECTION` requests need filesystem/terminal tools that only the
+    agent runtime has. With no agent configured, escalating them gains
+    nothing and would take them away from the pre-existing question /
+    web-answer route -- so that one reason yields, and the request routes
+    exactly as it did before this guard existed.
+
+    The other reasons (open-ended reasoning, multi-operation software work,
+    a scoping constraint) describe work the legacy planner path at least
+    attempts, and `brain/agent.py` degrades those to it when no provider is
+    configured. They escalate regardless, so routing stays provider-agnostic
+    for them.
+    """
+    if complexity.reason == LOCAL_INSPECTION:
+        return agent_escalation_available()
+    return True
 
 
 def route_command(command: str) -> dict:
@@ -131,6 +158,29 @@ def route_command(command: str) -> dict:
     from brain.coding_task_intent import is_coding_task
     if is_coding_task(command):
         return {"type": "coding_task", "task": command}
+
+    # Whole-request complexity guard (brain/request_complexity.py).
+    #
+    # Everything BELOW this point is a deterministic single-action route,
+    # and several of those routes end in an open-ended capture that will
+    # happily swallow an entire sentence as a tool argument. A single
+    # local action can only be the right answer when it satisfies the
+    # WHOLE request -- so a request that demands reasoning, chains several
+    # operations over a codebase, or carries a scoping constraint is
+    # handed to the agent runtime instead of being forced into whichever
+    # tool keyword happened to appear first.
+    #
+    # Checked AFTER the explicit control/music/coding routes above so none
+    # of those established behaviours change, and before every free-form
+    # pattern below so no keyword can pre-empt the assessment.
+    complexity = assess_complexity(command)
+    if complexity.is_complex and _escalation_helps(complexity):
+        return {
+            "type": "agent_task",
+            "goal": command.strip(),
+            "route_source": "complexity_guard",
+            "complexity": complexity.describe(),
+        }
 
     if re.fullmatch(r"(?:make it (?:much )?shorter|shorten that|only (?:tell|give) me (?:the )?(?:top )?\d+)",text.rstrip(".?!,;:")):
         return {"type":"correct_interrupted_response","instruction":text.rstrip(".?!,;:")}
@@ -406,8 +456,26 @@ def route_command(command: str) -> dict:
         key = m_press.group(1).strip()
         return {"type": "tool", "tool": "press_key", "arguments": {"key": key}}
 
+    # The "this/the active window" phrasing family, kept deterministic so a
+    # trivial command does not need the cloud intent router. Matched as a
+    # whole fixed phrase rather than on the verb alone -- a bare "describe"
+    # keyword would otherwise capture things like "describe the plot of
+    # hamlet" as a window name, which is the very failure mode the guard
+    # below exists to prevent.
+    window_describe_match = re.fullmatch(
+        r"(?:inspect|describe|read|what(?:'s| is) in)\s+(?:this|the|the current|the active|my)\s+window[.?!]?",
+        text,
+        re.I,
+    )
+    if window_describe_match:
+        return {"type":"tool","tool":"inspect_window","arguments":{"app_name":"the active window","limit":50}}
+
+    # `looks_like_simple_target` is the coverage half of the guard: this
+    # pattern captures everything after the keyword, so what it captured
+    # must actually look like a window/app name before it can be used as
+    # one. Anything sentence-shaped falls through to the routes below.
     inspect_match=re.fullmatch(r"(?:inspect|list (?:the )?controls in|what controls are in)\s+(.+?)[.?!]?",text,re.I)
-    if inspect_match:
+    if inspect_match and looks_like_simple_target(inspect_match.group(1)):
         app=inspect_match.group(1).strip().lower();app=APP_ALIASES.get(app,app)
         return {"type":"tool","tool":"inspect_window","arguments":{"app_name":app,"limit":50}}
 
@@ -428,7 +496,7 @@ def route_command(command: str) -> dict:
 
     # Switch/focus to application
     m_switch = re.match(r"^(?:switch to|focus)\s+(.+)$", text, flags=re.IGNORECASE)
-    if m_switch:
+    if m_switch and looks_like_simple_target(m_switch.group(1)):
         app = m_switch.group(1).strip().lower()
         # If an alias exists, resolve it
         if app in APP_ALIASES:
@@ -555,6 +623,24 @@ def route_command(command: str) -> dict:
     request_kind = classify_request_kind(command)
     classification_ms = (time.perf_counter() - classification_started) * 1000
     if request_kind.kind is RequestKind.QUESTION:
+        # A QUESTION normally means "answer this from the web"
+        # (brain/web_answer.py). But a question ABOUT THIS MACHINE -- a
+        # file on disk, a directory listing, `git status` -- is not on the
+        # web at all, and the web-answer service cannot see any of it. The
+        # agent runtime has the filesystem/terminal/code tools that can, so
+        # a tool-requiring question is allowed to reach it.
+        #
+        # Gated on a provider actually being configured: with no agent
+        # available the pre-existing web-answer route is still the best
+        # available answer, so this stays inert ("Claude is optional").
+        if complexity.requires_local_context and agent_escalation_available():
+            return {
+                "type": "agent_task",
+                "goal": command.strip(),
+                "route_source": "local_context_question",
+                "complexity": complexity.describe(),
+                "intent_classification_ms": classification_ms,
+            }
         return {
             "type": "question",
             "message": command,
@@ -574,6 +660,26 @@ def route_command(command: str) -> dict:
     # -------------------------
     # AI / Intent fallback
     # -------------------------
+
+    # Nothing deterministic matched. Historically this always spent a
+    # cloud classification call (gpt-5-mini) whose only possible useful
+    # outcomes are a `tool`/`plan`/`ai` route -- and `brain/agent.py`
+    # escalates `plan`/`ai` straight to the agent runtime anyway, so on
+    # those the call was pure added latency and cost before the real work
+    # started. When an agent IS available it is strictly more capable than
+    # this classifier, so hand the request over directly.
+    #
+    # With no agent configured the classifier remains the fallback exactly
+    # as before.
+    if agent_escalation_available():
+        return {
+            "type": "agent_task",
+            "goal": command.strip(),
+            "route_source": "no_deterministic_route",
+            "fallback_from": ["deterministic_router", "local_learned_classifier"],
+            "fallback_reason": "no_confident_local_route",
+            "model_calls": 0,
+        }
 
     fallback=classify_intent(command)
     fallback.setdefault("route_source","cloud_intent_router")

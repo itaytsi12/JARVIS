@@ -157,24 +157,31 @@ class ElevenLabsRealtimeSTT:
         # `language_code` and `include_language_detection` are both real,
         # documented query parameters of ElevenLabs' realtime Scribe
         # endpoint (confirmed against the live API reference -- no guessed
-        # parameter names). Forced `"en"`/`"he"` modes keep sending an
-        # explicit `language_code` exactly as before. `"auto"` mode does
-        # the opposite of forcing a language: it omits `language_code`
-        # entirely and sets `include_language_detection=true` instead, so
-        # Scribe detects and preserves whichever language was actually
-        # spoken per utterance rather than being told to expect one.
-        from .voice_language import get_voice_language
+        # parameter names).
+        #
+        # Which of the two is sent comes from `stt_language_code`, the ONE
+        # shared rule `voice/speech_to_text.py`'s Whisper fallback also
+        # uses: force `language_code` only when the configuration expects
+        # exactly one language, and otherwise ask Scribe to detect the
+        # language per utterance. Deciding this here, from the mode name,
+        # is what previously let the primary and the fallback provider
+        # disagree about what counts as expected input.
+        from .voice_language import get_voice_language, stt_language_code
         voice_language = get_voice_language()
+        forced_language = stt_language_code(voice_language)
         params = (
             f"model_id={self.model}&audio_format=pcm_{self.sample_rate}"
             f"&commit_strategy=vad&vad_silence_threshold_secs={self._silence_secs}"
         )
-        if voice_language == "auto":
+        if forced_language is None:
             params += "&include_language_detection=true"
         else:
-            params += f"&language_code={voice_language}"
+            params += f"&language_code={forced_language}"
         url = f"{ENDPOINT}?{params}"
-        log.info("[STT] configured_provider=elevenlabs voice_language_mode=%s model=%s", voice_language, self.model)
+        log.info(
+            "[STT] configured_provider=elevenlabs voice_language_mode=%s forced_language=%s model=%s",
+            voice_language, forced_language or "auto-detect", self.model,
+        )
         ready = threading.Event()
         error_or_close = threading.Event()
 

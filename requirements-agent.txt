@@ -1,3 +1,13 @@
+# `.venv-agent` -- the environment `python main.py --tray` actually runs in.
+# It runs the WHOLE assistant, agent runtime included, so it needs the
+# Claude SDK as much as the main environment does. Omitting it did not
+# fail loudly: `providers/anthropic_provider.py::is_available()` simply
+# returned False with `unavailable_reason="anthropic_sdk_not_installed"`,
+# `get_agent_provider()` returned None, and the live tray reported
+# "no agent provider is configured" and fell back to the cloud planner --
+# with a perfectly valid ANTHROPIC_API_KEY loaded the whole time.
+anthropic>=0.70,<1  # Claude provider (providers/anthropic_provider.py)
+python-dotenv>=1,<2  # config/settings.py reads .env at import
 playwright>=1.62,<2
 pywinauto>=0.6.9,<0.7
 pytest>=9,<10
