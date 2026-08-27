@@ -173,6 +173,125 @@ the local layer genuinely cannot resolve. Full detail is in
   `brain/planner.py`, `brain/intent_router.py`, `brain/web_answer.py` and
   `vision/screen_analyzer.py` import `config` for the side effect instead.
   `tests/test_provider_wiring.py` enforces both rules.
+### Plan execution: dependency graph, parallelism, result passing
+
+`brain/models.py::Action` has always had `depends_on`, but for a long time
+nothing scheduled from it. `AgentRuntime` either ran a plan strictly one
+action at a time or -- only when EVERY action was simultaneously
+dependency-free and context-independent -- ran the whole plan at once. That
+all-or-nothing choice lost on the requests people actually make: "open Chrome
+and Spotify, then lower the volume" has one ordering edge at the end, so both
+independent launches were serialized for no reason.
+
+- **`brain/execution_graph.py` is the scheduler, and it is a strict
+  generalization -- not a replacement.** `build_waves` levels the dependency
+  graph (Kahn); `partition_wave` splits one wave into the actions that may
+  genuinely run together and those that must not. A pure chain (what
+  `task_planner` emits) levels into N single-action waves and takes the
+  untouched sequential path in `_execute_plan`, so existing plans behave
+  exactly as before. An all-independent plan levels into one all-parallel
+  wave -- the old `_execute_plan_parallel` case, which now DELEGATES to
+  `_execute_plan_scheduled` rather than being a second engine that could
+  drift. Mixed plans, previously forced fully sequential, now overlap what is
+  safe to overlap. A cycle raises `CyclicPlanError` rather than silently
+  executing an arbitrary subset.
+- **Parallel safety is never re-derived.** `partition_wave` reuses
+  `brain/safe_tools.py::CONTEXT_INDEPENDENT_TOOLS` and
+  `brain/resource_locks.py::resource_for_tool`, and additionally refuses to
+  batch an action with a repeat of itself or with a sibling claiming the same
+  exclusive resource. `ActionRisk` above SAFE and `optional` actions are never
+  parallel candidates. Concurrency is bounded by `JARVIS_MAX_PARALLEL_TOOLS`.
+- **`plan_lock_held` is per-thread, and getting it wrong is subtle.**
+  `AgentRuntime.execute()` holds the process-wide `action_plan` lock for the
+  whole plan on the CALLING thread. Only actions dispatched to worker threads
+  pass `plan_lock_held=True`; actions run sequentially within a wave run on
+  the calling thread and must keep `plan_lock_held=False` -- both because the
+  RLock is already held reentrantly there, and because that flag changes which
+  arity `_execute_with_retry` uses to call `_execute_action`, which test
+  subclasses override with the historical two-argument signature.
+- **Failure semantics are unchanged by scheduling.** A dependency that never
+  completed yields `dependency_failure` without executing; an `optional`
+  failure is skipped; anything else stops the plan -- but only AFTER the wave
+  it happened in finishes, so a sibling already running still returns its own
+  result. An exception escaping one action becomes a failed `ToolResult`,
+  never a swallowed error and never an aborted sibling.
+- **`brain/action_results.py` lets one action consume another's result.**
+  `{"__from_result__": {"action": 0, "field": "data.failures"}}` in an
+  action's arguments is replaced at execution time by that field of action 0's
+  result. It is validated data, never code -- the only thing a reference can
+  do is read a field of a result that already exists. `ToolResult` stays the
+  SINGLE result type; status/summary/text/artifacts/metadata/`data.*` are a
+  VIEW over its existing fields, so any tool that already populates `data`
+  gains result passing for free. A reference is itself an ordering
+  constraint: `with_reference_dependencies` adds every referenced index to
+  `depends_on` before scheduling, so referencing a result orders the two
+  actions even if the planner forgot to say so. An unresolvable reference
+  fails the action that MADE it (`error="unresolved_reference: ..."`), never
+  silently passes nothing.
+- **`brain/recovery.py` is bounded by construction, not by a counter.**
+  Consulted once per failed action; a strategy may only PROPOSE actions, and
+  those run with `allow_recovery=False`, so a failing recovery can never
+  generate more recovery. At most `MAX_RECOVERY_ACTIONS` (2), SAFE risk only,
+  and `cancelled`/`human_confirmation_required`/`dependency_failure`/
+  `resource_timeout`/`unresolved_reference` are never recovered -- those are
+  decisions, or they point at a different action. A failed recovery leaves the
+  ORIGINAL error standing; it never invents a success. This sits ABOVE the
+  tool layer's own fallbacks (`tools/applications.py` already tries VS Code
+  aliases, a direct path, `shutil.which`, the start-app command and the app
+  index) -- do not duplicate those here.
+
+**Adding a tool that should work with the planner/executor:** implement it in
+`tools/`, dispatch it in `brain/tool_router.py::execute_tool`, describe it in
+`brain/tool_catalog.py::DEFINITIONS`, and return the existing
+`brain/models.py::ToolResult`. Then decide two things: whether it belongs in
+`CONTEXT_INDEPENDENT_TOOLS` (only if it neither reads state a sibling writes
+nor writes state a sibling reads -- when in doubt, leave it out and it stays
+sequential), and whether it needs an entry in
+`brain/resource_locks.py::resource_for_tool`. Populate `data` with a
+`summary` and any structured payload so later actions can reference it. That
+is the whole integration -- the scheduler, result passing, recovery and
+dataset capture then apply automatically.
+
+### Multi-target commands and connector-aware dependencies
+
+`brain/task_planner.py` used to chain every clause to its predecessor
+(`depends_on=[len(actions)-1]`) whether or not anything required that order,
+so no request could ever be scheduled concurrently. Worse, "open Spotify and
+VS Code" planned only Spotify: the clause splitter only splits before a
+command VERB, "vs code" is not one, and the single-clause path then dropped
+every target after the first.
+
+- `segment_with_connectors` reports HOW each clause was joined;
+  `segment_sequential_commands` is now written in terms of it and keeps its
+  exact previous behavior (including the quoted-payload and
+  connector-not-before-a-verb cases).
+- `states_an_order` distinguishes explicit sequencing ("then", "and then",
+  "after that", "next") from a bare "and"/comma. A clause depends on the
+  previous one when the user sequenced it explicitly, OR when its tool is
+  outside `CONTEXT_INDEPENDENT_TOOLS` and therefore needs shared desktop state
+  (typing, clicking and saving all need the right window in front).
+- `split_coordinated_targets` treats a coordinated phrase as several targets
+  ONLY when every piece independently resolves to a known app or website, so a
+  document called "my report and notes" is never torn in half.
+
+Result: "open chrome and spotify" plans four actions in two waves with both
+launches parallel; "open notepad and type hello" still runs strictly in order.
+
+### What the dataset captures about a plan
+
+`PLAN_CREATED` records `index`/`tool`/`arguments`/`depends_on`/`optional`/
+`risk` per action (`brain/agent.py::_plan_action_records`) plus the wave and
+concurrency breakdown (`_plan_schedule_record`) -- the dependency structure is
+exactly what a future model would need and used to be thrown away. Redaction
+is unchanged: arguments still go through `_safe_action_arguments` and the
+payload still through `training_data/sanitizer.py::privacy_safe_event`.
+`plan.context["execution_metrics"]` carries measured `waves`,
+`parallel_actions`, `scheduled_ms` and `parallel_saved_ms` (a wave's summed
+action durations minus its slowest member -- measured, not modelled), and each
+action's own duration lands on its result as `action_ms`. A pure chain records
+no scheduler metrics at all, so overhead is zero where there is nothing to
+schedule.
+
 ### Complex-agent performance (measured, not assumed)
 
 `scripts/benchmark_agent.py` is the harness: a free dry run (tool latency,
