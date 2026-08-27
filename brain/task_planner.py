@@ -6,6 +6,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from brain.models import Action, ActionRisk, Plan
+from brain.safe_tools import CONTEXT_INDEPENDENT_TOOLS
 from brain.session_context import SessionContext
 from tools.files import get_desktop_path,get_documents_path
 from tools.registry import APP_ALIASES, WEBSITE_ALIASES
@@ -23,36 +24,92 @@ def _clean(value: str) -> str:
     return value.strip(" \t\r\n,.;!?'\"")
 
 
-_COMMAND_START = r"(?:open|launch|start|play|type|write|save|close|quit|go\s+to|search|press|hit|click|maximize|minimize|switch|focus|send|message|tell|create|rename|move|read)"
+_COMMAND_START = r"(?:open|launch|start|play|type|write|save|close|quit|go\s+to|search|press|hit|click|maximize|minimize|switch|focus|send|message|tell|create|rename|move|read|lower|raise|turn|mute|unmute|pause|resume|stop|run|execute)"
 _TEXT_REFERENCES = re.compile(
     r"^(?:exactly\s+)?(?:what you(?: just| last)? said|what you(?: just| last)? told me|your last (?:answer|response)|the previous (?:answer|response)|your previous (?:answer|response)|the last thing you said|that|the last thing)$",
     re.I,
 )
 
 
-def segment_sequential_commands(text: str) -> list[str]:
-    """Split clear imperative sequences while protecting quoted payloads."""
-    mask=list(text);quote=None;escaped=False
-    for index,char in enumerate(text):
-        if escaped:mask[index]=" ";escaped=False;continue
-        if char=="\\" and quote:mask[index]=" ";escaped=True;continue
-        if char in {'"',"'"}:
-            quote=None if quote==char else char if quote is None else quote
-            mask[index]=" ";continue
-        if quote:mask[index]=" "
-    visible="".join(mask)
-    connector=re.compile(
+#: Connectors that state an ORDER ("do A, then B"). A clause introduced by
+#: one of these always waits for the clause before it, whatever its tool is.
+#: A bare "and" or comma states only that both were asked for -- whether they
+#: must be ordered is then decided by what the clause actually does.
+_ORDERING_CONNECTOR = re.compile(r"^\s*(?:and\s+then|then|after\s+that|next|,\s*(?:then|next))\b", re.I)
+
+
+def _mask_quoted(text: str) -> str:
+    """`text` with quoted payloads blanked out, so a connector word inside a
+    quoted string ("type 'hello and then save it'") is never a split point."""
+    mask = list(text); quote = None; escaped = False
+    for index, char in enumerate(text):
+        if escaped: mask[index] = " "; escaped = False; continue
+        if char == "\\" and quote: mask[index] = " "; escaped = True; continue
+        if char in {'"', "'"}:
+            quote = None if quote == char else char if quote is None else quote
+            mask[index] = " "; continue
+        if quote: mask[index] = " "
+    return "".join(mask)
+
+
+def segment_with_connectors(text: str) -> list[tuple[str, str]]:
+    """Split into `(connector, clause)` pairs, connector first and possibly "".
+
+    Same splitting rule as `segment_sequential_commands` -- which is written
+    in terms of this -- but it also reports HOW each clause was joined to the
+    one before it. That is what lets the planner tell "open Chrome and
+    Spotify" (two things asked for, no order stated) from "open Chrome then
+    lower the volume" (an order stated explicitly), instead of chaining every
+    clause to its predecessor regardless.
+    """
+    visible = _mask_quoted(text)
+    connector = re.compile(
         rf"(?:\s+and\s+then\s+|\s+then\s+|\s+after\s+that\s+|\s+next\s+|\s+and\s+|,\s*(?:then\s+|next\s+)?)(?={_COMMAND_START}\b)",
         re.I,
     )
-    parts=[];start=0
+    parts: list[tuple[str, str]] = []; start = 0; pending = ""
     for match in connector.finditer(visible):
-        part=text[start:match.start()].strip(" ,")
-        if part:parts.append(part)
-        start=match.end()
-    tail=text[start:].strip(" ,")
-    if tail:parts.append(tail)
+        part = text[start:match.start()].strip(" ,")
+        if part: parts.append((pending, part))
+        pending = text[match.start():match.end()]
+        start = match.end()
+    tail = text[start:].strip(" ,")
+    if tail: parts.append((pending, tail))
     return parts
+
+
+def segment_sequential_commands(text: str) -> list[str]:
+    """Split clear imperative sequences while protecting quoted payloads."""
+    return [clause for _, clause in segment_with_connectors(text)]
+
+
+def states_an_order(connector: str) -> bool:
+    """Did the user explicitly sequence this clause after the previous one?"""
+    return bool(connector) and bool(_ORDERING_CONNECTOR.match(connector))
+
+
+#: Coordinators that join several targets of ONE verb ("open Spotify and VS
+#: Code"). Split on these only when every resulting piece names a known app or
+#: website -- otherwise the phrase is an ordinary target that happens to
+#: contain the word (e.g. a document called "cats and dogs").
+_TARGET_COORDINATOR = re.compile(r"\s*(?:,\s*(?:and\s+)?|\s+and\s+|\s*&\s*)", re.I)
+
+
+def split_coordinated_targets(target: str) -> list[str]:
+    """["spotify", "vs code"] for "spotify and vs code"; ["x"] for anything
+    that is not a list of recognised targets.
+
+    General mechanism, not a list of sentences: a coordinated phrase is only
+    treated as several targets when EVERY piece independently resolves to a
+    known application or website. That keeps "open my report and notes.txt"
+    (one filename) from being torn in half.
+    """
+    pieces = [piece.strip() for piece in _TARGET_COORDINATOR.split(target) if piece.strip()]
+    if len(pieces) < 2:
+        return [target]
+    if all(piece.lower() in APP_ALIASES or piece.lower() in WEBSITE_ALIASES for piece in pieces):
+        return pieces
+    return [target]
 
 
 def _literal_payload(value: str) -> str:
@@ -101,27 +158,65 @@ def _whatsapp_parts(segment:str,context:SessionContext):
     return None
 
 
+def _has_coordinated_targets(clause: str) -> bool:
+    """Is this single clause an open/launch verb naming SEVERAL targets?
+
+    "open Spotify and VS Code" is one clause but two actions. Without this the
+    segmented planner bailed out at `len(segments)<2` and only the first
+    target was ever planned -- the second was silently dropped.
+    """
+    match = re.match(r"^(?:open|launch|start|go\s+to)\s+(.+)$", clause.strip(), re.I)
+    return bool(match) and len(split_coordinated_targets(_clean(match.group(1)))) > 1
+
+
 def _segmented_plan(text: str,context:SessionContext) -> Plan | None:
-    segmentation_started=time.perf_counter();segments=segment_sequential_commands(text);segmentation_ms=(time.perf_counter()-segmentation_started)*1000
-    if len(segments)<2:return None
+    segmentation_started=time.perf_counter();paired=segment_with_connectors(text);segments=[clause for _,clause in paired];segmentation_ms=(time.perf_counter()-segmentation_started)*1000
+    if len(segments)<2 and not (segments and _has_coordinated_targets(segments[0])):return None
     actions=[];resolved=[];type_traces=[];reference_started=time.perf_counter()
-    for segment in segments:
+    # Index of the last action contributed by the PREVIOUS clause. A clause
+    # that must wait for the one before it depends on exactly this, so the
+    # edge describes the clause boundary rather than whichever action
+    # happened to be appended last.
+    previous_clause_end=None
+    for connector,segment in paired:
+        # Must this clause wait for the previous one? Yes when the user
+        # sequenced it explicitly ("then", "after that"), and yes when what
+        # it does depends on shared desktop state a sibling could be changing
+        # (typing, clicking and saving all need the right window in front).
+        # A self-contained clause joined by a bare "and" does not have to
+        # wait, and saying so is what lets the scheduler overlap them.
+        def _deps(tool, ordered=states_an_order(connector), end=previous_clause_end):
+            if end is None:
+                return []
+            if ordered or tool not in CONTEXT_INDEPENDENT_TOOLS:
+                return [end]
+            return []
         lowered=segment.lower().strip()
         whatsapp=_whatsapp_parts(segment,context)
         if whatsapp:
             recipient,payload,metadata,literal=whatsapp
             if payload is None:return Plan(text,[],context=metadata)
             if metadata:resolved.append(metadata)
-            actions.append(Action("send_whatsapp_message",{"recipient":recipient,"message":payload,"literal":literal},depends_on=[len(actions)-1] if actions else [],risk=ActionRisk.CAUTION,max_attempts=1,sensitive_fields={"message"}))
+            actions.append(Action("send_whatsapp_message",{"recipient":recipient,"message":payload,"literal":literal},depends_on=_deps("send_whatsapp_message"),risk=ActionRisk.CAUTION,max_attempts=1,sensitive_fields={"message"}))
+            previous_clause_end=len(actions)-1
             continue
         open_match=re.match(r"^(?:open|launch|start|go\s+to)\s+(.+)$",segment,re.I)
         if open_match:
-            target=_clean(open_match.group(1)).lower()
-            if target in WEBSITE_ALIASES:
-                actions.append(Action("open_website",{"url":WEBSITE_ALIASES[target]},depends_on=[len(actions)-1] if actions else [],max_attempts=1))
-            elif target in APP_ALIASES:
-                app=APP_ALIASES[target];open_index=len(actions);actions.append(Action("open_application",{"app_name":app},depends_on=[open_index-1] if open_index else [],verify="process_started",max_attempts=1));actions.append(Action("wait_for_window",{"app_name":app},depends_on=[open_index],verify="window_exists",max_attempts=1))
-            else:return None
+            raw_target=_clean(open_match.group(1))
+            # "open Spotify and VS Code" is one verb with several targets.
+            # Each becomes its own independent action group, so both are
+            # planned and scheduled together instead of the second being
+            # silently dropped (which is what used to happen).
+            targets=[t.lower() for t in split_coordinated_targets(raw_target)]
+            if not all(t in WEBSITE_ALIASES or t in APP_ALIASES for t in targets):return None
+            for target in targets:
+                if target in WEBSITE_ALIASES:
+                    actions.append(Action("open_website",{"url":WEBSITE_ALIASES[target]},depends_on=_deps("open_website"),max_attempts=1))
+                else:
+                    app=APP_ALIASES[target];open_index=len(actions)
+                    actions.append(Action("open_application",{"app_name":app},depends_on=_deps("open_application"),verify="process_started",max_attempts=1))
+                    actions.append(Action("wait_for_window",{"app_name":app},depends_on=[open_index],verify="window_exists",max_attempts=1))
+            previous_clause_end=len(actions)-1
             continue
         type_match=re.match(r"^(?:type|write)\s+(.+)$",segment,re.I)
         if type_match:
@@ -130,16 +225,19 @@ def _segmented_plan(text: str,context:SessionContext) -> Plan | None:
                 return Plan(text,[],context={"clarification":"I don't have a previous answer to type.","planning_trace":{"segments":segments,"type_text":type_traces}})
             if trace["reference_resolution_result"] is not None:
                 resolved.append({"reference":trace["type_payload_before_reference_resolution"],"resolved_value":payload})
-            actions.append(Action("type_text",{"text":payload,"delay":.02},depends_on=[len(actions)-1] if actions else [],max_attempts=1,sensitive_fields={"text"}))
+            actions.append(Action("type_text",{"text":payload,"delay":.02},depends_on=_deps("type_text"),max_attempts=1,sensitive_fields={"text"}))
+            previous_clause_end=len(actions)-1
             continue
         search_match=re.match(r"^search(?:\s+(?:google|chrome))?\s+(?:for\s+)?(.+)$",segment,re.I)
         if search_match:
             app=next((a.args.get("app_name") for a in reversed(actions) if a.tool=="open_application"),None) or context.active_app
             if app!="chrome":return None
-            actions.append(Action("open_website",{"url":SEARCH_URLS["google"].format(quote_plus(_clean(search_match.group(1))))},depends_on=[len(actions)-1] if actions else [],max_attempts=1))
+            actions.append(Action("open_website",{"url":SEARCH_URLS["google"].format(quote_plus(_clean(search_match.group(1))))},depends_on=_deps("browser_search"),max_attempts=1))
+            previous_clause_end=len(actions)-1
             continue
         if re.fullmatch(r"save(?:\s+(?:it|the document|the file))?",lowered.rstrip(".?!")):
-            actions.append(Action("save_current_document",{},depends_on=[len(actions)-1] if actions else [],max_attempts=1))
+            actions.append(Action("save_current_document",{},depends_on=_deps("save_current_document"),max_attempts=1))
+            previous_clause_end=len(actions)-1
             continue
         click_match=re.match(r"^click\s+(?:the\s+)?(.+?)(?:\s+(button|link|menu item))?(?:\s+(?:in|on)\s+(.+?))?[.?!]?$",segment,re.I)
         if click_match:
@@ -148,7 +246,8 @@ def _segmented_plan(text: str,context:SessionContext) -> Plan | None:
             if not app:return None
             app=APP_ALIASES.get(_clean(app).lower(),_clean(app).lower());arguments={"app_name":app,"name":_clean(name)}
             if control_type:arguments["control_type"]={"button":"Button","link":"Hyperlink","menu item":"MenuItem"}[control_type.lower()]
-            actions.append(Action("click_ui_element",arguments,depends_on=[len(actions)-1] if actions else [],max_attempts=1))
+            actions.append(Action("click_ui_element",arguments,depends_on=_deps("click_ui_element"),max_attempts=1))
+            previous_clause_end=len(actions)-1
             continue
         close_match=re.match(r"^(?:close|quit)\s+(.+)$",segment,re.I)
         if close_match:
@@ -156,7 +255,8 @@ def _segmented_plan(text: str,context:SessionContext) -> Plan | None:
             if target in {"it","the app"}:target=context.last_opened_app or next((a.args.get("app_name") for a in reversed(actions) if a.tool=="open_application"),None)
             target=APP_ALIASES.get(target,target)
             if not target:return None
-            actions.append(Action("close_application",{"app_name":target},depends_on=[len(actions)-1] if actions else [],risk=ActionRisk.CAUTION,verify="window_closed",max_attempts=1))
+            actions.append(Action("close_application",{"app_name":target},depends_on=_deps("close_application"),risk=ActionRisk.CAUTION,verify="window_closed",max_attempts=1))
+            previous_clause_end=len(actions)-1
             continue
         return None
     reference_ms=(time.perf_counter()-reference_started)*1000
