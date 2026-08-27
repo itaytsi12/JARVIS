@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from brain.context_resolver import observe_tool_result
+from brain.action_results import ReferenceError_, plan_has_references, resolve_arg_references, with_reference_dependencies
 from brain.execution_graph import build_waves, partition_wave, plan_is_chain
 from brain.executor import Executor
 from brain.models import Action, ActionRisk, Plan, PlanStatus, ToolResult
@@ -101,7 +102,11 @@ class AgentRuntime:
         # runs each wave's independent actions together and everything else
         # in order. `_all_actions_independent` plans are simply the case
         # where that produces a single all-parallel wave.
-        if not plan_is_chain(plan.actions):
+        # A chain that passes results between its actions also goes through
+        # the scheduler: it levels into single-action waves (so the order is
+        # identical to the sequential path) but gains reference resolution,
+        # which the sequential loop does not perform.
+        if not plan_is_chain(plan.actions) or plan_has_references(plan.actions):
             self._log("[PLAN] Scheduling by dependency graph")
             return self._execute_plan_scheduled(plan, cancellation_token, action_observer)
         while plan.current_action_index < len(plan.actions):
@@ -144,7 +149,7 @@ class AgentRuntime:
             plan.status = PlanStatus.COMPLETED
         return results
 
-    def _run_one_action(self, plan, index, action, cancellation_token, action_observer, plan_lock_held):
+    def _run_one_action(self, plan, index, action, cancellation_token, action_observer, plan_lock_held, results_by_index=None):
         """Execute a single action and fold its result into shared state.
 
         Shared by the sequential-within-a-wave path and the concurrent one,
@@ -155,6 +160,19 @@ class AgentRuntime:
         """
         if action_observer is not None:
             action_observer("prepared", index, action, None, self.context)
+        # Substitute any {"__from_result__": ...} argument with the field of
+        # the earlier result it names. A bad reference fails THIS action --
+        # attributed to the action that made it, never silently ignored.
+        try:
+            action = self._with_resolved_arguments(action, results_by_index)
+        except ReferenceError_ as exc:
+            result = ToolResult(False, action.tool, "Could not use the earlier result.", error=f"unresolved_reference: {exc}")
+            with self._context_lock:
+                self.context.previous_action = action.tool
+                self.context.previous_result = result.message
+            if action_observer is not None:
+                action_observer("result", index, action, result, self.context)
+            return result
         if cancellation_token is not None and cancellation_token.cancelled:
             result = ToolResult(False, action.tool, "Task cancelled.", error="cancelled")
         elif not may_auto_execute(action):
@@ -176,6 +194,21 @@ class AgentRuntime:
         if action_observer is not None:
             action_observer("result", index, action, result, self.context)
         return result
+
+    @staticmethod
+    def _with_resolved_arguments(action, results_by_index):
+        """A copy of `action` with its argument references substituted."""
+        if not results_by_index:
+            resolved = resolve_arg_references(action.args, {})
+        else:
+            resolved = resolve_arg_references(action.args, results_by_index)
+        if resolved == action.args:
+            return action
+        return Action(
+            tool=action.tool, args=resolved, depends_on=list(action.depends_on), optional=action.optional,
+            verify=action.verify, stop_condition=action.stop_condition, risk=action.risk,
+            sensitive_fields=set(action.sensitive_fields), max_attempts=action.max_attempts,
+        )
 
     def _execute_plan_scheduled(self, plan: Plan, cancellation_token=None, action_observer=None) -> list[ToolResult]:
         """Execute a plan by dependency wave instead of strictly in order.
@@ -202,6 +235,10 @@ class AgentRuntime:
         # RLock reentrancy is per-thread -- a worker thread re-acquiring it
         # would deadlock against its own plan. See _execute_plan_parallel's
         # original note; the same reasoning applies to every worker here.
+        # A reference to an earlier result is itself an ordering constraint,
+        # so a plan that references without declaring `depends_on` still runs
+        # in a correct order instead of reading a result that does not exist.
+        plan.actions = with_reference_dependencies(plan.actions)
         for wave in build_waves(plan.actions):
             if stop:
                 break
@@ -225,14 +262,14 @@ class AgentRuntime:
                 self._log(f"[PLAN] Running {len(parallel)} independent steps concurrently")
                 with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jarvis-parallel-action") as pool:
                     futures = {
-                        index: pool.submit(self._run_one_action, plan, index, plan.actions[index], cancellation_token, action_observer, True)
+                        index: pool.submit(self._run_one_action, plan, index, plan.actions[index], cancellation_token, action_observer, True, dict(results_by_index))
                         for index in parallel
                     }
                     for index, future in futures.items():
                         results_by_index[index] = future.result()
             for index in sequential:
                 results_by_index[index] = self._run_one_action(
-                    plan, index, plan.actions[index], cancellation_token, action_observer, True
+                    plan, index, plan.actions[index], cancellation_token, action_observer, True, results_by_index
                 )
             for index in sorted(results_by_index):
                 if index in plan.completed_actions:
