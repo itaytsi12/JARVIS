@@ -9,10 +9,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from brain.context_resolver import observe_tool_result
 from brain.executor import Executor
 from brain.models import Action, ActionRisk, Plan, PlanStatus, ToolResult
 from brain.safe_tools import CONTEXT_INDEPENDENT_TOOLS
 from brain.session_context import SessionContext
+from brain.task_planner import _BROWSER_CAPABLE_APPS
 from security.safety import may_auto_execute
 from tools.browser_agent import BrowserAgent, HumanActionRequired
 from tools.desktop_agent import click_control,focus_target,get_controls,type_into_control,type_into_notepad_native,wait_for_window
@@ -384,9 +386,17 @@ class AgentRuntime:
         return ToolResult(bool(raw.get("success")), tool, raw.get("message", ""), raw, raw.get("error"))
 
     def _update_context(self, action: Action, result: ToolResult) -> None:
+        # Generalized short-term context: records the command itself, any
+        # error, and any structured list-like result (file listing, test
+        # failures, ...) the same way regardless of which branch below
+        # (if any) also updates the older, tool-specific fields.
+        observe_tool_result(self.context, action.tool, action.args, result)
         if action.tool == "open_application":
             self.context.last_opened_app = self.context.active_app = action.args["app_name"]
             self.context.last_pid = result.data.get("pid")
+            self.context.record_app_event(action.args["app_name"], "opened")
+            if action.args["app_name"] in _BROWSER_CAPABLE_APPS:
+                self.context.browser_active=True;self.context.browser_updated_at=time.monotonic();self.context.record_app_event("browser","opened")
             if result.data.get("hwnd"):self._remember_app_window(action.args["app_name"],result.data["hwnd"])
             if self.memory:
                 self.memory.remember_entity("application", action.args["app_name"], self.session_id, pid=self.context.last_pid, hwnd=result.data.get("hwnd"), opened_by_jarvis=True)
@@ -394,17 +404,21 @@ class AgentRuntime:
             if self.context.active_app==action.args.get("app_name"):
                 self.context.active_app=None;self.context.last_hwnd=None;self.context.last_pid=None
             self.context.application_windows.pop(action.args.get("app_name"),None)
+            self.context.record_app_event(action.args.get("app_name"), "closed")
             if self.memory:
                 resolution=self.memory.resolve(action.args["app_name"],self.session_id,"application")
                 if resolution.status=="resolved":self.memory.update_entity(resolution.entity["id"],status="closed")
         elif action.tool in {"wait_for_window", "focus_application"}:
             self.context.last_hwnd = result.data.get("hwnd", self.context.last_hwnd)
             self.context.active_app = action.args.get("app_name", self.context.active_app)
+            if self.context.active_app:self.context.record_app_event(self.context.active_app, "focused")
             if result.data.get("hwnd"):self._remember_app_window(self.context.active_app,result.data["hwnd"])
         elif action.tool.startswith("browser_"):
             self.context.browser_active = True
             self.context.active_app = "browser"
             self.context.current_url = result.data.get("url")
+            self.context.browser_updated_at = time.monotonic()
+            self.context.record_app_event("browser", "opened" if action.tool == "browser_open_url" else "focused")
             if action.tool == "browser_open_url":
                 parsed = urlparse(action.args.get("url", ""))
                 query = parse_qs(parsed.query)
@@ -414,6 +428,7 @@ class AgentRuntime:
                     self.memory.remember_entity("search", self.context.last_search_query, self.session_id, provider=self.context.last_search_provider, url=result.data.get("url"))
         elif action.tool in {"create_text_file", "write_text_file", "verify_file", "save_active_document","open_path","read_text_file","rename_path","move_path"}:
             self.context.last_opened_file = result.data.get("path") or action.args.get("path") or action.args.get("destination")
+            self.context.last_opened_file_at = time.monotonic()
             if self.memory and action.tool in {"create_text_file", "write_text_file"}:
                 self.memory.remember_entity("file", Path(self.context.last_opened_file).name, self.session_id, path=self.context.last_opened_file)
         elif action.tool == "send_whatsapp_message":

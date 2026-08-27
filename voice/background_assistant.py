@@ -526,7 +526,7 @@ class AlwaysOnAssistant:
                 self._set_state(AssistantState.IDLE, "No command after wake phrase")
                 return
             self._set_state(AssistantState.EXECUTING)
-            from brain.agent import run_agent
+            from brain.agent import run_agent, agent_runtime
             from brain.router import route_command
             from .language_utils import detect_dominant_language
             from .response_formatter import format_spoken_response
@@ -538,8 +538,11 @@ class AlwaysOnAssistant:
             recorder.record(EventType.NORMALIZED_REQUEST, {"normalized_text": safe_command, "final_interpreted_command": safe_command}, interaction_id)
             self._perf("intent_started")
             question_pipeline_started = time.perf_counter()
-            from brain.agent import agent_runtime as _agent_runtime
-            route = route_command(command, _agent_runtime.context)
+            # Resolving references here (before run_agent bumps the turn for
+            # this command) still only ever sees PRIOR turns' entities --
+            # correct, since nothing from this command has been recorded yet.
+            # `agent_runtime` is already imported into this scope above.
+            route = route_command(command, context=agent_runtime.context)
             perf.mark("committed_transcript")
             if ledger is not None and ledger.has_fired_anything():
                 from brain.speculative_execution import reconcile_final_route, reconcile_local_plan_actions

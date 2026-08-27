@@ -229,4 +229,25 @@ def _describe_session(session_context: Any) -> str:
         value = getattr(session_context, attribute, None)
         if value:
             parts.append(f"- {label}: {value}")
+
+    # Section 15: explicit, structured follow-up context -- so a request
+    # like "fix the first one" doesn't require the model to re-derive what
+    # "the first one" was from a full transcript it doesn't have.
+    from brain.context_resolver import resolved_context_summary
+
+    summary = resolved_context_summary(session_context)
+    if summary.get("project_path"):
+        parts.append(f"- Current project: {summary['project_path']}")
+    if summary.get("previous_task_goal"):
+        parts.append(f"- Previous task ({summary.get('previous_task_status')}): {summary['previous_task_goal']}")
+        if summary.get("previous_task_result_summary"):
+            parts.append(f"- Previous task result: {summary['previous_task_result_summary']}")
+        if summary.get("previous_task_error"):
+            parts.append(f"- Previous task error: {summary['previous_task_error']}")
+    if summary.get("last_error"):
+        parts.append(f"- Last error ({summary.get('last_error_source')}): {summary['last_error']}")
+    result_set = summary.get("last_result_set")
+    if result_set:
+        items = "; ".join(result_set["items"])
+        parts.append(f"- Most recent {result_set['kind']} list (from {result_set['source']}): {items}")
     return "\n".join(parts)

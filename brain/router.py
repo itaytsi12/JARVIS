@@ -11,6 +11,7 @@ from brain.request_complexity import assess_complexity, looks_like_simple_target
 from brain.control_words import normalize_control_word
 from brain.conversational_context import resolve_explanatory_followup, resolve_browser_search_correction
 from providers.registry import agent_escalation_available
+from brain.context_router import route_with_context
 
 def looks_like_math(text: str) -> bool:
     math_pattern = r"^[\d\s\.\+\-\*\/\%\(\)]+$"
@@ -116,23 +117,71 @@ def route_command(command: str, context=None) -> dict:
     if text.rstrip(".?!,;:") == "continue":
         return {"type":"resume_interrupted_response"}
 
+    # -------------------------
+    # Conversational context resolution, in two layers that compose as a
+    # union rather than competing (both sides of the
+    # `conversational-context-agent` merge are kept deliberately):
+    #
+    #  1. The RESPONSE-TEXT resolvers (brain/conversational_context.py): a
+    #     generic explanatory follow-up ("What does that mean?", "Why?",
+    #     "Explain that.") resolved against `last_assistant_response`, and
+    #     a bare browser search correction ("Batman instead.", "change that
+    #     to Batman.").
+    #  2. The GENERALIZED structured resolver (brain/context_resolver.py +
+    #     brain/context_router.py): elliptical follow-ups ("close it",
+    #     "run it"), corrections ("no, I meant Telegram"), "do it again",
+    #     ordinal result references ("open the second one"), project opens,
+    #     search continuations and "why did that fail?". It keys off
+    #     STRUCTURED session state (last_task_id / last_error /
+    #     last_project_path / last_result_set).
+    #
+    # The two key off DISJOINT context fields, so almost nothing overlaps.
+    # The one phrase that does -- "what does that mean?" -- is given to
+    # layer 1 first, because the thing "that" refers to is literally the
+    # text JARVIS last said, which only layer 1 carries. Nothing is lost by
+    # that ordering: `brain/context_builder.py::_describe_session` injects
+    # `resolved_context_summary(...)` into the agent's system prompt on
+    # EVERY agent run, so layer 2's structured summary still reaches the
+    # model even when layer 1 chose the route. When there is no recent
+    # response text to explain, layer 1 returns None and layer 2 handles
+    # the same phrase from structured state instead.
+    #
+    # The bare browser correction runs LAST: layer 2's search-continuation
+    # pattern is the more specific of the two (it requires an explicit
+    # "search"/"search for" verb), so it gets first refusal, and layer 1
+    # then catches the verb-less forms and the reddit/github providers that
+    # layer 2 deliberately does not cover.
+    # -------------------------
+
     # Generic explanatory follow-ups ("What does that mean?", "Why?",
     # "Explain that.") resolve against the most relevant recent assistant
-    # output (brain/conversational_context.py) BEFORE anything else gets a
-    # chance to send them to the context-blind web-answer question route.
-    # Returns None (falls through to normal routing, eventually including
-    # ordinary QUESTION handling) whenever the phrase isn't one of these, or
-    # there is no real referent to resolve against.
+    # output BEFORE anything else gets a chance to send them to the
+    # context-blind web-answer question route. Returns None (falls through
+    # to normal routing, eventually including ordinary QUESTION handling)
+    # whenever the phrase isn't one of these, or there is no real referent
+    # to resolve against.
     contextual_question = resolve_explanatory_followup(command, context)
     if contextual_question is not None:
         return contextual_question
 
+    # Only attempted when a SessionContext was supplied -- every caller
+    # that doesn't pass one (most tests, brain/speculative_execution.py)
+    # keeps today's behavior unchanged, and a caller that DOES pass one
+    # falls straight through to every pattern below whenever nothing
+    # contextual matched.
+    if context is not None:
+        contextual_route = route_with_context(text, command, context)
+        if contextual_route is not None:
+            return contextual_route
+
     # A correction to an existing browser search ("Batman instead.", "Try
-    # Superman instead.", "Change that to Batman.") resolves deterministically
-    # to the same search-URL shape the original search used, with zero model
-    # calls, whenever session context has an active browser search to
-    # correct. Falls through (eventually to the agent runtime) for anything
-    # genuinely ambiguous -- see brain/conversational_context.py.
+    # Superman instead.", "Change that to Batman.") resolves
+    # deterministically to the same search-URL shape the original search
+    # used, with zero model calls, whenever session context has an active
+    # browser search to correct. Covers the bare (verb-less) forms and the
+    # reddit/github providers that layer 2's search-continuation pattern
+    # deliberately does not. Falls through (eventually to the agent
+    # runtime) for anything genuinely ambiguous.
     browser_correction = resolve_browser_search_correction(command, context)
     if browser_correction is not None:
         return browser_correction

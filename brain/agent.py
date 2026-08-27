@@ -13,11 +13,12 @@ from openai import OpenAI
 from brain.router import route_command
 from brain.tool_router import execute_tool
 from brain.tool_catalog import get_tool_catalog
+from brain.context_resolver import observe_tool_result
 from brain.planner import create_plan
 from brain.executor import Executor
 from brain.models import Action,ActionRisk,Plan,ToolResult
 from brain.agent_runtime import AgentRuntime
-from brain.task_planner import assess_plan_completeness,create_task_plan,should_use_task_planner,validate_goal_coverage
+from brain.task_planner import assess_plan_completeness,create_task_plan,should_use_task_planner,validate_goal_coverage,_BROWSER_CAPABLE_APPS
 from brain.plan_validator import RUNTIME_TOOLS,validate_generated_actions,validate_plan_preflight
 from memory import MemoryManager
 from training_data import EventType, get_recorder
@@ -67,6 +68,10 @@ def ask_ai(message: str) -> str:
 
 def run_agent(command: str, route: dict | None = None, interaction_id: str | None = None, original_user_text: str | None = None, cancellation_token=None, execution_outcome: dict | None = None, speculative_ledger=None, progress=None, on_answer_text=None) -> str:
     request_started = time.perf_counter()
+    # One "turn" per top-level user request -- see SessionContext/AppEvent
+    # and brain.context_resolver's docstring for why this (not wall-clock
+    # time) is the recency signal reference resolution relies on.
+    agent_runtime.context.bump_turn()
     recorder = get_recorder()
     created_interaction = interaction_id is None
     iid = interaction_id or recorder.begin(original_user_text or command, agent_runtime.session_id)
@@ -140,14 +145,25 @@ def _is_deterministic_music_route(route: dict | None) -> bool:
 
 
 #: `route_source` values `brain/router.py` sets ONLY on a route it already
-#: resolved by combining the current utterance with real session context
-#: (an explanatory follow-up's referent, a browser search correction, the
-#: task-vs-media priority guard). `should_use_task_planner(command)` below
-#: is a text-only heuristic on the ORIGINAL command that knows nothing about
-#: any of this -- without this guard it can re-capture a phrase like "Tell
-#: me more about that." (which starts with "tell", one of its own signals)
-#: and discard the already-correct contextual route in favor of inventing a
-#: new plan from scratch.
+#: resolved by combining the current utterance with real session context.
+#: Two families exist after the `conversational-context-agent` merge, and
+#: BOTH must be recognized here:
+#:
+#:  - the explicit names below, from `brain/conversational_context.py`'s
+#:    response-text resolvers and the task-vs-media priority guard;
+#:  - every `context_*` source from `brain/context_router.py`'s generalized
+#:    structured resolver (`context_correction`, `context_replay`,
+#:    `context_ordinal`, `context_pronoun`, `context_followup_reasoning`,
+#:    `context_search_continuation`, ...).
+#:
+#: `should_use_task_planner(command)` below is a text-only heuristic on the
+#: ORIGINAL command that knows nothing about any of this -- without this
+#: guard it can re-capture a phrase like "Tell me more about that." (which
+#: starts with "tell", one of its own signals) or a correction like "No, I
+#: meant Telegram." (which matches its bare-comma heuristic) and discard the
+#: already-correct contextual route in favor of inventing a new plan from
+#: scratch -- costing either a wasted cloud/agent call or "I couldn't create
+#: a safe local plan", exactly what this subsystem exists to prevent.
 _CONTEXT_RESOLVED_ROUTE_SOURCES = {
     "conversational_context",
     "conversational_context_browser_correction",
@@ -156,7 +172,12 @@ _CONTEXT_RESOLVED_ROUTE_SOURCES = {
 
 
 def _is_context_resolved_route(route: dict | None) -> bool:
-    return bool(route) and route.get("route_source") in _CONTEXT_RESOLVED_ROUTE_SOURCES
+    if not route:
+        return False
+    source = route.get("route_source")
+    if not isinstance(source, str):
+        return False
+    return source in _CONTEXT_RESOLVED_ROUTE_SOURCES or source.startswith("context_")
 
 
 def _active_agent_tasks():
@@ -293,7 +314,7 @@ def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, ca
 
 
 def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execution_meta: dict, cancellation_token=None,original_user_text: str | None=None,speculative_ledger=None,progress=None,on_answer_text=None) -> str:
-    control_types={"cancel_read_only_task","task_status","resume_interrupted_response","correct_interrupted_response","revise_whatsapp_recipient","remember","agent_task"}
+    control_types={"cancel_read_only_task","task_status","resume_interrupted_response","correct_interrupted_response","revise_whatsapp_recipient","remember","agent_task","clarification"}
     # The route is resolved BEFORE any planner decision, always.
     #
     # `should_use_task_planner(command)` is a text heuristic that knows
@@ -312,7 +333,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
     # behave identically: `voice/background_assistant.py` has always
     # routed before calling `run_agent`.
     if route is None:
-        route = _timed(execution_meta,"routing_ms",lambda: route_command(command, agent_runtime.context))
+        route = _timed(execution_meta,"routing_ms",lambda: route_command(command, context=agent_runtime.context))
     use_task_planner=(
         route.get("type") not in control_types
         and not _is_deterministic_music_route(route)
@@ -451,6 +472,24 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
     recorder.record(EventType.PLAN_CREATED, {"route_type": route["type"],"route_source":route_source,"model":route.get("model"),"model_calls":route.get("model_calls",0),"input_tokens":route.get("input_tokens",0),"output_tokens":route.get("output_tokens",0),"fallback_from":route.get("fallback_from",[]),"fallback_reason":route.get("fallback_reason"), "tool": route.get("tool"), "arguments": route_arguments}, iid)
     if route_source=="cloud_intent_router":
         recorder.record(EventType.REASONING_REQUEST,{"operation":"cloud_intent_router","model":route.get("model","gpt-5-mini"),"model_calls":route.get("model_calls",1),"input_tokens":route.get("input_tokens",0),"output_tokens":route.get("output_tokens",0),"fallback_reason":route.get("fallback_reason")},iid)
+    if isinstance(route_source,str) and route_source.startswith("context_"):
+        # Section 21: capture what the contextual resolver decided and why --
+        # original request, the resolution method, the resolved target, and
+        # (for a clarification) which candidates were considered. A
+        # local_plan route (search continuations) carries its resolved
+        # tool/arguments on the first action rather than at the top level.
+        resolved_tool=route.get("tool");resolved_args=route_arguments
+        if route["type"]=="local_plan" and route.get("actions"):
+            first_action=route["actions"][0];resolved_tool=first_action.tool;resolved_args=_safe_action_arguments(first_action)
+        recorder.record(EventType.RESOLVED_REFERENCES, {
+            "request": sanitize_user_request(command),
+            "resolution_method": route_source,
+            "resolved_tool": resolved_tool,
+            "resolved_arguments": resolved_args,
+            "resolved_goal": route.get("goal") if route["type"] == "agent_task" else None,
+            "clarification_needed": route["type"] == "clarification",
+            "clarification_message": route.get("message") if route["type"] == "clarification" else None,
+        }, iid)
 
     # -------------------------
     # Escalation to the agent runtime
@@ -468,6 +507,19 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         goal = route.get("task") or route.get("message") or original_user_text or command
         runtime_log.info("Escalating to agent runtime from route_type=%s", route["type"])
         return _run_agent_with_loop(goal, recorder, iid, execution_meta, cancellation_token, progress, on_answer_text)
+
+    if route["type"] == "clarification":
+        # A conversational reference resolved to more than one plausible
+        # candidate (brain/context_resolver.py) -- section 4/18: ask one
+        # concise question rather than guessing. Logged as AMBIGUOUS so the
+        # dataset distinguishes "JARVIS correctly refused to guess" from an
+        # ordinary failure.
+        recorder.record(EventType.TASK_BLOCKED, {"reason": "ambiguous_reference"}, iid)
+        execution_meta["success"] = False
+        execution_meta["verified"] = False
+        execution_meta["block_reason"] = "ambiguous_reference"
+        execution_meta["block_errors"] = ["ambiguous_reference"]
+        return route["message"]
 
     if route["type"] == "remember":
         # Explicit "remember that ..." -- a local, deterministic write to
@@ -685,6 +737,14 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         _record_action_results(recorder,iid,[action],[result],prepared,agent_runtime.context)
         execution_meta["success"]=result.success;execution_meta["verified"]=_results_verified([action],[result]);execution_meta["model_calls"]+=_result_model_calls([result])
         execution_meta["executed_actions"]=[action];execution_meta["executed_results"]=[result]
+        if action.tool not in SESSION_AWARE_SINGLE_TOOLS:
+            # SESSION_AWARE_SINGLE_TOOLS already went through agent_runtime.execute(),
+            # which records this same structured context itself.
+            observe_tool_result(agent_runtime.context, action.tool, action.args, result)
+        if route.get("corrects_previous") is not None:
+            recorder.correction(iid, route["corrects_previous"], action.args, successful=result.success)
+        if route.get("project_name") and result.success:
+            agent_runtime.context.record_project(route["project_name"], action.args.get("path"))
 
         if result.success:
             _remember_action(action, result)
@@ -1099,26 +1159,37 @@ def _remember_action(action: Action, result) -> None:
         context=agent_runtime.context
         if action.tool == "open_application":
             context.last_opened_app=context.active_app=action.args["app_name"];context.last_pid=data.get("pid");context.last_hwnd=data.get("hwnd")
+            context.record_app_event(action.args["app_name"],"opened")
+            if action.args["app_name"] in _BROWSER_CAPABLE_APPS:
+                # Opening Chrome/Edge itself (not just a subsequent
+                # browser_*/open_website action) makes it the CURRENT
+                # browser for a bare follow-up search -- section 9's "Open
+                # Chrome." -> "Search for flights to Milan." example.
+                context.browser_active=True;context.browser_updated_at=time.monotonic();context.record_app_event("browser","opened")
             memory_manager.remember_entity("application", action.args["app_name"], agent_runtime.session_id, pid=data.get("pid"), hwnd=data.get("hwnd"), opened_by_jarvis=True)
         elif action.tool == "open_task_manager":
             context.last_opened_app=context.active_app="task manager";context.last_pid=data.get("pid");context.last_hwnd=data.get("hwnd")
+            context.record_app_event("task manager","opened")
             if data.get("hwnd"):context.application_windows["task manager"]=int(data["hwnd"])
             memory_manager.remember_entity("application","task manager",agent_runtime.session_id,pid=data.get("pid"),hwnd=data.get("hwnd"),opened_by_jarvis=True)
         elif action.tool == "open_website":
             url = action.args["url"]
             context.browser_active=True;context.current_url=url;context.active_app="browser";context.last_pid=data.get("pid");context.last_hwnd=data.get("hwnd")
+            context.browser_updated_at=time.monotonic();context.record_app_event("browser","opened")
             if data.get("hwnd"):context.application_windows["browser"]=int(data["hwnd"])
             memory_manager.remember_entity("website", urlparse(url).netloc or url, agent_runtime.session_id, url=url)
             query = (parse_qs(urlparse(url).query).get("search_query") or parse_qs(urlparse(url).query).get("q") or [None])[0]
             if query:
                 provider = "youtube" if "youtube" in url else "google" if "google" in url else None
+                context.last_search_query=query;context.last_search_provider=provider
                 memory_manager.remember_entity("search", query, agent_runtime.session_id, provider=provider, url=url)
         elif action.tool == "close_application":
             if context.active_app==action.args["app_name"]:context.active_app=None
+            context.record_app_event(action.args["app_name"],"closed")
             resolution = memory_manager.resolve(action.args["app_name"], agent_runtime.session_id, "application")
             if resolution.status == "resolved": memory_manager.update_entity(resolution.entity["id"], status="closed")
         elif action.tool in {"create_text_file","write_text_file","open_path","rename_path","move_path","copy_path"} and data.get("path"):
-            context.last_opened_file=data["path"]
+            context.last_opened_file=data["path"];context.last_opened_file_at=time.monotonic()
     except Exception:
         # Memory must never turn a successful user action into a failed action.
         pass

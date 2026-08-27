@@ -96,13 +96,22 @@ class SequenceA_ExplanatoryFollowupUsesRealContext(unittest.TestCase):
         self.assertTrue(second_answer)
 
     def test_followup_with_no_prior_context_still_answers_as_an_ordinary_question(self):
-        from brain.agent import agent_runtime, run_agent
-
-        agent_runtime.context.last_assistant_response = None
-        agent_runtime.context.last_spoken_response = None
         from brain.router import route_command
 
-        route = route_command("What does that mean?", agent_runtime.context)
+        # A genuinely empty context, not the process-wide
+        # `agent_runtime.context` with two fields nulled out.
+        #
+        # "No prior context" now means more than "no previous response
+        # text": `brain/context_router.py`'s generalized resolver also
+        # treats a recorded task, a recent error, an open project and a
+        # recent result set as context worth resolving against, and the
+        # shared runtime context still carries all of those from whatever
+        # ran before this test. Nulling only `last_assistant_response` /
+        # `last_spoken_response` therefore no longer describes the state
+        # this test is about -- and asserting on a polluted singleton would
+        # make the result depend on test execution order. A fresh
+        # `SessionContext` states the precondition exactly.
+        route = route_command("What does that mean?", SessionContext())
         self.assertEqual(route["type"], "question")
 
 

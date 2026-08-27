@@ -234,11 +234,20 @@ def run_agent_task(
             tool_specs=specs,
             cancellation_token=cancellation_token,
             task=task,
+            session_context=session_context,
         )
 
     if record_turns and run.answer:
         memory.record_assistant(run.answer, task_id=task_id)
     written = memory.observe_exchange(goal, run.answer, task_id=task_id, record_turns=False)
+
+    if session_context is not None:
+        # Section 11/15: "why did that fail?", "continue it", "fix the
+        # first one" resolve against THIS afterward -- the task's own
+        # id/goal/status/result, not a re-derivation from the transcript.
+        status = "completed" if run.success else "failed"
+        error_text = "; ".join(run.errors[-3:]) if run.errors and not run.success else None
+        session_context.record_task(task_id, goal, status, result_summary=(run.answer or "")[:400], error=error_text)
 
     episode = Episode(
         episode_id=uuid.uuid4().hex,
