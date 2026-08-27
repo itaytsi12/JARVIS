@@ -73,10 +73,19 @@ def _safe_error_reason(exc: Exception) -> str:
 def is_configured() -> bool:
     """Whether ElevenLabs realtime STT is both configured AND its client
     library is installed -- checked cheaply, no network call, no credits
-    spent (Part Q's startup validation contract)."""
+    spent (Part Q's startup validation contract).
+
+    Also false once this session has already seen a definite quota/funds
+    failure from this provider (`voice/provider_health.py`) -- callers then
+    skip straight to Whisper instead of paying a doomed connect attempt on
+    every command.
+    """
     if not _env_flag("ELEVENLABS_STT_ENABLED", "true"):
         return False
     if os.getenv("STT_PROVIDER", "elevenlabs").strip().lower() != "elevenlabs":
+        return False
+    from voice.provider_health import get_provider_health
+    if not get_provider_health("elevenlabs_stt").available:
         return False
     return bool(os.getenv("ELEVENLABS_API_KEY")) and _WEBSOCKET_AVAILABLE
 

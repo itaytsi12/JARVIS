@@ -130,6 +130,40 @@ def active_interactive_task_summary():
         action_count=sum(not token.cancelled for token in _INTERACTIVE_TOKENS.values())
     return {"read_only_tasks":scheduled,"interactive_action_count":action_count,"total":len(scheduled)+action_count}
 
+def any_active_interactive_work() -> bool:
+    """Is JARVIS actively working on or speaking a response right now?
+
+    This is `brain/router.py`'s task-priority guard: an ambiguous command
+    like bare "pause" must resolve to the active JARVIS task instead of a
+    media control, but only while there genuinely IS one. Combines every
+    signal that answers that -- read-only tasks/questions (this module),
+    agent tasks (`tasks/manager.py`, imported lazily the same way
+    `brain/agent.py::_active_agent_tasks` already does, so this module
+    never takes a hard dependency on the newer `tasks` package), and
+    whether JARVIS is currently speaking (`brain/activity_state.py`, set by
+    the voice layer). Never raises -- a broken status lookup must not block
+    an ordinary command from routing.
+    """
+    try:
+        if active_interactive_task_summary()["total"] > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        from tasks.manager import get_task_manager
+        from tasks.models import TaskStatus
+        if any(task.status is TaskStatus.RUNNING for task in get_task_manager().active()):
+            return True
+    except Exception:
+        pass
+    try:
+        from brain.activity_state import is_speaking
+        if is_speaking():
+            return True
+    except Exception:
+        pass
+    return False
+
 @dataclass
 class ProposedStep:
     kind:str

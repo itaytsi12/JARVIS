@@ -19,7 +19,10 @@ import os
 import threading
 from typing import Callable, Optional
 
+from voice.provider_health import get_provider_health
+
 _API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
+_HEALTH_NAME = "elevenlabs_tts"
 
 _PLAYBACK_LOCK = threading.Lock()
 _STOP_EVENT = threading.Event()
@@ -36,6 +39,11 @@ def _sample_rate() -> int:
 
 def is_available() -> bool:
     if os.getenv("ELEVENLABS_TTS_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    # A known non-transient failure (quota/insufficient funds) this
+    # session -- see voice/provider_health.py -- skips straight past this
+    # provider instead of retrying a doomed request on every command.
+    if not get_provider_health(_HEALTH_NAME).available:
         return False
     return bool(os.getenv("ELEVENLABS_API_KEY")) and bool(os.getenv("ELEVENLABS_VOICE_ID"))
 
@@ -100,6 +108,18 @@ def speak(text: str, lang: Optional[str] = None, on_first_audio_chunk: Optional[
     `voice/text_to_speech.py` can fall back to the next provider."""
     if not text:
         return
+    try:
+        _speak_impl(text, on_first_audio_chunk)
+    except Exception as exc:
+        # Only a known non-transient error (quota/funds -- see
+        # voice/provider_health.py) marks the provider unavailable; an
+        # ordinary transient failure is left alone so it can be retried
+        # next time exactly as before this health tracking existed.
+        get_provider_health(_HEALTH_NAME).note_result(exc)
+        raise
+
+
+def _speak_impl(text: str, on_first_audio_chunk: Optional[Callable[[], None]] = None) -> None:
     import numpy as np
     import sounddevice as sd
 

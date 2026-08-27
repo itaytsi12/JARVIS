@@ -1,0 +1,162 @@
+{
+  "tag": "after2",
+  "recorded_at": "2026-08-20T21:40:01",
+  "tools": {
+    "list_files": {
+      "first_ms": 1878.0,
+      "warm_ms": 0.4,
+      "observation_chars": 1151
+    },
+    "inspect_project": {
+      "first_ms": 182.4,
+      "warm_ms": 182.4,
+      "observation_chars": 1765
+    },
+    "read_text_file": {
+      "first_ms": 1.2,
+      "warm_ms": 0.7,
+      "observation_chars": 5027
+    },
+    "search_code": {
+      "first_ms": 1761.8,
+      "warm_ms": 1761.8,
+      "observation_chars": 334
+    }
+  },
+  "context": {
+    "files": {
+      "skills": [
+        "files",
+        "coding"
+      ],
+      "effort": "medium",
+      "tool_schemas_selected": 22,
+      "tool_schemas_available": 49,
+      "tool_schema_chars": 6510,
+      "system_prompt_chars": 4517,
+      "memory_retrieval_ms": 12.4,
+      "first_call_input_tokens_estimate": 2785
+    },
+    "git": {
+      "skills": [
+        "coding"
+      ],
+      "effort": "medium",
+      "tool_schemas_selected": 22,
+      "tool_schemas_available": 49,
+      "tool_schema_chars": 6510,
+      "system_prompt_chars": 3793,
+      "memory_retrieval_ms": 9.1,
+      "first_call_input_tokens_estimate": 2597
+    },
+    "architecture": {
+      "skills": [
+        "coding",
+        "research"
+      ],
+      "effort": "medium",
+      "tool_schemas_selected": 31,
+      "tool_schemas_available": 49,
+      "tool_schema_chars": 8652,
+      "system_prompt_chars": 4316,
+      "memory_retrieval_ms": 11.1,
+      "first_call_input_tokens_estimate": 3267
+    }
+  },
+  "live": {
+    "files": {
+      "total_ms": 22812,
+      "model_calls": 6,
+      "agent_steps": 6,
+      "tools": [
+        "inspect_project",
+        "list_files",
+        "list_files",
+        "list_files",
+        "inspect_project",
+        "list_files"
+      ],
+      "input_tokens": 120,
+      "output_tokens": 977,
+      "cache_creation_tokens": 4413,
+      "cache_read_tokens": 33514,
+      "cost_usd": 0.04161795,
+      "effort": "medium",
+      "context_chars": 4778,
+      "selected_tool_count": 22,
+      "available_tool_count": 49,
+      "parallel_tool_batches": 1,
+      "parallel_saved_ms": 0,
+      "time_to_first_tool_ms": 3351,
+      "model_first_event_ms": 10139,
+      "time_to_first_speech_ms": 5488,
+      "time_to_first_answer_token_ms": 12273,
+      "progress_lines": 2,
+      "answer_chunks": 18,
+      "success": true,
+      "verified": true
+    },
+    "git": {
+      "total_ms": 40000,
+      "model_calls": 5,
+      "agent_steps": 4,
+      "tools": [
+        "run_command",
+        "find_file",
+        "list_files",
+        "run_command"
+      ],
+      "input_tokens": 110,
+      "output_tokens": 610,
+      "cache_creation_tokens": 10587,
+      "cache_read_tokens": 26217,
+      "cost_usd": 0.05704635,
+      "effort": "medium",
+      "context_chars": 4530,
+      "selected_tool_count": 22,
+      "available_tool_count": 49,
+      "parallel_tool_batches": 0,
+      "parallel_saved_ms": 0,
+      "time_to_first_tool_ms": 2097,
+      "model_first_event_ms": 33077,
+      "time_to_first_speech_ms": 31773,
+      "time_to_first_answer_token_ms": 33115,
+      "progress_lines": 1,
+      "answer_chunks": 7,
+      "success": true,
+      "verified": true
+    },
+    "architecture": {
+      "total_ms": 51178,
+      "model_calls": 6,
+      "agent_steps": 6,
+      "tools": [
+        "inspect_project",
+        "find_file",
+        "list_files",
+        "inspect_project",
+        "read_code",
+        "read_text_file"
+      ],
+      "input_tokens": 114,
+      "output_tokens": 1165,
+      "cache_creation_tokens": 14753,
+      "cache_read_tokens": 41262,
+      "cost_usd": 0.08551935,
+      "effort": "medium",
+      "context_chars": 5588,
+      "selected_tool_count": 31,
+      "available_tool_count": 49,
+      "parallel_tool_batches": 1,
+      "parallel_saved_ms": 0,
+      "time_to_first_tool_ms": 2510,
+      "model_first_event_ms": 38807,
+      "time_to_first_speech_ms": 33545,
+      "time_to_first_answer_token_ms": 38846,
+      "progress_lines": 2,
+      "answer_chunks": 11,
+      "success": true,
+      "verified": true
+    }
+  }
+}

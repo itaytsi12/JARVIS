@@ -98,7 +98,7 @@ def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
 
 	Returns the recognized text (empty string on no speech).
 	"""
-	from .voice_language import get_voice_language, stt_language_code
+	from .voice_language import detect_input_language, expected_input_languages, get_voice_language, stt_language_code
 
 	model = _get_model(model_size)
 	voice_language = get_voice_language()
@@ -137,7 +137,45 @@ def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
 		if text:
 			texts.append(text)
 
-	return " ".join(texts).strip()
+	text = " ".join(texts).strip()
+
+	# Whisper's own unconstrained auto-detect (`language=None`, used
+	# whenever more than one language is expected) picks from its full
+	# ~100-language vocabulary, not just the languages JARVIS is actually
+	# configured to recognize -- confirmed live: plain English commands
+	# committed as Dutch, and "stop" committed as Russian. JARVIS has no
+	# route for any language outside `expected_input_languages`, so
+	# accepting that text is never useful even when the detection happens
+	# to be technically correct. Re-transcribing once, constrained to
+	# whichever of the configured candidates the mistranscribed text looks
+	# more like (script-based, via the same Hebrew-block check
+	# `voice_language.py` already uses -- no cloud LLM call), is cheap and
+	# strictly better than keeping text no local route can ever match. Only
+	# applies when the language was genuinely unconstrained (`whisper_language
+	# is None`); a forced single-language mode is never second-guessed.
+	detected_language = getattr(info, "language", None)
+	expected = expected_input_languages(voice_language)
+	if whisper_language is None and text and isinstance(detected_language, str) and detected_language and detected_language not in expected:
+		fallback_language = "he" if detect_input_language(text) == "he" and "he" in expected else "en"
+		log.info(
+			"[STT] whisper_fallback implausible_detected_language=%s (expected one of %s); re-transcribing constrained to %s",
+			detected_language, expected, fallback_language,
+		)
+		retry_segments, _retry_info = model.transcribe(
+			path,
+			language=fallback_language,
+			task="transcribe",
+			initial_prompt=_ENGLISH_INITIAL_PROMPT if fallback_language == "en" else None,
+			beam_size=5,
+			temperature=0.0,
+			vad_filter=True,
+			condition_on_previous_text=False,
+		)
+		retried_text = " ".join(segment.text.strip() for segment in retry_segments if segment.text.strip()).strip()
+		if retried_text:
+			text = retried_text
+
+	return text
 
 
 def is_available() -> bool:

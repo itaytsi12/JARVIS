@@ -113,6 +113,8 @@ class AlwaysOnAssistant:
         self.state = state
         self.status_detail = detail or state.value.title()
         self.log.info("State: %s%s", state.value, f" - {detail}" if detail else "")
+        from brain.activity_state import set_speaking
+        set_speaking(state is AssistantState.SPEAKING)
         if self.state_callback:
             try:
                 self.state_callback(state, detail)
@@ -536,7 +538,8 @@ class AlwaysOnAssistant:
             recorder.record(EventType.NORMALIZED_REQUEST, {"normalized_text": safe_command, "final_interpreted_command": safe_command}, interaction_id)
             self._perf("intent_started")
             question_pipeline_started = time.perf_counter()
-            route = route_command(command)
+            from brain.agent import agent_runtime as _agent_runtime
+            route = route_command(command, _agent_runtime.context)
             perf.mark("committed_transcript")
             if ledger is not None and ledger.has_fired_anything():
                 from brain.speculative_execution import reconcile_final_route, reconcile_local_plan_actions
@@ -570,6 +573,16 @@ class AlwaysOnAssistant:
             if route.get("type") == "question":
                 self._start_question_task(command, route, interaction_id, transcript, question_pipeline_started)
                 return
+            if route.get("type") == "contextual_question" and not self._is_agent_route(route):
+                # No agent provider available -- brain/agent.py's
+                # `_run_agent_impl` falls back to the same cancellable
+                # web-answer path an ordinary "question" gets (with the
+                # resolved context folded into the query), so dispatch it
+                # the same way here too instead of letting it fall through
+                # to the synchronous default path below and block the
+                # microphone.
+                self._start_question_task(command, route, interaction_id, transcript, question_pipeline_started)
+                return
             if route.get("type") == "start_learning":
                 self._start_learning_task(interaction_id)
                 return
@@ -592,6 +605,7 @@ class AlwaysOnAssistant:
                 # registers a token, so the user can still speak -- and can say
                 # "cancel" -- while it works.
                 self.log.info("Dispatching to the agent runtime off the capture thread: route=%s", route.get("type"))
+                perf.mark("agent_dispatched")
                 if not self.muted:
                     from .response_formatter import generic_acknowledgement
                     from .voice_language import resolve_utterance_language
@@ -599,7 +613,7 @@ class AlwaysOnAssistant:
                         self._start_speech_task(generic_acknowledgement(), "en", None)
                     else:
                         self._start_speech_task("I'll work on that, sir.", "en", None)
-                self._start_cancellable_action_task(command,route,interaction_id,transcript)
+                self._start_cancellable_action_task(command,route,interaction_id,transcript,narrate=True)
                 return
             needs_planning = self._command_needs_planning(command, route)
             # Bilingual voice UX: VOICE_LANGUAGE (auto/en/he) controls STT
@@ -693,12 +707,12 @@ class AlwaysOnAssistant:
                     self._set_state(AssistantState.SPEAKING)
                     from brain.agent import agent_runtime
                     agent_runtime.context.interrupted_response=spoken
-                    from .text_to_speech import speak
+                    from .speech_coordinator import get_speech_coordinator
                     from .speech_journal import begin_speech,finish_speech
                     speech_journal=begin_speech(lang,len(spoken),interaction_id)
                     tts_start_ms=(time.perf_counter()-question_pipeline_started)*1000
                     self.log.info("Question performance: intent_classification_ms=%.1f tts_start_ms=%.1f",route.get("intent_classification_ms",0.0),tts_start_ms)
-                    try:speech_result=speak(spoken,lang=lang)
+                    try:speech_result=get_speech_coordinator().speak(spoken,lang=lang)
                     except Exception as exc:finish_speech(speech_journal,error=exc);raise
                     finish_speech(speech_journal,speech_result)
                     if not isinstance(speech_result,dict) or speech_result.get("success"):
@@ -713,16 +727,18 @@ class AlwaysOnAssistant:
         with self._question_threads_lock:self._question_threads.add(thread)
         thread.start()
 
-    def _start_speech_task(self,spoken,lang,interaction_id=None) -> None:
+    def _start_speech_task(self,spoken,lang,interaction_id=None,priority=None) -> None:
+        from .speech_coordinator import PRIORITY_STATUS
+        if priority is None:priority=PRIORITY_STATUS
         def work():
             try:
                 from brain.agent import agent_runtime
                 agent_runtime.context.interrupted_response=spoken
                 self._set_state(AssistantState.SPEAKING)
-                from .text_to_speech import speak
+                from .speech_coordinator import get_speech_coordinator
                 from .speech_journal import begin_speech,finish_speech
                 speech_journal=begin_speech(lang,len(spoken),interaction_id)
-                try:speech_result=speak(spoken,lang=lang)
+                try:speech_result=get_speech_coordinator().speak(spoken,lang=lang,priority=priority)
                 except Exception as exc:finish_speech(speech_journal,error=exc);raise
                 finish_speech(speech_journal,speech_result)
                 if not isinstance(speech_result,dict) or speech_result.get("success"):
@@ -741,32 +757,81 @@ class AlwaysOnAssistant:
         "local routing could not resolve this" routes at a moment when a
         provider is genuinely configured. With no API key this is always
         False, so the voice path is byte-for-byte unchanged.
+
+        `contextual_question` (brain/conversational_context.py's resolved
+        explanatory follow-up) is included alongside `plan`/`ai`: like
+        them, `_run_agent_impl` conditionally escalates it to
+        `_run_agent_with_loop` only when a provider is available. Without
+        this, a follow-up like "What does that mean?" would run the whole
+        agent turn SYNCHRONOUSLY on this capture thread instead of through
+        the off-thread, cancellable, narrated dispatch every other agent
+        turn gets -- blocking the microphone for as long as the model
+        takes to answer.
         """
         route_type = (route or {}).get("type")
         if route_type == "agent_task":
             return True
-        if route_type not in {"plan", "ai"}:
+        if route_type not in {"plan", "ai", "contextual_question"}:
             return False
         from brain.agent import _agent_escalation_available
 
         return _agent_escalation_available()
 
-    def _start_cancellable_action_task(self,command,route,interaction_id,transcript):
+    def _start_cancellable_action_task(self,command,route,interaction_id,transcript,narrate=False):
+        """Run a long action off the capture thread.
+
+        `narrate=True` (agent routes) additionally speaks REAL progress while
+        the agent works and streams the final answer sentence by sentence, so
+        a minute-long task is not a minute of silence. Both are dispatched on
+        their own speech threads and never block the agent -- see
+        `voice/agent_narration.py`."""
         def work():
             from brain.task_supervisor import CancellationToken,register_interactive_task,unregister_interactive_task
             token=CancellationToken();task_id=register_interactive_task(token)
+            narrator=None;stream=None
             try:
                 from brain.agent import run_agent
                 execution_outcome = {}
-                response=run_agent(command,route=route,interaction_id=interaction_id,original_user_text=transcript,cancellation_token=token,execution_outcome=execution_outcome)
-                if token.cancelled or self._stop.is_set():return
+                if narrate and not self.muted:
+                    from .agent_narration import AgentNarrator
+                    from .speech_coordinator import PRIORITY_STATUS,PRIORITY_FINAL
+                    narrator=AgentNarrator(
+                        speak=lambda text: self._start_speech_task(text,"en",None,priority=PRIORITY_STATUS),
+                        speak_final=lambda text: self._start_speech_task(text,"en",None,priority=PRIORITY_FINAL),
+                    )
+                    stream=narrator.answer_stream()
+                    # Fills a long gap while the model reasons between tools.
+                    # Runs on its own thread; the agent never waits for it.
+                    narrator.start_heartbeat()
+                response=run_agent(
+                    command,route=route,interaction_id=interaction_id,original_user_text=transcript,
+                    cancellation_token=token,execution_outcome=execution_outcome,
+                    progress=None if narrator is None else narrator.on_event,
+                    on_answer_text=None if stream is None else stream.feed,
+                )
+                if token.cancelled or self._stop.is_set():
+                    if stream is not None:stream.discard()
+                    return
                 text=str(response);lang="en"
                 from .response_formatter import format_spoken_response
                 spoken=format_spoken_response(command,route,text,lang=lang,execution=execution_outcome)
                 self.log.info("Formatter result / final spoken response: %s",_redact_for_log(spoken))
-                if spoken:self._start_speech_task(spoken,lang,interaction_id)
+                if stream is not None and stream.has_spoken:
+                    # The answer was already streamed sentence by sentence as
+                    # the model produced it. Speaking `spoken` now would say
+                    # the whole thing a second time; flush whatever is still
+                    # buffered instead so nothing is lost.
+                    stream.flush()
+                    self.log.info("Final answer was streamed in %d chunk(s); not repeated",len(stream.spoken_chunks))
+                    return
+                if stream is not None:stream.discard()
+                if spoken:
+                    from .speech_coordinator import PRIORITY_FINAL
+                    self._start_speech_task(spoken,lang,interaction_id,priority=PRIORITY_FINAL)
             except Exception:self.log.exception("Cancellable action task failed")
-            finally:unregister_interactive_task(task_id)
+            finally:
+                if narrator is not None:narrator.stop()
+                unregister_interactive_task(task_id)
         threading.Thread(target=work,name="jarvis-interactive-action",daemon=True).start()
 
     def _start_learning_task(self, interaction_id=None) -> None:

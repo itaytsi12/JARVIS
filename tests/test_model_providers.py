@@ -140,7 +140,13 @@ class RequestTranslationTests(unittest.TestCase):
             tools=[ToolSpec("get_time", "the time", {"type": "object", "properties": {}, "required": []})],
         )
         request = client.requests[0]
-        self.assertEqual(request["system"], "be brief")
+        # The system prompt is sent as a content-block list so it can carry a
+        # prompt-cache breakpoint: it and the tool schemas are byte-identical
+        # on every step of a run, and were previously re-billed in full each
+        # time. The text itself is unchanged.
+        self.assertEqual(request["system"], [
+            {"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}
+        ])
         self.assertEqual(request["tools"][0]["name"], "get_time")
         self.assertIn("input_schema", request["tools"][0])
         self.assertEqual(request["model"], "claude-opus-5")

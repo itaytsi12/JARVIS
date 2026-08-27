@@ -58,7 +58,13 @@ class ScriptedProvider:
         temperature: float | None = None,
         timeout: float | None = None,
         model: str | None = None,
+        **kwargs: Any,
     ) -> ModelResponse:
+        # `effort`, `cache` and `on_text` are HINTS in the
+        # `providers.base.ModelProvider` contract: a provider whose backend
+        # has no equivalent ignores them and behaves exactly as before.
+        # Accepting them here is what lets this scripted provider stand in
+        # for a real one in the agent-loop tests.
         self.calls.append(
             {
                 "messages": list(messages),

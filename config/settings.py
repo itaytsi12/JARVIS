@@ -108,6 +108,16 @@ class JarvisConfig:
 
     # ---- agent loop safety limits -----------------------------------
     max_agent_steps: int = field(default_factory=lambda: _int("JARVIS_MAX_AGENT_STEPS", 25))
+    #: How many independent READ-ONLY tools the agent loop may run at once
+    #: (`brain/agent_loop.py::_parallel_safe`). Only read-only tools with no
+    #: exclusive resource are ever eligible, so this bounds concurrency, not
+    #: safety. 1 disables batching without changing any other behaviour.
+    max_parallel_tools: int = field(default_factory=lambda: _int("JARVIS_MAX_PARALLEL_TOOLS", 4))
+    #: `output_config.effort` for an ordinary interactive agent turn. The API
+    #: default is "high"; `brain/agent_service.py::select_effort` raises it
+    #: back to "high" for tasks that genuinely need the depth.
+    agent_effort: str = field(default_factory=lambda: _text("JARVIS_AGENT_EFFORT", "medium"))
+    agent_effort_complex: str = field(default_factory=lambda: _text("JARVIS_AGENT_EFFORT_COMPLEX", "high"))
     max_action_retries: int = field(default_factory=lambda: _int("JARVIS_MAX_ACTION_RETRIES", 2))
     max_consecutive_failures: int = field(default_factory=lambda: _int("JARVIS_MAX_CONSECUTIVE_FAILURES", 4))
     agent_task_timeout: float = field(default_factory=lambda: _float("JARVIS_AGENT_TASK_TIMEOUT", 900.0))

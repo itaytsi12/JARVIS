@@ -41,6 +41,30 @@ from providers.base import (
 log = logging.getLogger("jarvis.providers.anthropic")
 
 
+CACHE_CONTROL: dict[str, Any] = {"type": "ephemeral"}
+
+
+def _mark_cache_breakpoint(payload: list[dict[str, Any]]) -> None:
+    """Put a rolling cache breakpoint on the last content block.
+
+    Caching is a PREFIX match rendered in the order `tools` -> `system` ->
+    `messages`, so a breakpoint here caches the entire conversation so far.
+    In an agent loop that is exactly the part that keeps being re-sent: every
+    step resends every previous observation, so by step four the same tokens
+    have been billed four times.
+
+    Only the LAST block is marked (one breakpoint, re-placed each turn),
+    which stays well inside the API's 4-breakpoint limit however long the run
+    gets. A block that is not a dict -- a plain string message -- cannot
+    carry `cache_control`, so it is left alone rather than restructured.
+    """
+    if not payload:
+        return
+    content = payload[-1].get("content")
+    if isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1] = {**content[-1], "cache_control": CACHE_CONTROL}
+
+
 def _to_api_messages(messages: list[Message]) -> list[dict[str, Any]]:
     """Translate JARVIS messages into Anthropic Messages API content blocks."""
     payload: list[dict[str, Any]] = []
@@ -152,25 +176,84 @@ class AnthropicProvider:
         temperature: float | None = None,
         timeout: float | None = None,
         model: str | None = None,
+        effort: str | None = None,
+        cache: bool = True,
+        on_text: Any = None,
     ) -> ModelResponse:
         config = get_config()
         client = self._get_client()
         model_id = model or self.model
+        api_messages = _to_api_messages(messages)
         request: dict[str, Any] = {
             "model": model_id,
             "max_tokens": max_tokens or config.agent_max_tokens,
-            "messages": _to_api_messages(messages),
+            "messages": api_messages,
         }
-        if system:
-            request["system"] = system
         if tools:
             request["tools"] = [spec.to_dict() for spec in tools]
+        if system:
+            # Prompt caching. The prefix is rendered `tools` -> `system` ->
+            # `messages`, so ONE breakpoint at the end of `system` caches the
+            # tool schemas AND the system prompt together -- the two parts
+            # that are byte-identical on every step of a run (and across
+            # runs), and that were previously re-billed at full price every
+            # time. The system prompt must become a content-block list for
+            # `cache_control` to have anywhere to live.
+            if cache:
+                request["system"] = [{"type": "text", "text": system, "cache_control": CACHE_CONTROL}]
+            else:
+                request["system"] = system
+        if cache:
+            _mark_cache_breakpoint(api_messages)
+        if effort:
+            # `output_config.effort` (GA, not a top-level parameter) controls
+            # how much thinking and total token spend a turn gets. The API
+            # default is "high"; a routine read-only step does not need it,
+            # and a genuinely hard one still asks for it -- see
+            # `brain/agent_service.py::select_effort`.
+            request["output_config"] = {"effort": effort}
         if timeout is not None and hasattr(client, "with_options"):
             client = client.with_options(timeout=timeout)
 
         started = time.perf_counter()
+        first_event_ms: float | None = None
         try:
-            response = client.messages.create(**request)
+            if on_text is None:
+                response = client.messages.create(**request)
+            else:
+                # Streaming, used ONLY when the caller wants text as it is
+                # produced (the final spoken answer). `get_final_message()`
+                # returns the same Message object the non-streaming call
+                # would have, so everything below is identical -- streaming
+                # changes when text arrives, never what the run concludes.
+                #
+                # `on_text` receives PUBLIC assistant text only. Thinking
+                # blocks and tool-call payloads are deliberately not
+                # forwarded: `text` events fire for `text` content blocks,
+                # and `input_json` / `thinking` events are simply not
+                # subscribed to here.
+                tool_use_started = False
+                with client.messages.stream(**request) as stream:
+                    for event in stream:
+                        event_type = getattr(event, "type", None)
+                        if event_type == "content_block_start":
+                            block = getattr(event, "content_block", None)
+                            if getattr(block, "type", None) == "tool_use":
+                                # This turn is an ACTION, not an answer.
+                                # Stop forwarding text: everything after
+                                # this point is tool-call payload, and
+                                # anything before it was a preamble the
+                                # caller must not treat as the answer.
+                                tool_use_started = True
+                            continue
+                        if event_type != "text" or tool_use_started:
+                            continue
+                        if first_event_ms is None:
+                            first_event_ms = (time.perf_counter() - started) * 1000
+                        chunk = getattr(event, "text", "") or ""
+                        if chunk:
+                            on_text(chunk)
+                    response = stream.get_final_message()
         except Exception as exc:  # translated below; never leaked raw
             _log_provider_failure(exc, model_id)
             raise _translate_error(exc) from exc
@@ -213,6 +296,7 @@ class AnthropicProvider:
             provider=self.name,
             usage=usage,
             latency_ms=round(latency_ms, 3),
+            first_event_ms=round(first_event_ms, 3) if first_event_ms is not None else None,
             estimated_cost_usd=cost,
             raw_stop_details=(
                 {

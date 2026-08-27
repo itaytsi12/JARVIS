@@ -26,12 +26,13 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from brain.context_builder import BuiltContext, ContextBuilder
 from brain.models import ToolResult
-from brain.tool_catalog import ToolCatalog, get_tool_catalog
+from brain.tool_catalog import SESSION_AWARE_CATEGORIES, SESSION_AWARE_TOOLS, ToolCatalog, get_tool_catalog
 from config import get_config
 from memory.episodic import StepRecord
 from providers.base import (
@@ -91,6 +92,17 @@ class AgentRun:
     errors: list[str] = field(default_factory=list)
     retries: int = 0
     model_calls: int = 0
+    #: How many times independent tool calls were run concurrently instead of
+    #: one after another, and how much wall clock that saved (the difference
+    #: between the batch's total tool time and its slowest member).
+    parallel_batches: int = 0
+    parallel_saved_ms: float = 0.0
+    #: Milliseconds from the start of the run to the first tool actually
+    #: running, and to the first text token of the final answer. None means
+    #: it never happened, which is deliberately distinct from zero.
+    first_tool_ms: float | None = None
+    first_model_event_ms: float | None = None
+    effort: str | None = None
     usage: Usage = field(default_factory=lambda: Usage(reported=False))
     estimated_cost_usd: float | None = None
     duration_ms: float = 0.0
@@ -111,6 +123,11 @@ class AgentRun:
             "stop_reason": self.stop_reason,
             "steps": len(self.steps),
             "retries": self.retries,
+            "parallel_batches": self.parallel_batches,
+            "parallel_saved_ms": round(self.parallel_saved_ms, 1),
+            "first_tool_ms": round(self.first_tool_ms, 1) if self.first_tool_ms is not None else None,
+            "model_first_event_ms": round(self.first_model_event_ms, 1) if self.first_model_event_ms is not None else None,
+            "effort": self.effort,
             "errors": len(self.errors),
             # The COUNT alone made a real provider failure undebuggable
             # from the run summary; the message itself is what says
@@ -130,6 +147,15 @@ class AgentRun:
 ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
+def _any_refused(calls: list[ToolCall], attempts: dict[str, int], max_retries: int) -> bool:
+    """Is any call in this turn already past its retry limit?
+
+    Such a call is refused rather than executed, so the turn is not a clean
+    batch and takes the sequential path where that refusal is handled.
+    """
+    return any(attempts.get(_signature(call), 0) + 1 > max_retries + 1 for call in calls)
+
+
 class AgentLoop:
     def __init__(
         self,
@@ -139,12 +165,23 @@ class AgentLoop:
         limits: AgentLimits | None = None,
         context_builder: ContextBuilder | None = None,
         progress: ProgressCallback | None = None,
+        effort: str | None = None,
+        on_answer_text: Callable[[str], None] | None = None,
     ):
         self.provider = provider
         self.catalog = catalog or get_tool_catalog()
         self.limits = limits or AgentLimits.from_config()
         self.context_builder = context_builder or ContextBuilder()
         self.progress = progress
+        config = get_config()
+        self.effort = effort
+        self.max_parallel_tools = config.max_parallel_tools
+        # When set, PUBLIC assistant text is forwarded as it is generated so
+        # the caller can start speaking before the answer is complete. The
+        # provider stops forwarding the moment a tool_use block starts, so
+        # this never carries a tool payload; internal reasoning is never
+        # subscribed to at all.
+        self.on_answer_text = on_answer_text
 
     # ------------------------------------------------------------------
     def run(
@@ -161,6 +198,7 @@ class AgentLoop:
         run = AgentRun(goal=goal, context=context, skills=[skill.name for skill in skills])
         run.provider = getattr(self.provider, "name", None)
         run.model = getattr(self.provider, "model", None)
+        run.effort = self.effort
 
         if self.provider is None or not self.provider.is_available():
             run.stop_reason = NO_PROVIDER
@@ -215,6 +253,10 @@ class AgentLoop:
                 return self._stop(run, started, PROVIDER_ERROR, self._partial_answer(run, message))
 
             run.model_calls += 1
+            if run.first_model_event_ms is None and response.first_event_ms is not None:
+                run.first_model_event_ms = (time.perf_counter() - started) * 1000 - (
+                    response.latency_ms - response.first_event_ms
+                )
             _accumulate(run, response)
             self._emit("model_turn", {"step": step_number, "text": response.text[:200], "tool_calls": len(response.tool_calls)})
 
@@ -226,6 +268,20 @@ class AgentLoop:
 
             messages.append(response.as_message())
             outcomes: list[ToolOutcome] = []
+            # Independent read-only calls in one turn are run concurrently
+            # (`_parallel_safe`); everything else falls through to the
+            # sequential path below completely unchanged. Pre-computing the
+            # batch keeps every attempt/retry/step-record rule identical --
+            # only the wall clock differs.
+            batched: dict[str, ToolResult] = {}
+            if self._parallel_safe(response.tool_calls) and not _any_refused(
+                response.tool_calls, attempts, self.limits.max_action_retries
+            ):
+                if run.first_tool_ms is None:
+                    run.first_tool_ms = (time.perf_counter() - started) * 1000
+                for call in response.tool_calls:
+                    self._emit("tool_started", {"tool": call.name, "attempt": 1})
+                batched = self._execute_parallel(response.tool_calls, cancellation_token, run)
             for call in response.tool_calls:
                 if _is_cancelled(cancellation_token):
                     return self._stop(run, started, CANCELLED, "I stopped that, sir.")
@@ -247,7 +303,15 @@ class AgentLoop:
                 if attempt > 1:
                     run.retries += 1
 
-                result = self.catalog.execute(call.name, call.arguments, cancellation_token=cancellation_token)
+                if run.first_tool_ms is None:
+                    run.first_tool_ms = (time.perf_counter() - started) * 1000
+                # Emitted BEFORE the call so a listener can distinguish "the
+                # tool is still running" from "the model is thinking" -- the
+                # difference between an honest status line and a guess.
+                self._emit("tool_started", {"tool": call.name, "attempt": attempt})
+                result = batched.get(call.id) or self.catalog.execute(
+                    call.name, call.arguments, cancellation_token=cancellation_token
+                )
                 observation = self.context_builder.bound_observation(_observation_text(result))
                 outcomes.append(ToolOutcome(call.id, observation, is_error=not result.success))
                 self._record_step(run, call, result, observation, attempt, response.text)
@@ -285,7 +349,89 @@ class AgentLoop:
 
     # ------------------------------------------------------------------
     def _call_model(self, messages: list[Message], system: str, specs: list[ToolSpec]) -> ModelResponse:
-        return self.provider.complete(messages, system=system, tools=specs)
+        return self.provider.complete(
+            messages,
+            system=system,
+            tools=specs,
+            effort=self.effort,
+            on_text=self.on_answer_text,
+        )
+
+    # ------------------------------------------------------------------
+    def _parallel_safe(self, calls: list[ToolCall]) -> bool:
+        """May these tool calls run at the same time?
+
+        Only when every one of them is READ-ONLY and needs no exclusive
+        resource. Read-only means it cannot change state another call in the
+        batch might read; no exclusive resource means it cannot contend for
+        the keyboard, the foreground window or a browser page. Together those
+        are exactly the conditions under which running them concurrently
+        cannot change any individual result -- which is the only kind of
+        speed-up worth having.
+
+        Anything else stays strictly sequential: a write, a desktop action, a
+        browser step, an unknown tool, or the same call repeated (a repeat is
+        a retry, not a batch, and the retry accounting depends on order).
+        """
+        if len(calls) < 2:
+            return False
+        signatures = set()
+        for call in calls:
+            definition = self.catalog.get(call.name)
+            if definition is None or not definition.read_only or definition.exclusive_resource:
+                return False
+            # Read-only is not enough on its own for the desktop and browser
+            # tools: their answers describe SHARED session state (which
+            # window has focus, which page is loaded), so two of them at once
+            # can observe a different desktop from the one the model is
+            # reasoning about -- and the UIA/CDP layers underneath are not
+            # designed to be driven from several threads at once.
+            if definition.category in SESSION_AWARE_CATEGORIES or definition.name in SESSION_AWARE_TOOLS:
+                return False
+            signature = _signature(call)
+            if signature in signatures:
+                return False
+            signatures.add(signature)
+        return True
+
+    def _execute_parallel(self, calls: list[ToolCall], cancellation_token: Any, run: AgentRun) -> dict[str, ToolResult]:
+        """Run an eligible batch concurrently, keyed by call id.
+
+        Results are returned as a mapping rather than a list so the caller's
+        existing per-call bookkeeping (attempt counts, step records, ordering
+        of `tool_result` blocks) is completely unchanged -- only WHEN each
+        tool ran differs.
+        """
+        started = time.perf_counter()
+        results: dict[str, ToolResult] = {}
+        durations: list[float] = []
+        workers = min(len(calls), self.max_parallel_tools)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jarvis-agent-tool") as pool:
+            futures = {
+                call.id: pool.submit(
+                    self._execute_timed, call, cancellation_token, durations
+                )
+                for call in calls
+            }
+            for call_id, future in futures.items():
+                results[call_id] = future.result()
+        elapsed = (time.perf_counter() - started) * 1000
+        run.parallel_batches += 1
+        # Honest saving: what the same work would have cost sequentially,
+        # minus what it actually cost. Never negative.
+        run.parallel_saved_ms += max(0.0, sum(durations) - elapsed)
+        log.info(
+            "Ran %d independent read-only tools concurrently in %.0f ms (sequential would be ~%.0f ms): %s",
+            len(calls), elapsed, sum(durations), [call.name for call in calls],
+        )
+        return results
+
+    def _execute_timed(self, call: ToolCall, cancellation_token: Any, durations: list[float]) -> ToolResult:
+        started = time.perf_counter()
+        try:
+            return self.catalog.execute(call.name, call.arguments, cancellation_token=cancellation_token)
+        finally:
+            durations.append((time.perf_counter() - started) * 1000)
 
     def _record_step(
         self,
@@ -386,6 +532,33 @@ def _safe_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
+#: How many entries of a list-shaped tool result the model actually reads.
+#: A directory listing or a search result is evidence, but the 900th
+#: filename is not: it costs input tokens on THIS step and on every step
+#: after it, because the whole conversation is re-sent each turn. The count
+#: and the continuation hint below preserve what the truncation removed --
+#: the model can always ask for more with a narrower path or query.
+MAX_LIST_ITEMS = 40
+
+
+def _compact_list(key: str, value: Any) -> str:
+    """Render a list-shaped result compactly, without hiding its size.
+
+    Says how many there are, shows the first `MAX_LIST_ITEMS`, and tells the
+    model exactly how to see the rest. Truncating silently would be the one
+    unacceptable version of this: the model would reason as if it had seen
+    everything.
+    """
+    if not isinstance(value, list) or len(value) <= MAX_LIST_ITEMS:
+        return f"{key}: {json.dumps(value, default=str)[:2000]}"
+    shown = json.dumps(value[:MAX_LIST_ITEMS], default=str)
+    return (
+        f"{key}: {len(value)} entries in total; first {MAX_LIST_ITEMS} shown: {shown}\n"
+        f"({len(value) - MAX_LIST_ITEMS} more of the same kind are not listed. Repeating this same call "
+        f"returns this same summary; use a more specific path or query if you actually need them.)"
+    )
+
+
 def _observation_text(result: ToolResult) -> str:
     """Turn a `ToolResult` into what the model should actually read.
 
@@ -416,7 +589,7 @@ def _observation_text(result: ToolResult) -> str:
     for key in ("items", "matches", "files", "project_markers", "entry_points", "top_level_directories"):
         value = data.get(key)
         if value:
-            parts.append(f"{key}: {json.dumps(value, default=str)[:2000]}")
+            parts.append(_compact_list(key, value))
     if not parts:
         parts.append("The tool completed but reported no detail.")
     return "\n".join(parts)

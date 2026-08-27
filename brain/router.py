@@ -8,6 +8,8 @@ import urllib.parse
 from brain.local_intent_model import route_with_local_model
 from brain.request_intent import RequestKind, classify_request_kind
 from brain.request_complexity import assess_complexity, looks_like_simple_target
+from brain.control_words import normalize_control_word
+from brain.conversational_context import resolve_explanatory_followup, resolve_browser_search_correction
 from providers.registry import agent_escalation_available
 
 def looks_like_math(text: str) -> bool:
@@ -70,7 +72,7 @@ def _escalation_helps(complexity) -> bool:
     return True
 
 
-def route_command(command: str) -> dict:
+def route_command(command: str, context=None) -> dict:
     text = command.lower().strip()
 
     if text.rstrip(".?!,;:") in {
@@ -83,17 +85,57 @@ def route_command(command: str) -> dict:
 
     # Highest-priority deterministic control command. This must never reach an
     # intent model because it exists specifically to interrupt active work.
-    if text.rstrip(".?!,;:") in {
+    # `normalize_control_word` also recognizes a small, fixed set of
+    # non-English equivalents (see brain/control_words.py) -- e.g. Russian
+    # "Стоп!", a confirmed-live STT mis-detection of English "stop" as
+    # Russian, must reach this branch exactly like the English word does.
+    control_word = normalize_control_word(text)
+    if control_word in {
         "cancel",
         "cancel that",
         "stop that",
         "stop the current task",
         "stop",
         "never mind",
+        "forget it",
     }:
         return {"type": "cancel_read_only_task"}
+    # "pause" / "pause that" is genuinely ambiguous with media control (see
+    # brain/music_intent.py's PAUSE pattern, matched further down). It only
+    # resolves to the active JARVIS task while one is actually running or
+    # JARVIS is speaking (brain/task_supervisor.py::any_active_interactive_work);
+    # otherwise it falls through unchanged to the music route below, exactly
+    # as before this guard existed. An EXPLICIT media phrase ("pause the
+    # music", "pause Spotify") never matches this bare-word check at all, so
+    # it always reaches the music route regardless of task state -- media
+    # control wins whenever the user names it explicitly.
+    if control_word in {"pause", "pause that"}:
+        from brain.task_supervisor import any_active_interactive_work
+        if any_active_interactive_work():
+            return {"type": "cancel_read_only_task", "route_source": "task_priority_over_media"}
     if text.rstrip(".?!,;:") == "continue":
         return {"type":"resume_interrupted_response"}
+
+    # Generic explanatory follow-ups ("What does that mean?", "Why?",
+    # "Explain that.") resolve against the most relevant recent assistant
+    # output (brain/conversational_context.py) BEFORE anything else gets a
+    # chance to send them to the context-blind web-answer question route.
+    # Returns None (falls through to normal routing, eventually including
+    # ordinary QUESTION handling) whenever the phrase isn't one of these, or
+    # there is no real referent to resolve against.
+    contextual_question = resolve_explanatory_followup(command, context)
+    if contextual_question is not None:
+        return contextual_question
+
+    # A correction to an existing browser search ("Batman instead.", "Try
+    # Superman instead.", "Change that to Batman.") resolves deterministically
+    # to the same search-URL shape the original search used, with zero model
+    # calls, whenever session context has an active browser search to
+    # correct. Falls through (eventually to the agent runtime) for anything
+    # genuinely ambiguous -- see brain/conversational_context.py.
+    browser_correction = resolve_browser_search_correction(command, context)
+    if browser_correction is not None:
+        return browser_correction
 
     # Deterministic voice-approved continual learning commands (never routed
     # through the local intent model or the cloud planner -- see

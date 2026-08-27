@@ -68,6 +68,8 @@ class RealtimeSTTController:
                 self._flush_pending()
             except Exception as exc:
                 self._connect_error = exc
+                from voice.provider_health import get_provider_health
+                get_provider_health("elevenlabs_stt").note_result(exc)
                 log.info(
                     "[STT] active_provider=whisper_fallback provider_fallback_reason=%s: %s",
                     type(exc).__name__, str(exc)[:300],

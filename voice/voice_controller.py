@@ -98,7 +98,8 @@ def one_round_push_to_talk():
     recorder.record(EventType.NORMALIZED_REQUEST,{"normalized_text":safe_command,"final_interpreted_command":safe_command},interaction_id)
 
     try:
-        route = route_command(cleaned)
+        from brain.agent import agent_runtime as _agent_runtime
+        route = route_command(cleaned, _agent_runtime.context)
     except Exception:
         route = None
 

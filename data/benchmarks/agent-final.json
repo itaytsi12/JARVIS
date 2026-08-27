@@ -1,0 +1,161 @@
+{
+  "tag": "final",
+  "recorded_at": "2026-08-20T21:42:34",
+  "tools": {
+    "list_files": {
+      "first_ms": 1973.7,
+      "warm_ms": 0.4,
+      "observation_chars": 1151
+    },
+    "inspect_project": {
+      "first_ms": 186.9,
+      "warm_ms": 171.9,
+      "observation_chars": 1765
+    },
+    "read_text_file": {
+      "first_ms": 0.7,
+      "warm_ms": 0.7,
+      "observation_chars": 5027
+    },
+    "search_code": {
+      "first_ms": 1951.0,
+      "warm_ms": 1951.0,
+      "observation_chars": 334
+    }
+  },
+  "context": {
+    "files": {
+      "skills": [
+        "files",
+        "coding"
+      ],
+      "effort": "medium",
+      "tool_schemas_selected": 22,
+      "tool_schemas_available": 49,
+      "tool_schema_chars": 6510,
+      "system_prompt_chars": 4517,
+      "memory_retrieval_ms": 11.2,
+      "first_call_input_tokens_estimate": 2785
+    },
+    "git": {
+      "skills": [
+        "coding"
+      ],
+      "effort": "medium",
+      "tool_schemas_selected": 22,
+      "tool_schemas_available": 49,
+      "tool_schema_chars": 6510,
+      "system_prompt_chars": 4051,
+      "memory_retrieval_ms": 11.2,
+      "first_call_input_tokens_estimate": 2661
+    },
+    "architecture": {
+      "skills": [
+        "coding",
+        "research"
+      ],
+      "effort": "medium",
+      "tool_schemas_selected": 31,
+      "tool_schemas_available": 49,
+      "tool_schema_chars": 8652,
+      "system_prompt_chars": 4316,
+      "memory_retrieval_ms": 15.6,
+      "first_call_input_tokens_estimate": 3267
+    }
+  },
+  "live": {
+    "files": {
+      "total_ms": 53536,
+      "model_calls": 6,
+      "agent_steps": 6,
+      "tools": [
+        "inspect_project",
+        "find_file",
+        "list_files",
+        "inspect_project",
+        "list_files",
+        "read_text_file"
+      ],
+      "input_tokens": 120,
+      "output_tokens": 1030,
+      "cache_creation_tokens": 8650,
+      "cache_read_tokens": 41537,
+      "cost_usd": 0.0607086,
+      "effort": "medium",
+      "context_chars": 4778,
+      "selected_tool_count": 22,
+      "available_tool_count": 49,
+      "parallel_tool_batches": 1,
+      "parallel_saved_ms": 0,
+      "time_to_first_tool_ms": 3517,
+      "model_first_event_ms": 39466,
+      "time_to_first_speech_ms": 5632,
+      "time_to_first_answer_token_ms": 41579,
+      "progress_lines": 5,
+      "answer_chunks": 10,
+      "success": true,
+      "verified": true
+    },
+    "git": {
+      "total_ms": 43114,
+      "model_calls": 5,
+      "agent_steps": 4,
+      "tools": [
+        "run_command",
+        "find_file",
+        "exists",
+        "run_command"
+      ],
+      "input_tokens": 110,
+      "output_tokens": 605,
+      "cache_creation_tokens": 8084,
+      "cache_read_tokens": 23985,
+      "cost_usd": 0.0469155,
+      "effort": "medium",
+      "context_chars": 4788,
+      "selected_tool_count": 22,
+      "available_tool_count": 49,
+      "parallel_tool_batches": 0,
+      "parallel_saved_ms": 0,
+      "time_to_first_tool_ms": 3002,
+      "model_first_event_ms": 41240,
+      "time_to_first_speech_ms": 12093,
+      "time_to_first_answer_token_ms": 41278,
+      "progress_lines": 3,
+      "answer_chunks": 5,
+      "success": true,
+      "verified": true
+    },
+    "architecture": {
+      "total_ms": 16432,
+      "model_calls": 4,
+      "agent_steps": 5,
+      "tools": [
+        "inspect_project",
+        "read_text_file",
+        "inspect_project",
+        "read_text_file",
+        "read_code"
+      ],
+      "input_tokens": 110,
+      "output_tokens": 1098,
+      "cache_creation_tokens": 9851,
+      "cache_read_tokens": 19312,
+      "cost_usd": 0.05953485,
+      "effort": "medium",
+      "context_chars": 5588,
+      "selected_tool_count": 31,
+      "available_tool_count": 49,
+      "parallel_tool_batches": 2,
+      "parallel_saved_ms": 2,
+      "time_to_first_tool_ms": 3269,
+      "model_first_event_ms": 11119,
+      "time_to_first_speech_ms": 6533,
+      "time_to_first_answer_token_ms": 11172,
+      "progress_lines": 1,
+      "answer_chunks": 9,
+      "success": true,
+      "verified": true
+    }
+  }
+}

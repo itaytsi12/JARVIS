@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 from pathlib import Path
+from typing import Iterator
 
 log = logging.getLogger("jarvis.code")
 
@@ -47,6 +49,32 @@ def _skip(path: Path) -> bool:
     )
 
 
+def _ignored_directory(name: str) -> bool:
+    return name in IGNORED_DIRECTORIES or name.startswith(IGNORED_PREFIXES)
+
+
+def walk_source_files(root: Path) -> Iterator[Path]:
+    """Yield every file under `root`, PRUNING ignored directories as it goes.
+
+    `root.rglob("*")` cannot prune: it descends into every directory and
+    leaves the caller to discard the results afterwards. On this repository
+    that meant walking four virtualenvs, `.git`, the model artifacts and the
+    caches -- `inspect_project` took 98 SECONDS and was by far the largest
+    single cost in a live agent run, dwarfing every model call. Pruning at
+    the directory level visits only the directories that can contain a
+    result, which is the same answer for a fraction of the work.
+
+    Yields lazily, so a caller that stops early (a bounded search) stops the
+    walk with it instead of paying for a full traversal first.
+    """
+    for directory, subdirectories, filenames in os.walk(root):
+        # In-place mutation is what makes os.walk skip the subtree entirely.
+        subdirectories[:] = [name for name in subdirectories if not _ignored_directory(name)]
+        base = Path(directory)
+        for filename in filenames:
+            yield base / filename
+
+
 def inspect_project(path: str, max_files: int = 200) -> dict:
     """Describe a project: markers, entry points, layout, and file counts.
 
@@ -62,9 +90,7 @@ def inspect_project(path: str, max_files: int = 200) -> dict:
     files: list[str] = []
     by_suffix: dict[str, int] = {}
     total = 0
-    for item in sorted(root.rglob("*")):
-        if item.is_dir() or _skip(item.relative_to(root)):
-            continue
+    for item in walk_source_files(root):
         suffix = item.suffix.lower()
         if suffix not in SOURCE_SUFFIXES:
             continue
@@ -222,12 +248,9 @@ def search_code(path: str, query: str, max_results: int = 60, suffixes: list[str
     needle = query.lower()
     matches: list[dict] = []
     scanned = 0
-    targets = [root] if root.is_file() else sorted(root.rglob("*"))
+    targets = iter([root]) if root.is_file() else walk_source_files(root)
     for item in targets:
-        if item.is_dir():
-            continue
-        relative = item.relative_to(root) if item != root else Path(item.name)
-        if _skip(relative) or item.suffix.lower() not in wanted:
+        if item.suffix.lower() not in wanted:
             continue
         scanned += 1
         try:

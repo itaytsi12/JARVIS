@@ -173,6 +173,65 @@ the local layer genuinely cannot resolve. Full detail is in
   `brain/planner.py`, `brain/intent_router.py`, `brain/web_answer.py` and
   `vision/screen_analyzer.py` import `config` for the side effect instead.
   `tests/test_provider_wiring.py` enforces both rules.
+### Complex-agent performance (measured, not assumed)
+
+`scripts/benchmark_agent.py` is the harness: a free dry run (tool latency,
+context size, tool-schema count, effort) plus `--run` for the real numbers,
+saved to `data/benchmarks/agent-<tag>.json` so before/after is a diff rather
+than a memory. What it found, and what was done:
+
+- **`tools/code.py`'s tree walk was the single largest cost in a live run.**
+  `root.rglob("*")` cannot prune, so `inspect_project` descended into four
+  virtualenvs, `.git`, `models/` and the caches, then discarded them: **98.5
+  seconds** on this repository, more than every model call put together.
+  `walk_source_files` uses `os.walk` with in-place `dirnames` pruning
+  (~200ms warm) and `inspect_project` / `search_code` both use it. Same
+  answer, one four-hundredth of the work.
+- **Prompt caching.** `providers/anthropic_provider.py` sends `system` as a
+  content-block list carrying `cache_control: {"type": "ephemeral"}` (which
+  caches the tool schemas too -- the prefix renders `tools` -> `system` ->
+  `messages`), plus one ROLLING breakpoint on the last message so the
+  conversation prefix is cached as the run grows. Measured effect: a task
+  that billed 19,000-27,000 input tokens at full price now bills ~110
+  uncached with 20,000-94,000 served from cache. Cost per task fell roughly
+  40%.
+- **Parallel tool execution.** `brain/agent_loop.py::_parallel_safe` runs a
+  turn's tool calls concurrently ONLY when every one is read-only, needs no
+  exclusive resource, is not a session-aware desktop/browser tool, and is
+  not a repeat. Anything else stays strictly sequential.
+  `JARVIS_MAX_PARALLEL_TOOLS` bounds it. Honest result: now that the tools
+  themselves are fast, the wall-clock saving is small (`parallel_saved_ms`
+  in the log says exactly how small); the round-trip saving from batching
+  several reads into one model turn is the real win.
+- **Observation compaction.** `_compact_list` renders a long list as a count
+  plus the first `MAX_LIST_ITEMS`, and says so. `inspect_project`'s
+  observation went from 21,222 characters to 1,670 -- and that text is
+  re-sent on every subsequent step, so it compounds. The wording deliberately
+  tells the model that repeating the same call returns the same summary: an
+  earlier version invited a retry and measurably caused redundant steps.
+- **Effort.** `brain/agent_service.py::select_effort` sends
+  `output_config: {"effort": ...}` -- the configured interactive default
+  (`medium`) for read-only inspection, `high` for anything naming work that
+  changes something or has to be reasoned out (`_DEMANDING`). It never
+  lowers effort for the hard cases.
+- **Perceived latency.** `voice/agent_narration.py` speaks rate-limited,
+  deduplicated progress derived from real `tool_started`/`tool_result`
+  events, with a heartbeat that says the TOOL is slow while one is in
+  flight and the MODEL is once they have all returned -- never a guess about
+  either. `voice/sentence_stream.py` releases the streamed final answer one
+  whole speakable sentence at a time (markdown stripped, code blocks
+  dropped, nothing released until enough text has arrived that it cannot be
+  a tool preamble). Measured: first speech at 5.6-12.1s instead of nothing
+  until the whole answer at 20-93s.
+- **Never stream reasoning.** The provider forwards `text` events only, and
+  stops the moment a `tool_use` content block starts, so a tool payload or a
+  tool-turn preamble can never reach speech. Thinking blocks are not
+  subscribed to anywhere.
+- **What was NOT optimized, deliberately:** total wall clock is dominated by
+  Sonnet's own generation time and varies widely run to run; nothing here
+  tries to cut it by skipping verification, dropping evidence the model
+  needs, or preventing follow-up steps.
+
 - **Cost is never guessed.** `config/pricing.py` returns `None` for an
   unpriced model and `providers/usage.py` stores `NULL`, so "unknown" and
   "free" stay distinguishable.
@@ -474,6 +533,169 @@ session genuinely ready. Safe diagnostic logging was added throughout
 the STT path (`[STT] configured_provider=...`, `voice_language_mode=...`,
 `active_provider=...`, `provider_fallback_reason=...`,
 `committed_language=...`, `committed_text=...`) -- never keys/tokens.
+
+### Conversational context, task-vs-media priority, and provider health
+
+A live conversational-context test surfaced six integration gaps between
+the deterministic router and real session state. `brain/router.py::route_command`
+now takes an optional second `context` (a `SessionContext`) parameter --
+the real production callers (`brain/agent.py`, `voice/background_assistant.py`,
+`voice/voice_controller.py`) all pass `agent_runtime.context`; every test
+caller and `brain/speculative_execution.py` (context-independent tools
+only) still call it with one argument, unaffected.
+
+- **A generic explanatory follow-up resolves against real recent
+  context, never blind.** `brain/conversational_context.py::resolve_explanatory_followup`
+  matches a fixed, narrow set of context-only phrasings ("What does that
+  mean?", "Why?", "Explain that.", "What happened?", "Tell me more about
+  that.") -- deliberately NOT a bare keyword match, so "why is Chrome using
+  so much memory" (its own subject) is untouched -- and resolves them
+  against `SessionContext.last_assistant_response` (already the one field
+  every route's final answer/result/error text funnels through, per
+  `brain/agent.py::run_agent`). Checked in `route_command` before the
+  QUESTION classifier ever runs, so it never reaches
+  `brain/web_answer.py` blind. Returns a `{"type": "contextual_question",
+  "context_text": ...}` route; with no real referent it returns `None` and
+  ordinary QUESTION handling continues exactly as before.
+  `brain/agent.py::_run_agent_impl` folds the referent into the goal
+  explicitly and escalates to the agent runtime (`route_type` ends
+  "agent_task" like every other escalation, with `escalated_from=
+  "conversational_context"` recording provenance) when a provider is
+  configured; with none, it falls back to `brain/web_answer.py` with the
+  referent folded into the query -- still not blind, just without the
+  agent's own reasoning. `_is_context_resolved_route` stops
+  `should_use_task_planner`'s text-only heuristic (which independently
+  matches "tell", among others) from re-capturing an already-resolved
+  contextual route and inventing a new plan. `voice/background_assistant.py::_is_agent_route`
+  treats `contextual_question` like `plan`/`ai` (dispatched off-thread,
+  cancellable, narrated, exactly like every other agent turn) when a
+  provider is available; when one isn't, a dedicated dispatch branch sends
+  it through the same cancellable `_start_question_task` path an ordinary
+  `question` route gets, instead of the synchronous default path (which
+  would otherwise block the microphone for the whole web-answer call).
+- **A browser search correction resolves locally, with zero model
+  calls, whenever there is a real search to correct.**
+  `brain/conversational_context.py::resolve_browser_search_correction`
+  matches "X instead.", "search for X instead.", "try X instead.", "change
+  that/it to X." against `SessionContext.browser_active` /
+  `last_search_provider` / `last_search_query` (already populated by
+  `brain/agent_runtime.py::AgentRuntime._update_context` on every
+  `browser_open_url` action, deterministic or agent-driven alike), reusing
+  the exact same provider -> search-URL templates `brain/router.py` and
+  `brain/local_planner.py` already use for "search youtube for X" so a
+  correction always lands on the identical URL shape. Resolves to a single
+  `{"type": "local_plan", "actions": [Action("browser_open_url", ...)]}`
+  route -- `AgentRuntime.execute` already verifies a `browser_open_url`
+  action's URL actually changed, so this correction is verified exactly
+  like every other browser action, not just fired-and-forgotten. Excludes
+  "send it to X instead" explicitly (that's `revise_whatsapp_recipient`'s
+  own pattern) so a coincidentally-active browser session can never
+  hijack a WhatsApp recipient correction. An unresolvable provider or a
+  genuinely contentless correction ("search for something else") returns
+  `None` and falls through to the pre-existing routing, eventually the
+  agent runtime for real ambiguity -- never guessed locally.
+- **Task stop/pause/cancel outranks an ambiguous media command, but an
+  explicit media phrase always wins.** `brain/music_intent.py`'s bare
+  `pause` pattern (`pause`/`pause it`/`pause music`... all map to
+  `music_pause`) collided with a JARVIS task the user wanted to
+  stop -- confirmed live as Whisper transcribing "stop" as the literal
+  standalone word "pause". `brain/router.py::route_command` now normalizes
+  the utterance through `brain/control_words.py::normalize_control_word`
+  (a small, fixed, non-LLM multilingual equivalents table -- Russian
+  "Стоп"/"отмена", Hebrew "עצור"/"בטל" -- for exactly the STT
+  mis-detections observed live, never a general translation system) before
+  the existing unconditional `cancel`/`stop`/`never mind` set (now also
+  including `forget it`), so a mis-detected-language "stop" still
+  cancels. Bare `pause`/`pause that` is a SEPARATE, narrower check: it
+  only resolves to `cancel_read_only_task` (`route_source=
+  "task_priority_over_media"`) when `brain/task_supervisor.py::any_active_interactive_work`
+  is true (an active read-only/interactive task, an active `tasks/manager.py`
+  agent task, or JARVIS is currently speaking -- the last one via
+  `brain/activity_state.py`, a narrow one-directional flag
+  `voice/background_assistant.py::_set_state` writes on every SPEAKING
+  transition and only `brain/task_supervisor.py` reads, since the brain
+  layer must never import `voice/*`). An EXPLICIT media phrase ("pause the
+  music", "pause Spotify") never matches the bare-word check at all, so it
+  always reaches the music route regardless of task state -- confirmed by
+  keeping the check on the literal strings `"pause"`/`"pause that"` only,
+  never a substring/keyword match. Zero model calls either way: this is a
+  dict lookup plus the existing task-status bookkeeping.
+- **The speaker resource is preempted, not waited out.**
+  `voice/speech_coordinator.py::SpeechCoordinator` sits between every
+  speech dispatch site (`voice/background_assistant.py::_start_speech_task`,
+  the read-only question path, `voice/agent_narration.py::AgentNarrator`'s
+  progress/heartbeat AND its separate `speak_final` for the streamed
+  answer) and `voice/text_to_speech.py`'s pre-existing `speak_response`
+  resource lock. A live follow-up used to wait out that lock's own 30s
+  timeout (`TimeoutError: resource_timeout:speaker`) behind a stale
+  progress phrase, most often because a hung ElevenLabs call (see
+  provider health below) was still holding it. `SpeechCoordinator.speak()`
+  tracks in-flight priorities (`PRIORITY_STATUS` for acks/progress/
+  heartbeat, `PRIORITY_FINAL` for a narrated task's real final answer) and
+  calls `text_to_speech.stop()` to interrupt a STRICTLY lower-priority
+  in-flight utterance before it starts its own -- `>`, never `>=`, so two
+  same-priority utterances (an ordinary ack immediately followed by its
+  own ordinary result) simply queue for the lock and both play in full,
+  exactly as before this existed; only a genuinely stale PROGRESS phrase
+  is cut off by the narrated FINAL answer that supersedes it. Deliberately
+  does NOT cache `speak`/`stop` as bound callables -- it holds the
+  `voice.text_to_speech` MODULE and resolves both as attribute lookups on
+  every call, so `unittest.mock.patch.object(text_to_speech, "speak", ...)`
+  is honored no matter when it's applied; caching them once (an earlier
+  version of this fix) silently kept calling whatever was live the FIRST
+  time the process-wide singleton's `speak()` ran, including a `Mock` left
+  over from an unrelated, already-finished test -- confirmed live as a
+  cross-test failure (`tests/test_barge_in.py`) with no relation to the
+  test that actually failed once diagnosed back to its real cause.
+- **A definite ElevenLabs quota/funds failure degrades the provider
+  once per process, not on every request.** `voice/provider_health.py::ProviderHealth`
+  is a per-provider-name flag: `note_result(exc)` marks a provider
+  unavailable ONLY for a known non-transient error signature
+  (`quota_exceeded`, `insufficient_quota`/`_funds`, `payment_required` --
+  matched against the stringified exception, provider-agnostic) and logs
+  the reason exactly once; an ordinary transient failure (timeout, 5xx,
+  dropped connection) never marks anything, so a real temporary outage
+  still retries next time exactly as before this existed.
+  `voice/tts/elevenlabs_tts.py::is_available()` and
+  `voice/elevenlabs_realtime_stt.py::is_configured()` both check
+  `get_provider_health(...).available` before any network attempt --
+  every later request in the session then skips straight to the
+  configured fallback (Whisper / OpenAI / chatterbox / pyttsx3) with zero
+  wasted connect attempts. `voice.provider_health.reset(name)` is the
+  manual refresh (e.g. after topping up credits) for the rare case a
+  process needs to retry before restarting.
+- **Whisper's unconstrained auto-detect is sanity-checked against what
+  JARVIS is actually configured to recognize.** Confirmed live: plain
+  English commands committed as Dutch, "stop" committed as Russian --
+  `language=None` (used whenever more than one language is expected) picks
+  from faster-whisper's full detection vocabulary, not just en/he.
+  `voice/speech_to_text.py::transcribe_audio` now checks the returned
+  `info.language` against `voice_language.py::expected_input_languages`;
+  when the detected language is a real, non-empty string outside that set
+  (a `MagicMock`-shaped or missing value is deliberately never treated as
+  implausible -- that guard is what keeps this inert for a real
+  info object with a genuinely unavailable language field, and is also
+  what the existing `TranscribeLanguageParamTests` fixture relies on), it
+  re-transcribes ONCE, constrained to whichever of the configured
+  candidates the mistranscribed text's own script suggests
+  (`voice_language.py::detect_input_language`'s existing Hebrew-block
+  check -- never a guess toward English by default, so genuine Hebrew
+  recognition is not destroyed). A forced single-language mode
+  (`VOICE_LANGUAGE=en`) is never second-guessed -- there is no
+  unconstrained detection to sanity-check there at all. Still local,
+  still free: no cloud LLM call.
+
+All six are covered offline (`tests/test_conversational_context.py`,
+`tests/test_task_priority_routing.py`, `tests/test_speech_coordinator.py`,
+`tests/test_provider_health.py`, `tests/test_stt_language_sanity.py`) plus
+end-to-end sequence tests driving the real `brain.agent.run_agent` against
+a scripted fake provider (`tests/test_conversational_sequences.py`, same
+pattern as `tests/test_agent_runtime_integration.py`) -- asserting the
+provider was actually called with the resolved context embedded, not just
+that a route carries the right label. None of this has been re-verified
+against real ElevenLabs quota exhaustion or a live Whisper mis-detection
+recording; the fixes are built from the confirmed-live symptoms as
+reported, and the offline tests reproduce those exact symptoms with fakes.
 
 ### Music (Alexa-like Apple Music Web control)
 

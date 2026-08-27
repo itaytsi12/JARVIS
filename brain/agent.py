@@ -12,6 +12,7 @@ from openai import OpenAI
 
 from brain.router import route_command
 from brain.tool_router import execute_tool
+from brain.tool_catalog import get_tool_catalog
 from brain.planner import create_plan
 from brain.executor import Executor
 from brain.models import Action,ActionRisk,Plan,ToolResult
@@ -64,7 +65,7 @@ def ask_ai(message: str) -> str:
     return response.output_text
 
 
-def run_agent(command: str, route: dict | None = None, interaction_id: str | None = None, original_user_text: str | None = None, cancellation_token=None, execution_outcome: dict | None = None, speculative_ledger=None) -> str:
+def run_agent(command: str, route: dict | None = None, interaction_id: str | None = None, original_user_text: str | None = None, cancellation_token=None, execution_outcome: dict | None = None, speculative_ledger=None, progress=None, on_answer_text=None) -> str:
     request_started = time.perf_counter()
     recorder = get_recorder()
     created_interaction = interaction_id is None
@@ -76,7 +77,7 @@ def run_agent(command: str, route: dict | None = None, interaction_id: str | Non
     execution_meta = {}
     agent_runtime.context.last_user_message = original_user_text or command
     try:
-        response = _run_agent_impl(command, route, recorder, iid, execution_meta, cancellation_token,original_user_text,speculative_ledger)
+        response = _run_agent_impl(command, route, recorder, iid, execution_meta, cancellation_token,original_user_text,speculative_ledger,progress,on_answer_text)
         explicit_success=execution_meta.get("success")
         textual_failure = explicit_success is None and ("error:" in response.lower() or "couldn't" in response.lower() or response.lower().startswith(("failed ","failure:")))
         failed = explicit_success is False or textual_failure
@@ -138,6 +139,26 @@ def _is_deterministic_music_route(route: dict | None) -> bool:
     return isinstance(tool, str) and (tool == "open_music" or tool.startswith("music_"))
 
 
+#: `route_source` values `brain/router.py` sets ONLY on a route it already
+#: resolved by combining the current utterance with real session context
+#: (an explanatory follow-up's referent, a browser search correction, the
+#: task-vs-media priority guard). `should_use_task_planner(command)` below
+#: is a text-only heuristic on the ORIGINAL command that knows nothing about
+#: any of this -- without this guard it can re-capture a phrase like "Tell
+#: me more about that." (which starts with "tell", one of its own signals)
+#: and discard the already-correct contextual route in favor of inventing a
+#: new plan from scratch.
+_CONTEXT_RESOLVED_ROUTE_SOURCES = {
+    "conversational_context",
+    "conversational_context_browser_correction",
+    "task_priority_over_media",
+}
+
+
+def _is_context_resolved_route(route: dict | None) -> bool:
+    return bool(route) and route.get("route_source") in _CONTEXT_RESOLVED_ROUTE_SOURCES
+
+
 def _active_agent_tasks():
     """Running agent tasks, or an empty list if the manager isn't up yet.
 
@@ -182,7 +203,7 @@ def _agent_escalation_available() -> bool:
     return agent_escalation_available()
 
 
-def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, cancellation_token=None) -> str:
+def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, cancellation_token=None, progress=None, on_answer_text=None) -> str:
     """Hand a goal to the agent runtime (brain/agent_service.py).
 
     Records the same dataset events as every other route so an agentic
@@ -206,6 +227,8 @@ def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, ca
         goal,
         runtime=agent_runtime,
         cancellation_token=cancellation_token,
+        progress=progress,
+        on_answer_text=on_answer_text,
         session_context=agent_runtime.context,
     )
     run = outcome.run
@@ -230,6 +253,21 @@ def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, ca
     # without this a caller can see that a model was called but not what it
     # did, which is precisely the thing worth verifying.
     execution_meta["agent_tools"] = [step.tool for step in run.steps]
+    # Performance fields, so a slow run can be diagnosed from the log alone
+    # rather than by re-running it with a profiler attached.
+    execution_meta["parallel_tool_batches"] = run.parallel_batches
+    execution_meta["parallel_saved_ms"] = run.parallel_saved_ms
+    execution_meta["time_to_first_tool_ms"] = run.first_tool_ms
+    execution_meta["model_first_event_ms"] = run.first_model_event_ms
+    execution_meta["effort"] = run.effort
+    execution_meta["cache_creation_tokens"] = run.usage.cache_creation_tokens
+    execution_meta["cache_read_tokens"] = run.usage.cache_read_tokens
+    if run.context is not None:
+        described = run.context.describe()
+        execution_meta["context_chars"] = described["used_chars"]
+        execution_meta["context_tokens_estimate"] = described["used_chars"] // 4
+        execution_meta["selected_tool_count"] = described["tool_count"]
+        execution_meta["available_tool_count"] = len(get_tool_catalog().names())
     execution_meta["stop_reason"] = run.stop_reason
     execution_meta["estimated_cost_usd"] = run.estimated_cost_usd
     execution_meta["input_tokens"] = run.usage.input_tokens
@@ -254,7 +292,7 @@ def _run_agent_with_loop(goal: str, recorder, iid: str, execution_meta: dict, ca
     return outcome.answer
 
 
-def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execution_meta: dict, cancellation_token=None,original_user_text: str | None=None,speculative_ledger=None) -> str:
+def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execution_meta: dict, cancellation_token=None,original_user_text: str | None=None,speculative_ledger=None,progress=None,on_answer_text=None) -> str:
     control_types={"cancel_read_only_task","task_status","resume_interrupted_response","correct_interrupted_response","revise_whatsapp_recipient","remember","agent_task"}
     # The route is resolved BEFORE any planner decision, always.
     #
@@ -274,10 +312,11 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
     # behave identically: `voice/background_assistant.py` has always
     # routed before calling `run_agent`.
     if route is None:
-        route = _timed(execution_meta,"routing_ms",lambda: route_command(command))
+        route = _timed(execution_meta,"routing_ms",lambda: route_command(command, agent_runtime.context))
     use_task_planner=(
         route.get("type") not in control_types
         and not _is_deterministic_music_route(route)
+        and not _is_context_resolved_route(route)
         and should_use_task_planner(command)
     )
     runtime_log.info("Runtime decision: %s; route=%s/%s; command=%r; agent_runtime_id=%s context_id=%s", "task_planner" if use_task_planner else "deterministic_router", route.get("type"), route.get("route_source") or "-", _command_for_log(command), id(agent_runtime), id(agent_runtime.context))
@@ -316,7 +355,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                 if _agent_escalation_available():
                     runtime_log.info("Escalating to agent runtime instead of the cloud planner: incomplete local plan (reason=%s)",completeness.get("reason"))
                     execution_meta["escalated_from"]="incomplete_local_plan"
-                    return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token)
+                    return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token, progress, on_answer_text)
                 cloud_goal=original_user_text or command
                 runtime_log.info("Cloud planner invoked: true; full_goal=%r",_command_for_log(cloud_goal))
                 execution_meta["route_type"]="plan";execution_meta["route_source"]="cloud_planner";execution_meta["model_calls"]+=1
@@ -371,7 +410,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
             if _agent_escalation_available():
                 runtime_log.info("Escalating to agent runtime instead of the cloud planner: no local plan for %d clauses",len(missing_completeness.get("clauses") or []))
                 execution_meta["escalated_from"]="missing_local_plan"
-                return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token)
+                return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token, progress, on_answer_text)
             cloud_goal=original_user_text or command;runtime_log.info("Completeness decision: incomplete; cloud planner invoked: true; full_goal=%r",_command_for_log(cloud_goal))
             execution_meta["route_type"]="plan";execution_meta["route_source"]="cloud_planner";execution_meta["model_calls"]+=1
             proposed=_timed(execution_meta,"cloud_ms",lambda: create_plan(cloud_goal));cloud_actions,validation_errors=validate_generated_actions(proposed)
@@ -398,7 +437,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
             # insufficient" condition the agent runtime exists for --
             # rather than telling the user no, hand it to the agent.
             runtime_log.info("Escalating to agent runtime: no complete local plan")
-            return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token)
+            return _run_agent_with_loop(original_user_text or command, recorder, iid, execution_meta, cancellation_token, progress, on_answer_text)
         execution_meta["block_reason"]="missing_local_plan";execution_meta["block_errors"]=["missing_local_plan"]
         return "I couldn't create a safe local plan for that task."
 
@@ -428,7 +467,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
     if route["type"] in {"plan", "ai", "coding_task"} and _agent_escalation_available():
         goal = route.get("task") or route.get("message") or original_user_text or command
         runtime_log.info("Escalating to agent runtime from route_type=%s", route["type"])
-        return _run_agent_with_loop(goal, recorder, iid, execution_meta, cancellation_token)
+        return _run_agent_with_loop(goal, recorder, iid, execution_meta, cancellation_token, progress, on_answer_text)
 
     if route["type"] == "remember":
         # Explicit "remember that ..." -- a local, deterministic write to
@@ -481,7 +520,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
             execution_meta["agent_escalation_declined"] = "no_provider"
         else:
             runtime_log.info("Routing to agent runtime (%s): %s", route.get("route_source") or "explicit", route.get("complexity"))
-            return _run_agent_with_loop(route.get("goal") or command, recorder, iid, execution_meta, cancellation_token)
+            return _run_agent_with_loop(route.get("goal") or command, recorder, iid, execution_meta, cancellation_token, progress, on_answer_text)
 
     if route["type"] == "cancel_read_only_task":
         action=Action("cancel_active_task",{})
@@ -564,6 +603,31 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
         successful=bool(results and results[0].success);recorder.correction(iid,{"recipient":original_recipient},{"recipient":route["recipient"]},successful=successful)
         execution_meta["success"]=successful;execution_meta["verified"]=_results_verified(plan.actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
         return format_results(results)
+
+    if route["type"] == "contextual_question":
+        # A generic explanatory follow-up ("What does that mean?", "Why?")
+        # that brain/router.py already resolved against real recent context
+        # (brain/conversational_context.py). The referent is folded into
+        # the goal explicitly rather than sent blind: this is what turns a
+        # context-free web search into an answer that actually uses what
+        # JARVIS just did or said.
+        context_text = route.get("context_text") or ""
+        question = route.get("message") or command
+        goal = (
+            f"The user just asked: {question}\n\n"
+            "This refers to what I (JARVIS) just reported to them:\n"
+            f"{context_text}\n\n"
+            "Answer the user's question using that context directly, in one or two short spoken sentences. "
+            "Do not search the web -- the context above is what they are asking about."
+        )
+        if _agent_escalation_available():
+            runtime_log.info("Routing conversational follow-up to agent runtime with resolved context")
+            return _run_agent_with_loop(goal, recorder, iid, execution_meta, cancellation_token, progress, on_answer_text)
+        # No provider configured: still better than a context-blind web
+        # search -- fold the referent into the question route's message so
+        # brain/web_answer.py answers from it instead of searching blind.
+        runtime_log.info("No agent provider configured; falling back to web-answer with resolved context folded in")
+        route = {"type": "question", "message": goal, "route_source": "conversational_context_no_agent"}
 
     if route["type"] == "question":
         service = get_web_answer_service()
@@ -745,6 +809,11 @@ def _resource_wait_ms(execution_meta: dict) -> float:
     return next((float(_result_data(r).get("plan_resource_wait_ms",0.0) or 0.0) for r in results),0.0)
 
 
+def _ms_for_log(value) -> str:
+    """"-" for a stage that never happened -- never a fabricated 0.0."""
+    return "-" if value is None else f"{value:.0f}"
+
+
 def _cost_for_log(execution_meta: dict) -> str:
     if "estimated_cost_usd" not in execution_meta:
         return "-"
@@ -763,6 +832,8 @@ def _log_request_performance(execution_meta: dict, request_started: float, faile
         "Request performance: route_type=%s route_source=%s escalated_from=%s provider=%s model=%s "
         "routing_ms=%.1f planning_ms=%.1f cloud_ms=%.1f tool_execution_ms=%.1f resource_wait_ms=%.1f "
         "model_calls=%s agent_steps=%s input_tokens=%s output_tokens=%s estimated_cost_usd=%s "
+        "effort=%s context_chars=%s tools=%s/%s parallel_batches=%s parallel_saved_ms=%.0f "
+        "first_tool_ms=%s model_first_event_ms=%s cache_creation_tokens=%s cache_read_tokens=%s "
         "total_request_ms=%.1f success=%s",
         execution_meta.get("route_type"),execution_meta.get("route_source"),
         execution_meta.get("escalated_from") or "-",
@@ -777,6 +848,13 @@ def _log_request_performance(execution_meta: dict, request_started: float, faile
         # returns None and providers/usage.py stores NULL for exactly this
         # reason), or the real figure. None of them is 0.0.
         _cost_for_log(execution_meta),
+        execution_meta.get("effort") or "-",
+        execution_meta.get("context_chars","-"),
+        execution_meta.get("selected_tool_count","-"),execution_meta.get("available_tool_count","-"),
+        execution_meta.get("parallel_tool_batches",0),execution_meta.get("parallel_saved_ms",0.0),
+        _ms_for_log(execution_meta.get("time_to_first_tool_ms")),
+        _ms_for_log(execution_meta.get("model_first_event_ms")),
+        execution_meta.get("cache_creation_tokens","-"),execution_meta.get("cache_read_tokens","-"),
         total_ms,not failed,
     )
 
@@ -937,6 +1015,20 @@ def _build_execution_outcome(execution_meta, overall_success):
         "agent_steps": execution_meta.get("agent_steps", 0),
         "provider": execution_meta.get("provider"),
         "model": execution_meta.get("model"),
+        # Performance metrics. Present for every route; the agent-only ones
+        # stay None on a local route rather than being reported as zero.
+        **{
+            key: execution_meta.get(key)
+            for key in (
+                "effort", "context_chars", "context_tokens_estimate",
+                "selected_tool_count", "available_tool_count",
+                "parallel_tool_batches", "parallel_saved_ms",
+                "time_to_first_tool_ms", "model_first_event_ms",
+                "cache_creation_tokens", "cache_read_tokens",
+                "input_tokens", "output_tokens", "estimated_cost_usd",
+                "routing_ms", "escalated_from",
+            )
+        },
     }
 
 

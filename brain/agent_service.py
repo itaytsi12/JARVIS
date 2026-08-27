@@ -18,10 +18,11 @@ rather than an exception.
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from brain.agent_loop import AgentLoop, AgentRun
 from brain.context_builder import ContextBuilder
@@ -116,6 +117,40 @@ def build_memory_handlers(memory: AgentMemory, task_id: str | None = None) -> di
     return {"remember_fact": remember_fact, "recall_memory": recall_memory}
 
 
+#: Verbs that mean the task CHANGES something and has to be got right --
+#: writing code, fixing a bug, running and interpreting tests, debugging.
+#: These get the deeper reasoning budget. Read-only inspection ("list the
+#: files", "what does this do", "run git status and tell me") does not need
+#: it, and paying for it on every step is a large part of why a simple
+#: question felt slow.
+_DEMANDING = re.compile(
+    r"\b(fix|repair|debug|diagnose|implement|refactor|rewrite|patch|migrate|optimi[sz]e|"
+    r"troubleshoot|root\s+cause|why\s+(?:is|does|did|are)|failing|broken|crash\w*|"
+    r"crashes|regression|crash|test\s+again|make\s+it\s+work)\b",
+    re.I,
+)
+
+
+def select_effort(goal: str, skills: Iterable[Skill] = ()) -> str:
+    """How much reasoning effort this task deserves.
+
+    `output_config.effort` controls thinking depth and total token spend per
+    turn. The API default is "high", which is right for genuinely hard work
+    and wasteful for "tell me what files are in this folder" -- it costs
+    thinking tokens, output tokens and wall-clock time on EVERY step.
+
+    So: "high" whenever the goal names work that changes something or has to
+    be reasoned out (see `_DEMANDING`), the configured interactive default
+    otherwise. Deterministic, offline and logged, so the choice is
+    observable rather than a hidden knob -- and it never lowers effort for
+    the tasks that need it.
+    """
+    config = get_config()
+    if _DEMANDING.search(goal or ""):
+        return config.agent_effort_complex
+    return config.agent_effort
+
+
 def _classify_kind(skills: list[Skill]) -> TaskKind:
     return TaskKind.EXCLUSIVE_UI if any(skill.name in UI_SKILLS for skill in skills) else TaskKind.CONCURRENT
 
@@ -131,6 +166,7 @@ def run_agent_task(
     cancellation_token: Any = None,
     session_context: Any = None,
     progress: Callable[[str, dict], None] | None = None,
+    on_answer_text: Callable[[str], None] | None = None,
     record_turns: bool = True,
 ) -> AgentOutcome:
     """Handle one goal end to end, synchronously.
@@ -188,7 +224,9 @@ def run_agent_task(
         )
         run.duration_ms = (time.perf_counter() - started) * 1000
     else:
-        loop = AgentLoop(tracked, catalog, progress=progress)
+        effort = select_effort(goal, skills)
+        log.info("Agent effort for this task: %s (skills=%s)", effort, [skill.name for skill in skills])
+        loop = AgentLoop(tracked, catalog, progress=progress, effort=effort, on_answer_text=on_answer_text)
         run = loop.run(
             goal,
             context=context,

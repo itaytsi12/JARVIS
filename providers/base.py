@@ -152,6 +152,10 @@ class ModelResponse:
     provider: str = ""
     usage: Usage = field(default_factory=Usage)
     latency_ms: float = 0.0
+    #: Milliseconds until the FIRST text token arrived. Only a streaming
+    #: call can know this; None means the response was not streamed, which
+    #: is deliberately distinct from "arrived instantly".
+    first_event_ms: float | None = None
     estimated_cost_usd: float | None = None
     raw_stop_details: dict[str, Any] | None = None
 
@@ -186,8 +190,18 @@ class ModelProvider(Protocol):
         temperature: float | None = None,
         timeout: float | None = None,
         model: str | None = None,
+        effort: str | None = None,
+        cache: bool = True,
+        on_text: Any = None,
     ) -> ModelResponse:
         """Run exactly ONE model turn and return it.
+
+        `effort` and `cache` are hints, not requirements: a provider whose
+        API has no equivalent ignores them, and behaviour is unchanged.
+        `on_text`, when given, is called with each chunk of PUBLIC assistant
+        text as it is produced, so a caller can start speaking before
+        generation finishes; a provider without streaming may ignore it and
+        simply return the finished response.
 
         Deliberately single-turn: the agent loop lives in JARVIS
         (`brain/agent_loop.py`), not inside a provider or a vendor SDK
