@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from brain.context_resolver import observe_tool_result
+from brain.execution_graph import build_waves, partition_wave, plan_is_chain
 from brain.executor import Executor
 from brain.models import Action, ActionRisk, Plan, PlanStatus, ToolResult
 from brain.safe_tools import CONTEXT_INDEPENDENT_TOOLS
@@ -93,9 +94,16 @@ class AgentRuntime:
         results = []
         self._log(f"[PLAN] Goal: {plan.safe_goal()}")
         self._log(f"[PLAN] {len(plan.actions)} steps")
-        if _all_actions_independent(plan.actions):
-            self._log("[PLAN] All steps are independent -- executing concurrently")
-            return self._execute_plan_parallel(plan, cancellation_token, action_observer)
+        # A pure chain (every action waiting on the one before it -- what
+        # `brain/task_planner.py` emits) gains nothing from scheduling and
+        # keeps the original sequential path below, byte for byte. Anything
+        # with real structure goes through the dependency scheduler, which
+        # runs each wave's independent actions together and everything else
+        # in order. `_all_actions_independent` plans are simply the case
+        # where that produces a single all-parallel wave.
+        if not plan_is_chain(plan.actions):
+            self._log("[PLAN] Scheduling by dependency graph")
+            return self._execute_plan_scheduled(plan, cancellation_token, action_observer)
         while plan.current_action_index < len(plan.actions):
             index = plan.current_action_index
             action = plan.actions[index]
@@ -136,70 +144,145 @@ class AgentRuntime:
             plan.status = PlanStatus.COMPLETED
         return results
 
-    def _execute_plan_parallel(self, plan: Plan, cancellation_token=None, action_observer=None) -> list[ToolResult]:
-        """Part H: run every action in `plan` concurrently instead of one
-        at a time. Only ever reached when `_all_actions_independent(plan.actions)`
-        already confirmed every action's tool is in `CONTEXT_INDEPENDENT_TOOLS`
-        (self-contained: no action reads state a sibling writes) and has no
-        `depends_on` wiring -- genuinely dependent plans (e.g. open a
-        browser, then navigate, then click) always take the sequential path
-        above, completely unchanged. Reuses the exact same per-action
-        retry/resource-lock/high-impact-confirmation logic as the
-        sequential path; only the scheduling is different. `self.context`
-        mutations are serialized behind `self._context_lock` since multiple
-        actions may finish at the same time."""
-        results_by_index: dict[int, ToolResult] = {}
-        needs_confirmation = threading.Event()
+    def _run_one_action(self, plan, index, action, cancellation_token, action_observer, plan_lock_held):
+        """Execute a single action and fold its result into shared state.
 
-        def run_one(index: int, action: Action) -> None:
-            if action_observer is not None:
-                action_observer("prepared", index, action, None, self.context)
-            if cancellation_token is not None and cancellation_token.cancelled:
-                result = ToolResult(False, action.tool, "Task cancelled.", error="cancelled")
-            elif not may_auto_execute(action):
-                result = ToolResult(False, action.tool, "High-impact action requires confirmation.", error="human_confirmation_required")
-                needs_confirmation.set()
-            else:
-                # `plan_lock_held=True`: `AgentRuntime.execute()` already
-                # holds the process-wide "action_plan" resource lock for
-                # this whole plan's duration (acquired once, from THIS
-                # method's caller's thread, before any worker thread
-                # existed). `Executor.execute_action`'s own internal
-                # re-acquisition of that same lock is reentrant only for
-                # the thread that first took it -- a worker thread here
-                # would block/timeout trying to take it again. Skip that
-                # redundant re-acquisition; the per-tool resource lock
-                # below is still taken as normal.
-                result = self._execute_with_retry(action, cancellation_token, plan_lock_held=True)
-            with self._context_lock:
-                self.context.previous_action = action.tool
-                self.context.previous_result = result.message
-                if result.success:
-                    self._update_context(action, result)
-            results_by_index[index] = result
-            if action_observer is not None:
-                action_observer("result", index, action, result, self.context)
-
-        with ThreadPoolExecutor(max_workers=min(8, len(plan.actions)), thread_name_prefix="jarvis-parallel-action") as pool:
-            futures = [pool.submit(run_one, index, action) for index, action in enumerate(plan.actions)]
-            for future in futures:
-                future.result()
-
-        results = [results_by_index[index] for index in range(len(plan.actions))]
-        for index, result in enumerate(results):
+        Shared by the sequential-within-a-wave path and the concurrent one,
+        so a parallel action and a sequential action are executed by exactly
+        the same code -- only their scheduling differs. Every mutation of
+        `self.context` happens under `self._context_lock` because several
+        worker threads may finish at the same moment.
+        """
+        if action_observer is not None:
+            action_observer("prepared", index, action, None, self.context)
+        if cancellation_token is not None and cancellation_token.cancelled:
+            result = ToolResult(False, action.tool, "Task cancelled.", error="cancelled")
+        elif not may_auto_execute(action):
+            result = ToolResult(False, action.tool, "High-impact action requires confirmation.", error="human_confirmation_required")
+        else:
+            try:
+                result = self._execute_with_retry(action, cancellation_token, plan_lock_held=plan_lock_held)
+            except Exception as exc:
+                # An exception escaping one action must never abort its
+                # siblings or lose the others' results. It is converted to a
+                # failed ToolResult -- recorded, reported and visible -- not
+                # swallowed.
+                result = ToolResult(False, action.tool, f"Failed to execute {action.tool}.", error=f"{type(exc).__name__}: {exc}")
+        with self._context_lock:
+            self.context.previous_action = action.tool
+            self.context.previous_result = result.message
             if result.success:
-                plan.completed_actions.append(index)
-            elif plan.failed_action is None:
-                plan.failed_action = index
-                plan.failure_information = result.error or result.message
-        plan.current_action_index = len(plan.actions)
-        if all(result.success for result in results):
+                self._update_context(action, result)
+        if action_observer is not None:
+            action_observer("result", index, action, result, self.context)
+        return result
+
+    def _execute_plan_scheduled(self, plan: Plan, cancellation_token=None, action_observer=None) -> list[ToolResult]:
+        """Execute a plan by dependency wave instead of strictly in order.
+
+        `brain/execution_graph.py` levels the plan into waves and splits each
+        wave into the actions that may genuinely run together and those that
+        must not. Within a wave the parallel group runs on a bounded pool and
+        the rest run one at a time; the next wave does not start until the
+        current one has fully finished, which is what makes every
+        `depends_on` edge hold.
+
+        Failure semantics match the sequential path: an action whose
+        dependency never completed is reported as `dependency_failure` and
+        not executed, an `optional` failure is skipped, and any other failure
+        stops the plan -- but only AFTER the wave it happened in has
+        finished, so a sibling that was already running still returns its own
+        result rather than being discarded.
+        """
+        results_by_index: dict[int, ToolResult] = {}
+        needs_confirmation = False
+        stop = False
+        # `AgentRuntime.execute()` already holds the process-wide
+        # "action_plan" lock for this whole plan on the calling thread, and
+        # RLock reentrancy is per-thread -- a worker thread re-acquiring it
+        # would deadlock against its own plan. See _execute_plan_parallel's
+        # original note; the same reasoning applies to every worker here.
+        for wave in build_waves(plan.actions):
+            if stop:
+                break
+            runnable, blocked = [], []
+            for index in wave:
+                if any(dep not in plan.completed_actions for dep in plan.actions[index].depends_on):
+                    blocked.append(index)
+                else:
+                    runnable.append(index)
+            for index in blocked:
+                action = plan.actions[index]
+                if action_observer is not None:
+                    action_observer("prepared", index, action, None, self.context)
+                result = ToolResult(False, action.tool, "Dependency not completed.", error="dependency_failure")
+                results_by_index[index] = result
+                if action_observer is not None:
+                    action_observer("result", index, action, result, self.context)
+            parallel, sequential = partition_wave(plan.actions, runnable)
+            if parallel:
+                workers = max(1, min(len(parallel), self._max_parallel_actions()))
+                self._log(f"[PLAN] Running {len(parallel)} independent steps concurrently")
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jarvis-parallel-action") as pool:
+                    futures = {
+                        index: pool.submit(self._run_one_action, plan, index, plan.actions[index], cancellation_token, action_observer, True)
+                        for index in parallel
+                    }
+                    for index, future in futures.items():
+                        results_by_index[index] = future.result()
+            for index in sequential:
+                results_by_index[index] = self._run_one_action(
+                    plan, index, plan.actions[index], cancellation_token, action_observer, True
+                )
+            for index in sorted(results_by_index):
+                if index in plan.completed_actions:
+                    continue
+                result = results_by_index[index]
+                if result.success:
+                    plan.completed_actions.append(index)
+                    continue
+                if result.error == "human_confirmation_required":
+                    needs_confirmation = True
+                    stop = True
+                elif plan.actions[index].optional:
+                    self._log(f"[SKIP] {result.error or result.message}")
+                    continue
+                elif result.error == "dependency_failure":
+                    stop = True
+                else:
+                    stop = True
+                if plan.failed_action is None:
+                    plan.failed_action = index
+                    plan.failure_information = result.error or result.message
+        results = [results_by_index[index] for index in sorted(results_by_index)]
+        plan.current_action_index = len(plan.actions) if len(plan.completed_actions) == len(plan.actions) else max(plan.completed_actions, default=-1) + 1
+        if len(plan.completed_actions) == len(plan.actions):
             plan.status = PlanStatus.COMPLETED
-        elif needs_confirmation.is_set():
+        elif needs_confirmation:
             plan.status = PlanStatus.PAUSED
+        elif all(result.success for result in results) and not stop:
+            plan.status = PlanStatus.COMPLETED
         else:
             plan.status = PlanStatus.FAILED
         return results
+
+    @staticmethod
+    def _max_parallel_actions() -> int:
+        from config import get_config
+
+        return max(1, int(getattr(get_config(), "max_parallel_tools", 4) or 1))
+
+    def _execute_plan_parallel(self, plan: Plan, cancellation_token=None, action_observer=None) -> list[ToolResult]:
+        """Back-compatible entry point for an all-independent plan.
+
+        This used to be a second, standalone execution engine for the one
+        case where every action could run at once. That case is now just the
+        shape `_execute_plan_scheduled` produces when the dependency graph
+        levels into a single wave, so this delegates instead of maintaining a
+        parallel implementation that could drift from the scheduled one.
+        Kept as a named method because callers and tests refer to it.
+        """
+        return self._execute_plan_scheduled(plan, cancellation_token, action_observer)
 
     def _execute_with_retry(self, action: Action, cancellation_token=None, plan_lock_held: bool = False) -> ToolResult:
         attempts = action.max_attempts or (3 if action.tool in RETRYABLE_READ_ONLY_TOOLS and action.risk is ActionRisk.SAFE else 1)
