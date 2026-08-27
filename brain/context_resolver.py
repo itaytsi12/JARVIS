@@ -100,7 +100,10 @@ _ORDINAL_WORDS = {
 _ORDINAL_SHAPE = re.compile(
     r"^(?:the\s+)?(" + "|".join(_ORDINAL_WORDS) + r"|\d+(?:st|nd|rd|th))\s*(?:one|result|item|file|video|entry)?$", re.I
 )
-_AGAIN_SHAPE = re.compile(r"^(?:do it again|try again|again|repeat (?:that|it)|once more)$", re.I)
+# An optional verb may precede "it again" -- "run it again", "play it
+# again", "open it again" are the same request as "do it again", and the
+# verb is recoverable from the remembered command rather than the words.
+_AGAIN_SHAPE = re.compile(r"^(?:(?:do|run|try|play|open|start|execute)\s+(?:it|that|this)\s+again|do it again|try again|again|repeat (?:that|it)|once more)$", re.I)
 _CORRECTION_SHAPE = re.compile(
     r"^(?:no,?\s*i meant|no,?\s*i mean|actually,?\s*(?:i meant|use|make it)|i meant|not that one,?\s*(?:i meant|use)?\s*)\s*(.*)$",
     re.I,

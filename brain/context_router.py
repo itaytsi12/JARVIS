@@ -87,7 +87,7 @@ def route_with_context(text: str, command: str, context) -> dict | None:
     if not stripped:
         return None
 
-    project_route = _route_open_project(stripped)
+    project_route = _route_open_project(stripped, context)
     if project_route is not None:
         return project_route
 
@@ -125,11 +125,30 @@ def route_with_context(text: str, command: str, context) -> dict | None:
     return None
 
 
-def _route_open_project(stripped: str) -> dict | None:
+#: A deictic project reference names no project at all -- "that"/"this"/"the"
+#: only make sense against what the session already has open.
+_DEICTIC_PROJECT = re.compile(r"^(?:that|this|the|it|my)$", re.I)
+
+
+def _route_open_project(stripped: str, context=None) -> dict | None:
     match = _OPEN_PROJECT.match(stripped)
     if not match:
         return None
-    resolved = resolve_project(match.group(1))
+    spoken = match.group(1).strip()
+    if _DEICTIC_PROJECT.fullmatch(spoken):
+        # "open that project" / "open the project" -- resolve from session
+        # state instead of the words, which name nothing. Without this the
+        # phrase fell through to the generic open_application fallback and
+        # tried to launch an application literally called "that project".
+        path = getattr(context, "last_project_path", None)
+        if not path:
+            return None
+        return {
+            "type": "tool", "tool": "open_path", "arguments": {"path": path},
+            "route_source": "context_project_open",
+            "project_name": getattr(context, "last_project_name", None),
+        }
+    resolved = resolve_project(spoken)
     if not resolved:
         return None
     name, path = resolved
