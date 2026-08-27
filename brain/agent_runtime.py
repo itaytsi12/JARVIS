@@ -14,6 +14,7 @@ from brain.action_results import ReferenceError_, plan_has_references, resolve_a
 from brain.execution_graph import build_waves, partition_wave, plan_is_chain
 from brain.executor import Executor
 from brain.models import Action, ActionRisk, Plan, PlanStatus, ToolResult
+from brain.recovery import plan_recovery
 from brain.safe_tools import CONTEXT_INDEPENDENT_TOOLS
 from brain.session_context import SessionContext
 from brain.task_planner import _BROWSER_CAPABLE_APPS
@@ -124,6 +125,10 @@ class AgentRuntime:
                 plan.status = PlanStatus.PAUSED
             else:
                 result = self._execute_with_retry(action,cancellation_token)
+                if not result.success:
+                    recovery = plan_recovery(action, result)
+                    if recovery is not None:
+                        result = self._attempt_recovery(plan, index, action, result, recovery, cancellation_token, None)
             results.append(result)
             self.context.previous_action = action.tool
             self.context.previous_result = result.message
@@ -149,7 +154,7 @@ class AgentRuntime:
             plan.status = PlanStatus.COMPLETED
         return results
 
-    def _run_one_action(self, plan, index, action, cancellation_token, action_observer, plan_lock_held, results_by_index=None):
+    def _run_one_action(self, plan, index, action, cancellation_token, action_observer, plan_lock_held, results_by_index=None, allow_recovery=True):
         """Execute a single action and fold its result into shared state.
 
         Shared by the sequential-within-a-wave path and the concurrent one,
@@ -186,6 +191,14 @@ class AgentRuntime:
                 # failed ToolResult -- recorded, reported and visible -- not
                 # swallowed.
                 result = ToolResult(False, action.tool, f"Failed to execute {action.tool}.", error=f"{type(exc).__name__}: {exc}")
+        # One bounded recovery attempt, and only for a genuine tool failure.
+        # `allow_recovery=False` on the recovery actions themselves is what
+        # makes an infinite retry loop structurally impossible: a failing
+        # recovery can never generate more recovery.
+        if allow_recovery and not result.success:
+            recovery = plan_recovery(action, result)
+            if recovery is not None:
+                result = self._attempt_recovery(plan, index, action, result, recovery, cancellation_token, action_observer)
         with self._context_lock:
             self.context.previous_action = action.tool
             self.context.previous_result = result.message
@@ -194,6 +207,33 @@ class AgentRuntime:
         if action_observer is not None:
             action_observer("result", index, action, result, self.context)
         return result
+
+    def _attempt_recovery(self, plan, index, action, result, recovery, cancellation_token, action_observer):
+        """Run a `Recovery` and return the result that should stand.
+
+        A clarification replaces the raw tool error with a question for the
+        user. Otherwise each proposed action runs once, with recovery
+        disabled; if they all succeed the original action is reported as
+        recovered, and if any fails the ORIGINAL failure is what stands --
+        a recovery attempt never invents a success.
+        """
+        runtime_log.info("Recovering from %s on %s (%s)", result.error, action.tool, recovery.reason)
+        if recovery.clarification:
+            recovered = ToolResult(False, action.tool, recovery.clarification, error="needs_clarification")
+            recovered.data = dict(result.data or {})
+            recovered.data.update({"recovery_reason": recovery.reason, "original_error": result.error})
+            return recovered
+        for candidate in recovery.actions:
+            attempt = self._run_one_action(plan, index, candidate, cancellation_token, None, False, None, allow_recovery=False)
+            if not attempt.success:
+                if not isinstance(result.data, dict):
+                    result.data = {}
+                result.data.update({"recovery_attempted": recovery.reason, "recovery_succeeded": False})
+                return result
+        recovered = ToolResult(True, action.tool, result.message or f"{action.tool} completed after recovery.")
+        recovered.data = dict(result.data or {})
+        recovered.data.update({"recovery_attempted": recovery.reason, "recovery_succeeded": True, "original_error": result.error})
+        return recovered
 
     @staticmethod
     def _with_resolved_arguments(action, results_by_index):
@@ -268,8 +308,12 @@ class AgentRuntime:
                     for index, future in futures.items():
                         results_by_index[index] = future.result()
             for index in sequential:
+                # Runs on THIS thread, which already holds the plan-level
+                # resource lock reentrantly -- so `plan_lock_held` stays
+                # False, exactly as on the original sequential path. Only a
+                # worker thread needs the skip.
                 results_by_index[index] = self._run_one_action(
-                    plan, index, plan.actions[index], cancellation_token, action_observer, True, results_by_index
+                    plan, index, plan.actions[index], cancellation_token, action_observer, False, results_by_index
                 )
             for index in sorted(results_by_index):
                 if index in plan.completed_actions:
