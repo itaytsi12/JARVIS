@@ -163,6 +163,7 @@ class AgentRuntime:
         `self.context` happens under `self._context_lock` because several
         worker threads may finish at the same moment.
         """
+        action_started = time.perf_counter()
         if action_observer is not None:
             action_observer("prepared", index, action, None, self.context)
         # Substitute any {"__from_result__": ...} argument with the field of
@@ -195,6 +196,9 @@ class AgentRuntime:
         # `allow_recovery=False` on the recovery actions themselves is what
         # makes an infinite retry loop structurally impossible: a failing
         # recovery can never generate more recovery.
+        result_ms = (time.perf_counter() - action_started) * 1000
+        if isinstance(result.data, dict):
+            result.data.setdefault("action_ms", round(result_ms, 3))
         if allow_recovery and not result.success:
             recovery = plan_recovery(action, result)
             if recovery is not None:
@@ -270,6 +274,12 @@ class AgentRuntime:
         results_by_index: dict[int, ToolResult] = {}
         needs_confirmation = False
         stop = False
+        # Lightweight instrumentation: how much the dependency graph actually
+        # bought us. `parallel_saved_ms` is measured, not modelled -- the sum
+        # of a wave's action durations minus its slowest member, which is the
+        # wall clock that overlapping genuinely removed.
+        metrics = {"waves": 0, "parallel_actions": 0, "parallel_saved_ms": 0.0, "scheduled_ms": 0.0}
+        scheduling_started = time.perf_counter()
         # `AgentRuntime.execute()` already holds the process-wide
         # "action_plan" lock for this whole plan on the calling thread, and
         # RLock reentrancy is per-thread -- a worker thread re-acquiring it
@@ -297,7 +307,9 @@ class AgentRuntime:
                 if action_observer is not None:
                     action_observer("result", index, action, result, self.context)
             parallel, sequential = partition_wave(plan.actions, runnable)
+            metrics["waves"] += 1
             if parallel:
+                metrics["parallel_actions"] += len(parallel)
                 workers = max(1, min(len(parallel), self._max_parallel_actions()))
                 self._log(f"[PLAN] Running {len(parallel)} independent steps concurrently")
                 with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jarvis-parallel-action") as pool:
@@ -305,8 +317,12 @@ class AgentRuntime:
                         index: pool.submit(self._run_one_action, plan, index, plan.actions[index], cancellation_token, action_observer, True, dict(results_by_index))
                         for index in parallel
                     }
+                    wave_started = time.perf_counter()
                     for index, future in futures.items():
                         results_by_index[index] = future.result()
+                    wave_elapsed = (time.perf_counter() - wave_started) * 1000
+                    spent = sum(float((results_by_index[i].data or {}).get("action_ms") or 0.0) for i in parallel)
+                    metrics["parallel_saved_ms"] += max(0.0, spent - wave_elapsed)
             for index in sequential:
                 # Runs on THIS thread, which already holds the plan-level
                 # resource lock reentrantly -- so `plan_lock_held` stays
@@ -335,6 +351,11 @@ class AgentRuntime:
                 if plan.failed_action is None:
                     plan.failed_action = index
                     plan.failure_information = result.error or result.message
+        metrics["scheduled_ms"] = round((time.perf_counter() - scheduling_started) * 1000, 3)
+        metrics["parallel_saved_ms"] = round(metrics["parallel_saved_ms"], 3)
+        if not isinstance(plan.context, dict):
+            plan.context = {}
+        plan.context["execution_metrics"] = metrics
         results = [results_by_index[index] for index in sorted(results_by_index)]
         plan.current_action_index = len(plan.actions) if len(plan.completed_actions) == len(plan.actions) else max(plan.completed_actions, default=-1) + 1
         if len(plan.completed_actions) == len(plan.actions):

@@ -354,7 +354,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
             runtime_log.info("Completeness decision: complete=%s reason=%s",completeness["complete"],completeness.get("reason"))
             if not completeness["complete"]:
                 local_fidelity=validate_goal_coverage(command,plan.actions)
-                recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"deterministic_planner","complete":False,"reason":"incomplete_local_plan","clauses":completeness["clauses"],"actions":[{"tool":a.tool,"arguments":_safe_action_arguments(a)} for a in plan.actions]},iid)
+                recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"deterministic_planner","complete":False,"reason":"incomplete_local_plan","clauses":completeness["clauses"],"actions":_plan_action_records(plan.actions),"schedule":_plan_schedule_record(plan.actions)},iid)
                 if "app_identification_uncertain" in local_fidelity:
                     recorder.record(EventType.TASK_BLOCKED,{"reason":"app_identification_uncertain"},iid);execution_meta["success"]=False
                     execution_meta["block_reason"]="app_identification_uncertain";execution_meta["block_errors"]=["app_identification_uncertain"]
@@ -392,7 +392,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                     execution_meta["block_reason"]="cloud_plan_incomplete_or_invalid";execution_meta["block_errors"]=list(errors)
                     return "I identified the application request, but I don't have a complete validated UI plan to play that item, so I didn't open anything."
                 cloud_plan=Plan(command,cloud_actions,context={"planning_trace":{"segments":completeness["clauses"]},"represented_clause_count":len(completeness["clauses"]),"fallback_from":"incomplete_local_plan"})
-                recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"cloud_planner","goal":cloud_plan.safe_goal(),"actions":[{"tool":a.tool,"arguments":_safe_action_arguments(a)} for a in cloud_actions]},iid)
+                recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"cloud_planner","goal":cloud_plan.safe_goal(),"actions":_plan_action_records(cloud_actions),"schedule":_plan_schedule_record(cloud_actions)},iid)
                 results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token,execution_meta,speculative_ledger))
                 execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(cloud_actions,results)
                 execution_meta["success"]=len(results)==len(cloud_actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(cloud_actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
@@ -410,7 +410,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                 recorder.record(EventType.RESOLVED_REFERENCES, {"planning_trace": _safe_reference_payload(plan.context["planning_trace"])}, iid)
             if plan.context.get("resolved_references"):
                 recorder.record(EventType.RESOLVED_REFERENCES, _safe_reference_payload(plan.context["resolved_references"]), iid)
-            recorder.record(EventType.PLAN_CREATED, {"route_type":"task_plan","route_source":"deterministic_planner","goal": plan.safe_goal(), "actions": [{"tool": a.tool, "arguments": _safe_action_arguments(a)} for a in plan.actions]}, iid)
+            recorder.record(EventType.PLAN_CREATED, {"route_type":"task_plan","route_source":"deterministic_planner","goal": plan.safe_goal(), "actions": _plan_action_records(plan.actions), "schedule": _plan_schedule_record(plan.actions)}, iid)
             results = _timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,plan,agent_runtime,cancellation_token,execution_meta,speculative_ledger))
             execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(plan.actions,results)
             execution_meta["success"]=len(results)==len(plan.actions) and all(result.success for result in results)
@@ -442,7 +442,7 @@ def _run_agent_impl(command: str, route: dict | None, recorder, iid: str, execut
                 execution_meta["block_reason"]="cloud_plan_incomplete_or_invalid";execution_meta["block_errors"]=list(errors)
                 return "I couldn't build a complete validated plan for every part of that request, so I didn't execute anything."
             cloud_plan=Plan(command,cloud_actions,context={"planning_trace":{"segments":missing_completeness["clauses"]},"represented_clause_count":len(missing_completeness["clauses"]),"fallback_from":"missing_local_plan"})
-            recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"cloud_planner","goal":cloud_plan.safe_goal(),"actions":[{"tool":a.tool,"arguments":_safe_action_arguments(a)} for a in cloud_actions]},iid)
+            recorder.record(EventType.PLAN_CREATED,{"route_type":"task_plan","route_source":"cloud_planner","goal":cloud_plan.safe_goal(),"actions":_plan_action_records(cloud_actions),"schedule":_plan_schedule_record(cloud_actions)},iid)
             results=_timed(execution_meta,"tool_execution_ms",lambda: _execute_recorded_plan(recorder,iid,cloud_plan,agent_runtime,cancellation_token,execution_meta,speculative_ledger))
             execution_meta["executed_actions"],execution_meta["executed_results"]=_paired_execution(cloud_actions,results)
             execution_meta["success"]=len(results)==len(cloud_actions) and all(result.success for result in results);execution_meta["verified"]=_results_verified(cloud_actions,results);execution_meta["model_calls"]+=_result_model_calls(results)
@@ -921,6 +921,43 @@ def _log_request_performance(execution_meta: dict, request_started: float, faile
 
 def _bounded_context(context):
     return {"active_app":context.active_app,"last_opened_app":context.last_opened_app,"browser_active":context.browser_active,"has_last_assistant_response":bool(context.last_assistant_response),"has_last_spoken_response":bool(context.last_spoken_response),"has_pending_message":bool(context.pending_messaging_message)}
+
+
+def _plan_action_records(actions):
+    """Per-action dataset records including the plan's DEPENDENCY STRUCTURE.
+
+    The recorded plan used to be a flat list of tool + arguments, which threw
+    away exactly the part a future model would need to learn from: which
+    steps were ordered, which were independent, and which were optional.
+    Arguments still go through `_safe_action_arguments`, so nothing here
+    changes what is redacted.
+    """
+    return [
+        {
+            "index": index,
+            "tool": action.tool,
+            "arguments": _safe_action_arguments(action),
+            "depends_on": list(action.depends_on),
+            "optional": bool(action.optional),
+            "risk": getattr(action.risk, "value", str(action.risk)),
+        }
+        for index, action in enumerate(actions)
+    ]
+
+
+def _plan_schedule_record(actions):
+    """How the scheduler will actually run this plan (waves + concurrency).
+
+    Recorded alongside the actions so a trace shows the concurrency that was
+    available, not a flat list that hides it. Never raises: a cyclic or
+    malformed plan is a planning bug that must still be recordable.
+    """
+    try:
+        from brain.execution_graph import describe_schedule
+
+        return describe_schedule(list(actions))
+    except Exception:
+        return []
 
 
 def _record_prepared_actions(recorder,iid,actions,context):
