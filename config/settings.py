@@ -93,6 +93,25 @@ class JarvisConfig:
 
     # ---- model provider ---------------------------------------------
     anthropic_api_key: str | None = field(default_factory=lambda: _secret("ANTHROPIC_API_KEY"), repr=False)
+    nvidia_api_key: str | None = field(default_factory=lambda: _secret("NVIDIA_API_KEY"), repr=False)
+    openrouter_api_key: str | None = field(default_factory=lambda: _secret("OPENROUTER_API_KEY"), repr=False)
+    groq_api_key: str | None = field(default_factory=lambda: _secret("GROQ_API_KEY"), repr=False)
+    cerebras_api_key: str | None = field(default_factory=lambda: _secret("CEREBRAS_API_KEY"), repr=False)
+    google_api_key: str | None = field(default_factory=lambda: _secret("GOOGLE_API_KEY"), repr=False)
+    cloudflare_api_token: str | None = field(default_factory=lambda: _secret("CLOUDFLARE_API_TOKEN"), repr=False)
+    cloudflare_account_id: str | None = field(default_factory=lambda: _secret("CLOUDFLARE_ACCOUNT_ID"), repr=False)
+    mistral_api_key: str | None = field(default_factory=lambda: _secret("MISTRAL_API_KEY"), repr=False)
+    cohere_api_key: str | None = field(default_factory=lambda: _secret("COHERE_API_KEY"), repr=False)
+    hf_token: str | None = field(default_factory=lambda: _secret("HF_TOKEN"), repr=False)
+    moonshot_api_key: str | None = field(default_factory=lambda: _secret("MOONSHOT_API_KEY"), repr=False)
+    github_token: str | None = field(default_factory=lambda: _secret("GITHUB_TOKEN"), repr=False)
+    vercel_ai_gateway_api_key: str | None = field(default_factory=lambda: _secret("VERCEL_AI_GATEWAY_API_KEY"), repr=False)
+    lmstudio_base_url: str = field(default_factory=lambda: _text("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"))
+    ollama_base_url: str = field(default_factory=lambda: _text("OLLAMA_BASE_URL", "http://localhost:11434/v1"))
+    enable_anthropic_fallback: bool = field(default_factory=lambda: _flag("ENABLE_ANTHROPIC_FALLBACK", True))
+    local_model_idle_unload_minutes: int = field(default_factory=lambda: _int("LOCAL_MODEL_IDLE_UNLOAD_MINUTES", 15))
+    model_registry_cache_ttl: int = field(default_factory=lambda: _int("MODEL_REGISTRY_CACHE_TTL_SECONDS", 21600))
+    provider_discovery_timeout: float = field(default_factory=lambda: _float("JARVIS_PROVIDER_DISCOVERY_TIMEOUT", 3.0))
     agent_model: str = field(default_factory=lambda: _text("JARVIS_AGENT_MODEL", "claude-opus-5"))
     agent_max_tokens: int = field(default_factory=lambda: _int("JARVIS_AGENT_MAX_TOKENS", 4096))
     agent_temperature: float = field(default_factory=lambda: _float("JARVIS_AGENT_TEMPERATURE", 0.0))
@@ -101,7 +120,7 @@ class JarvisConfig:
     provider_order: tuple[str, ...] = field(
         default_factory=lambda: tuple(
             part.strip().lower()
-            for part in _text("JARVIS_PROVIDER_ORDER", "anthropic").split(",")
+            for part in _text("JARVIS_PROVIDER_ORDER", "multi_model,anthropic").split(",")
             if part.strip()
         )
     )
@@ -144,6 +163,24 @@ class JarvisConfig:
     # ---- cost tracking ----------------------------------------------
     cost_tracking_enabled: bool = field(default_factory=lambda: _flag("JARVIS_COST_TRACKING", True))
     pricing_file: str = field(default_factory=lambda: _text("JARVIS_PRICING_FILE", ""))
+
+    # ---- desktop startup / UI ---------------------------------------
+    #: Whether `main.py --start` (and therefore the Windows logon task)
+    #: brings up the graphical interface. `--no-ui` overrides it for one
+    #: run; this is the persistent default.
+    ui_enabled: bool = field(default_factory=lambda: _flag("JARVIS_UI_ENABLED", True))
+    #: Fullscreen vs maximized on launch. Escape always leaves fullscreen,
+    #: whatever this says -- see `ui/qml/main.qml`.
+    ui_fullscreen: bool = field(default_factory=lambda: _flag("START_UI_FULLSCREEN", False))
+    #: Open JARVIS's OWN dedicated Chrome profile at startup if it is not
+    #: already running (`startup/chrome.py`). Never the user's personal
+    #: profile, and never a second copy of JARVIS's.
+    auto_open_chrome: bool = field(default_factory=lambda: _flag("AUTO_OPEN_CHROME", True))
+    #: Start the always-on wake-word/voice assistant at startup.
+    auto_start_voice: bool = field(default_factory=lambda: _flag("AUTO_START_VOICE", True))
+    #: Show the notification-area icon alongside the window. The tray is
+    #: how JARVIS is exited and configured, so this defaults on.
+    tray_enabled: bool = field(default_factory=lambda: _flag("TRAY_ENABLED", True))
 
     # ---- memory ------------------------------------------------------
     memory_min_importance: int = field(default_factory=lambda: _int("JARVIS_MEMORY_MIN_IMPORTANCE", 2))

@@ -20,7 +20,27 @@ import sys
 
 
 def _print(payload) -> None:
-    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    """Print a diagnostic payload without ever dying on the console codec.
+
+    Windows consoles default to cp1252, which cannot encode the Hebrew
+    playlist and track titles this library is full of. `ensure_ascii=False`
+    is kept (escaped Hebrew is unreadable and the point of the tool is to
+    SEE the real titles), and stdout is reconfigured to UTF-8 instead --
+    the diagnostic crashing with a UnicodeEncodeError after successfully
+    fetching the data was strictly worse than either alternative.
+    Confirmed live: `python -m tools.music.diagnose_cli playlists` raised
+    `'charmap' codec can't encode characters` on a real library.
+    """
+    text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            print(text)
+        except Exception:
+            # Last resort: never lose the payload to a console limitation.
+            print(text.encode("utf-8", "replace").decode("ascii", "replace"))
 
 
 def now_playing() -> None:

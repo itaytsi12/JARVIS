@@ -13,6 +13,8 @@ from tools.system import (
     close_foreground_window,
 )
 from tools.files import (
+    file_info,
+    recent_files,
     create_directory,
     open_known_folder,
     open_path,
@@ -43,6 +45,16 @@ from tools.audio import (
 from tools.ui import (
     press_key,
     click_at,
+    scroll_screen,
+)
+from tools.clipboard import read_clipboard, write_clipboard
+from tools.machine import (
+    get_volume,
+    list_processes,
+    network_status,
+    process_running,
+    set_volume,
+    system_status,
 )
 from tools.browser import open_website
 from tools.whatsapp import send_whatsapp_message
@@ -207,22 +219,38 @@ def _execute_tool_impl(
         return result
 
     if tool_name == "minimize_window":
-        result = minimize_foreground_window()
+        # `hwnd` is optional and defaults to the foreground window. Passing
+        # it through is what lets the agent act on a SPECIFIC window it
+        # found with `inspect_window`, rather than only on whatever
+        # happens to be in front by the time the action runs.
+        result = minimize_foreground_window(arguments.get("hwnd"))
         
         return result
 
     if tool_name == "maximize_window":
-        result = maximize_foreground_window()
+        # `hwnd` is optional and defaults to the foreground window. Passing
+        # it through is what lets the agent act on a SPECIFIC window it
+        # found with `inspect_window`, rather than only on whatever
+        # happens to be in front by the time the action runs.
+        result = maximize_foreground_window(arguments.get("hwnd"))
         
         return result
 
     if tool_name == "restore_window":
-        result = restore_foreground_window()
+        # `hwnd` is optional and defaults to the foreground window. Passing
+        # it through is what lets the agent act on a SPECIFIC window it
+        # found with `inspect_window`, rather than only on whatever
+        # happens to be in front by the time the action runs.
+        result = restore_foreground_window(arguments.get("hwnd"))
         
         return result
 
     if tool_name == "close_window":
-        result = close_foreground_window()
+        # `hwnd` is optional and defaults to the foreground window. Passing
+        # it through is what lets the agent act on a SPECIFIC window it
+        # found with `inspect_window`, rather than only on whatever
+        # happens to be in front by the time the action runs.
+        result = close_foreground_window(arguments.get("hwnd"))
         
         return result
 
@@ -300,6 +328,36 @@ def _execute_tool_impl(
 
         return result
 
+    # Observation and small utilities. Grouped in one table rather than as
+    # a dozen `if` branches: every one takes its arguments straight from
+    # the schema in `brain/tool_catalog.py`, so there is nothing
+    # per-tool to say here.
+    simple_tools = {
+        "read_clipboard": lambda: read_clipboard(),
+        "write_clipboard": lambda: write_clipboard(arguments["text"]),
+        "list_processes": lambda: list_processes(arguments.get("name"), arguments.get("limit", 40)),
+        "process_running": lambda: process_running(arguments["name"]),
+        "system_status": lambda: system_status(),
+        "network_status": lambda: network_status(),
+        "get_volume": lambda: get_volume(),
+        "set_volume": lambda: set_volume(arguments["level"]),
+        "file_info": lambda: file_info(arguments["path"]),
+        "recent_files": lambda: recent_files(
+            arguments.get("path"),
+            arguments.get("within_hours", 48),
+            arguments.get("limit", 25),
+            arguments.get("suffixes"),
+        ),
+        "scroll_screen": lambda: scroll_screen(
+            arguments.get("direction", "down"),
+            arguments.get("clicks", 3),
+            arguments.get("x"),
+            arguments.get("y"),
+        ),
+    }
+    if tool_name in simple_tools:
+        return simple_tools[tool_name]()
+
     music_no_arg_tools = {
         "open_music": music.open_music,
         "music_pause": music.music_pause,
@@ -327,6 +385,23 @@ def _execute_tool_impl(
 
     if tool_name == "music_queue_next":
         return music.music_queue_next(arguments.get("song"), arguments.get("contextual", False))
+
+    if tool_name == "music_list_playlists":
+        return music.music_list_playlists()
+
+    if tool_name == "music_create_playlist":
+        return music.music_create_playlist(
+            arguments["name"],
+            arguments.get("songs"),
+            arguments.get("artist"),
+        )
+
+    if tool_name == "music_add_to_playlist":
+        return music.music_add_to_playlist(
+            arguments["song"],
+            arguments["playlist"],
+            arguments.get("artist"),
+        )
 
     if tool_name == "music_play":
         return music.music_play(

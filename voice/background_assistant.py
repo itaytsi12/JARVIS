@@ -115,6 +115,13 @@ class AlwaysOnAssistant:
         self.log.info("State: %s%s", state.value, f" - {detail}" if detail else "")
         from brain.activity_state import set_speaking
         set_speaking(state is AssistantState.SPEAKING)
+        # Runtime event bus (config/events.py). The graphical UI subscribes
+        # to this; `publish` never raises and does nothing at all when
+        # nothing is subscribed, so a headless/tray-only run is unaffected.
+        # Deliberately NOT routed through `state_callback` -- that slot is
+        # the tray's, and one callback cannot serve two observers.
+        from config import events
+        events.publish(events.ASSISTANT_STATE, state=state.value, detail=self.status_detail)
         if self.state_callback:
             try:
                 self.state_callback(state, detail)
@@ -522,6 +529,8 @@ class AlwaysOnAssistant:
             command, _ = normalize_transcript(transcript)
             self._perf("normalization_completed")
             self.log.info("Normalized command: %s", _redact_for_log(command))
+            from config import events as runtime_events
+            runtime_events.publish(runtime_events.USER_TEXT, text=command)
             if not command:
                 self._set_state(AssistantState.IDLE, "No command after wake phrase")
                 return
@@ -733,6 +742,12 @@ class AlwaysOnAssistant:
     def _start_speech_task(self,spoken,lang,interaction_id=None,priority=None) -> None:
         from .speech_coordinator import PRIORITY_STATUS
         if priority is None:priority=PRIORITY_STATUS
+        # Every spoken line JARVIS produces goes through this one dispatch
+        # site, so it is the single place the UI needs to learn what was
+        # said -- published before the (blocking) speech call starts.
+        from config import events as runtime_events
+        runtime_events.publish(runtime_events.JARVIS_TEXT, text=spoken)
+
         def work():
             try:
                 from brain.agent import agent_runtime

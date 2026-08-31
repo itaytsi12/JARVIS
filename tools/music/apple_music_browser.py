@@ -74,6 +74,22 @@ _REPEAT_NAME = re.compile(r"repeat", re.I)
 _ADD_LIBRARY_NAME = re.compile(r"^\s*add(?:\s+to\s+library)?\s*$", re.I)
 _ADD_FAVORITE_NAME = re.compile(r"favorite|love", re.I)
 _SIGN_IN_NAME = re.compile(r"sign in|log in", re.I)
+# Row context-menu entries. Confirmed live against the real site: a track
+# row's "more" button opens a `[role="menu"]` / `.contextual-menu` whose
+# items are exactly "Pin Song / Delete from Library / Add to Playlist /
+# New Playlist / <recent playlists> / All playlists / <every playlist> /
+# Play Next / Play Last / Create Station / Favourite / Suggest Less /
+# View Credits". The Add-to-Playlist SUBMENU is already present in the DOM
+# alongside the top-level menu, which is why a playlist name can be
+# clicked directly once the menu is open.
+_ADD_TO_PLAYLIST_NAME = re.compile(r"^\s*add to playlist\s*$", re.I)
+_NEW_PLAYLIST_NAME = re.compile(r"^\s*new playlist\s*$", re.I)
+_MENU_SELECTOR = "[role='menu']:visible, .contextual-menu:visible"
+# The inline field "New Playlist" reveals. Confirmed live: it carries
+# `data-testid="playlist-title-input"` and the accessible name "Playlist
+# Title", and clicking "New Playlist" does NOT navigate -- an earlier
+# version waited for a `/playlist/` URL that never came.
+_PLAYLIST_TITLE_INPUT = "[data-testid='playlist-title-input'], input[aria-label='Playlist Title']"
 _SEARCH_NAME = re.compile(r"search", re.I)
 # Confirmed live: every track row (search result detail page, album,
 # playlist) exposes an accessible button named exactly "Play <title> by
@@ -166,23 +182,65 @@ class AppleMusicWebController:
     # Sign-in state
     # ------------------------------------------------------------------
 
-    def is_signed_in(self, page=None) -> bool:
+    def is_signed_in(self, page=None, settle_timeout: float = 8.0) -> bool:
+        """Is Apple Music Web actually signed in on this tab?
+
+        Waits for the app shell to hydrate before deciding. Apple Music
+        renders a "Sign In" control in its initial HTML and only replaces
+        it with the account affordance once the SPA has loaded the user
+        session, so checking immediately after opening a fresh tab
+        reported "not signed in" for a perfectly signed-in account --
+        confirmed live, right after `_autostart_chrome` opened the tab.
+
+        Resolves as soon as EITHER answer is genuinely visible, so the
+        common case costs nothing; the timeout only bites on a page that
+        never settles, and it then falls back to the previous behaviour
+        (assume signed in unless a sign-in control is showing) rather than
+        inventing an answer.
+        """
         page = page or self._page
         if page is None:
             return False
-        try:
-            sign_in = page.get_by_role("button", name=_SIGN_IN_NAME).first
-            if sign_in.is_visible(timeout=1500):
+        deadline = time.monotonic() + max(0.0, float(settle_timeout))
+        while True:
+            if self._sign_in_control_visible(page):
                 return False
-        except Exception:
-            pass
-        try:
-            sign_in_link = page.get_by_role("link", name=_SIGN_IN_NAME).first
-            if sign_in_link.is_visible(timeout=1000):
-                return False
-        except Exception:
-            pass
-        return True
+            if self._signed_in_marker_visible(page):
+                return True
+            if time.monotonic() >= deadline:
+                # Neither marker resolved. Keep the historical default:
+                # no visible sign-in control means signed in.
+                return True
+            page.wait_for_timeout(300)
+
+    def _sign_in_control_visible(self, page) -> bool:
+        for role in ("button", "link"):
+            try:
+                if page.get_by_role(role, name=_SIGN_IN_NAME).first.is_visible(timeout=400):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _signed_in_marker_visible(self, page) -> bool:
+        """Something only a signed-in session shows.
+
+        The account control and the Library navigation are both confirmed
+        live on the signed-in shell ("My Account" appeared in the real
+        button list); either one is proof the session loaded, which is
+        what makes an early "not signed in" impossible to report.
+        """
+        for role, pattern in (
+            ("button", re.compile(r"my account|account", re.I)),
+            ("button", re.compile(r"^\s*library\s*$", re.I)),
+            ("link", re.compile(r"^\s*library\s*$", re.I)),
+        ):
+            try:
+                if page.get_by_role(role, name=pattern).first.is_visible(timeout=400):
+                    return True
+            except Exception:
+                continue
+        return False
 
     # ------------------------------------------------------------------
     # Now-playing observation (Part 5/14/18)
@@ -403,6 +461,59 @@ class AppleMusicWebController:
     # Search (Part 8)
     # ------------------------------------------------------------------
 
+
+    #: Result links, used both to detect that a search has rendered and to
+    #: detect that it has stopped changing.
+    _RESULT_LINK_SELECTOR = "a[href*='/album/'], a[href*='/artist/'], a[href*='/playlist/'], a[href*='/song/']"
+
+    def _wait_for_search_results(self, page, query: str, timeout: float = 10.0) -> bool:
+        """Block until the search page is really showing `query`'s results.
+
+        Step 1: the SPA copies the URL's `term` into its own search box, so
+        that box holding the new query is proof the new navigation was
+        processed -- not merely that some links exist.
+
+        Step 2: the result count has to stop changing. Apple streams the
+        shelves in, and reading mid-render yields a partial (and
+        previous-query-contaminated) list. Two consecutive identical counts
+        is the settle signal.
+
+        Returns whether it settled; a timeout is not an error -- the caller
+        reads whatever is there, which is the same behaviour as before,
+        just no longer the DEFAULT behaviour.
+        """
+        deadline = time.monotonic() + timeout
+        wanted = (query or "").strip().lower()
+
+        # Step 1 -- the search box reflects the new term.
+        while time.monotonic() < deadline:
+            try:
+                box = page.locator("input[data-testid='search-input__text-field'], [data-testid='search-input'] input").first
+                value = (box.input_value(timeout=500) or "").strip().lower()
+                if wanted and wanted in value:
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(150)
+
+        # Step 2 -- the result list stops growing.
+        previous = -1
+        stable = 0
+        while time.monotonic() < deadline:
+            try:
+                count = page.locator(self._RESULT_LINK_SELECTOR).count()
+            except Exception:
+                count = -1
+            if count > 0 and count == previous:
+                stable += 1
+                if stable >= 2:
+                    return True
+            else:
+                stable = 0
+            previous = count
+            page.wait_for_timeout(250)
+        return False
+
     def search(self, query: str) -> list[dict[str, str]]:
         """Navigate Apple Music's catalog+library search and return
         candidate results as `{"type", "title", "subtitle"}` dicts
@@ -416,12 +527,20 @@ class AppleMusicWebController:
             return []
         # Live-confirmed: results render well after domcontentloaded (this
         # is a heavy client-rendered SPA) -- a short fixed sleep missed
-        # them entirely. Wait for an actual result link instead of guessing
-        # a duration.
-        try:
-            page.locator("a[href*='/album/'], a[href*='/artist/'], a[href*='/playlist/']").first.wait_for(state="visible", timeout=8000)
-        except Exception:
-            pass  # genuinely no results -- fall through to an empty list
+        # them entirely.
+        #
+        # Waiting for "a result link is visible" is NOT enough, and that bug
+        # was confirmed live: this is a single long-lived tab, so the
+        # PREVIOUS query's links are still in the DOM the instant the new
+        # URL commits, the wait returns immediately, and the caller scores
+        # the old page's results. A search for "Save Your Tears" returned
+        # Khalid, twenty one pilots and "thank u, next" that way, and
+        # `_best_search_match` duly picked "Stressed Out" -- a wrong song
+        # chosen with complete confidence.
+        #
+        # So settle on the NEW query in two steps, both of which observe
+        # real page state rather than sleeping a guessed duration.
+        self._wait_for_search_results(page, query)
         results: list[dict[str, str]] = []
         try:
             candidates = page.get_by_role("link").all()
@@ -545,6 +664,329 @@ class AppleMusicWebController:
         except Exception as exc:
             log.info("Apple Music queue: menu item not found for pattern=%r: %s", name_pattern.pattern, exc)
             return False
+
+    # ------------------------------------------------------------------
+    # Playlists: adding a track, and creating one
+    # ------------------------------------------------------------------
+    #
+    # Everything below drives the track row's own context menu, whose real
+    # structure was confirmed live against the signed-in account (see
+    # `_ADD_TO_PLAYLIST_NAME` above for the observed item list). That menu
+    # is the only surface on Apple Music Web offering BOTH "add this to an
+    # existing playlist" and "make a new playlist from this", so both
+    # operations share one code path rather than being two independent
+    # guesses at Apple's markup.
+
+    def _open_track_menu(self, title: str | None = None, artist: str | None = None) -> bool:
+        """Open the context menu for a specific track row (or the first row
+        on the page when no title is given).
+
+        Apple Music renders one `more` button per row, all with the SAME
+        accessible name ("more"), so a row is identified by its
+        neighbouring "Play <title> by <artist>" button -- the one per-row
+        control that IS uniquely named -- and the menu button is taken from
+        that row. `play_specific_track` already identifies rows the same
+        way, so the two can never disagree about which row is which.
+        """
+        page = self._page
+        if page is None:
+            return False
+        try:
+            if title and title.strip():
+                escaped = re.escape(title.strip())
+                pattern = re.compile(rf"^Play\s+{escaped}(?:\s+by\s+.+)?$", re.I)
+                row_button = page.get_by_role("button", name=pattern).first
+            else:
+                row_button = page.get_by_role("button", name=_ROW_PLAY_NAME).first
+            row_button.wait_for(state="visible", timeout=6000)
+            # Walk up to the row container and back down to its own
+            # more-button: scoping to the row is what stops row 1's menu
+            # opening when row 7 was meant.
+            row = row_button.locator(
+                "xpath=ancestor::*[self::tr or self::li or @role='row' or @role='listitem'][1]"
+            )
+            more = row.get_by_role("button", name=re.compile(r"^\s*more\s*$", re.I)).first
+            more.scroll_into_view_if_needed(timeout=3000)
+            more.click(timeout=4000)
+        except Exception as exc:
+            log.info("Apple Music: could not open the row menu for %r: %s", title, exc)
+            return False
+        try:
+            page.locator(_MENU_SELECTOR).first.wait_for(state="visible", timeout=4000)
+            return True
+        except Exception:
+            log.info("Apple Music: the row menu did not appear for %r", title)
+            return False
+
+    def open_track_menu(self, title: str | None = None, artist: str | None = None, attempts: int = 2) -> bool:
+        """`_open_track_menu` with one bounded retry.
+
+        This is a heavy client-rendered SPA and a row can still be
+        painting when the click lands. One retry after a short settle
+        costs a second in the rare failing case and removes a whole class
+        of "it worked the first time and not the second" flakiness. The
+        retry count is bounded by construction -- there is no loop that
+        can run away.
+        """
+        for attempt in range(max(1, int(attempts))):
+            if self._open_track_menu(title, artist):
+                return True
+            self._close_menus()
+            if attempt + 1 < attempts and self._page is not None:
+                self._page.wait_for_timeout(900)
+        return False
+
+    def _close_menus(self) -> None:
+        """Escape out of any open context menu. Always safe, and always run
+        in a `finally` so a failed playlist operation never leaves a menu
+        covering the page for whatever runs next."""
+        page = self._page
+        if page is None:
+            return
+        for _ in range(3):
+            try:
+                if page.locator(_MENU_SELECTOR).count() == 0:
+                    return
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(150)
+            except Exception:
+                return
+
+    #: Menu entries that are commands, not playlist names. Anything else in
+    #: the open menu is a playlist the account owns.
+    _MENU_COMMAND_LABELS = frozenset({
+        "pin song", "unpin song", "delete from library", "add to playlist",
+        "new playlist", "recents", "all playlists", "play next", "play last",
+        "create station", "favourite", "favorite", "unfavourite", "unfavorite",
+        "suggest less", "view credits", "add to library", "share song",
+        "go to album", "go to artist", "share playlist", "remove from playlist",
+    })
+
+    def _menu_entry(self, name, exact: bool = True):
+        """One entry of an open Apple Music context menu.
+
+        Confirmed live: Apple renders these as `role="button"` inside a
+        `[role="menu"]`, NOT as `role="menuitem"`. Querying menuitem found
+        nothing and timed out -- so button is tried FIRST and menuitem is
+        kept only as a fallback in case Apple changes it back.
+        """
+        page = self._page
+        for role in ("button", "menuitem"):
+            try:
+                candidate = page.get_by_role(role, name=name, exact=exact).first
+                if candidate.is_visible(timeout=1200):
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    def _open_add_to_playlist_submenu(self) -> bool:
+        """Expand the "Add to Playlist" submenu of an open row menu.
+
+        Confirmed live: the submenu's contents ("New Playlist", "Recents",
+        every playlist) are present in the DOM as soon as the row menu
+        opens, but they are NOT visible or clickable until this parent
+        entry is activated. An earlier version clicked the playlist name
+        directly and timed out for exactly that reason.
+        """
+        page = self._page
+        if page is None:
+            return False
+        entry = self._menu_entry(_ADD_TO_PLAYLIST_NAME, exact=False)
+        if entry is None:
+            log.info("Apple Music: the row menu has no 'Add to Playlist' entry")
+            return False
+        try:
+            entry.click(timeout=3000)
+            page.wait_for_timeout(700)
+        except Exception as exc:
+            log.info("Apple Music: could not open the Add-to-Playlist submenu: %s", exc)
+            return False
+        # "New Playlist" heads that submenu, so its visibility is the
+        # signal that the submenu genuinely expanded.
+        return self._menu_entry(_NEW_PLAYLIST_NAME, exact=False) is not None
+
+    def menu_playlist_names(self) -> list[str]:
+        """The playlist names offered by the currently open Add-to-Playlist
+        submenu.
+
+        Lets a failure report "I could not find a playlist called X -- here
+        are the ones that exist", which is far more useful to both the user
+        and the agent than a bare "not found".
+        """
+        page = self._page
+        if page is None:
+            return []
+        names: list[str] = []
+        try:
+            for role in ("button", "menuitem"):
+                for item in page.get_by_role(role).all()[:200]:
+                    try:
+                        if not item.is_visible():
+                            continue
+                        text = (item.inner_text(timeout=150) or "").strip()
+                    except Exception:
+                        continue
+                    # A multi-line entry is a container, not a leaf item.
+                    if not text or "\n" in text or len(text) > 80:
+                        continue
+                    if text.lower() in self._MENU_COMMAND_LABELS:
+                        continue
+                    if text not in names:
+                        names.append(text)
+                if names:
+                    break
+        except Exception:
+            log.debug("Reading the menu's playlist names failed", exc_info=True)
+        return names
+
+    def add_track_to_playlist(self, playlist: str, title: str | None = None, artist: str | None = None) -> dict[str, Any]:
+        """Add a track on the current page to an existing playlist.
+
+        Returns a dict rather than a bool so an unmatched name can carry
+        the real list of available playlists back to the caller. Nothing is
+        guessed: the name must match a menu entry exactly
+        (case-insensitively) or, failing that, unambiguously as a prefix --
+        one candidate, never "the closest of several".
+        """
+        wanted = (playlist or "").strip()
+        if not wanted:
+            return {"added": False, "error": "missing_playlist"}
+        if not self.open_track_menu(title, artist):
+            return {"added": False, "error": "row_menu_unavailable"}
+
+        page = self._page
+        try:
+            if not self._open_add_to_playlist_submenu():
+                return {"added": False, "error": "add_to_playlist_unavailable"}
+            available = self.menu_playlist_names()
+            lowered = wanted.lower()
+            exact = [name for name in available if name.lower() == lowered]
+            prefix = [name for name in available if name.lower().startswith(lowered)] if not exact else []
+            if not exact and len(prefix) != 1:
+                return {
+                    "added": False,
+                    "error": "playlist_not_found" if not prefix else "playlist_ambiguous",
+                    "available": available,
+                    "candidates": prefix,
+                }
+            target = (exact or prefix)[0]
+            entry = self._menu_entry(target, exact=True)
+            if entry is None:
+                return {"added": False, "error": "playlist_entry_not_clickable", "available": available}
+            entry.click(timeout=3000)
+            page.wait_for_timeout(900)
+            # The menu closing is Apple's own acknowledgement that the entry
+            # was accepted. That is a weak signal by itself, which is why
+            # the provider re-opens the playlist and checks the track is
+            # genuinely listed; this reports only what the UI did.
+            menu_closed = page.locator(_MENU_SELECTOR).count() == 0
+            return {"added": True, "playlist": target, "menu_closed": menu_closed}
+        except Exception as exc:
+            log.info("Apple Music: adding to playlist %r failed: %s", wanted, exc)
+            return {"added": False, "error": f"add_failed:{type(exc).__name__}"}
+        finally:
+            self._close_menus()
+
+    def create_playlist_from_track(self, name: str, title: str | None = None, artist: str | None = None) -> dict[str, Any]:
+        """Create a NEW playlist called `name`, containing the track on the
+        current page.
+
+        Apple Music Web has no "create an empty playlist" control that can
+        be driven reliably. What it does have -- confirmed live -- is
+        "New Playlist" inside a track's Add-to-Playlist submenu. Clicking it
+        does NOT navigate anywhere: it reveals an inline text field
+        (`data-testid="playlist-title-input"`, accessible name "Playlist
+        Title") on the same page, and committing that field creates the
+        playlist with the track already in it. So the name is set AT
+        creation rather than by a separate rename afterwards -- which is
+        both fewer steps and impossible to leave half-done as a stray
+        playlist called "New Playlist".
+        """
+        name = (name or "").strip()
+        if not name:
+            return {"created": False, "error": "missing_name"}
+        if not self.open_track_menu(title, artist):
+            return {"created": False, "error": "row_menu_unavailable"}
+        page = self._page
+        try:
+            if not self._open_add_to_playlist_submenu():
+                return {"created": False, "error": "add_to_playlist_unavailable"}
+            entry = self._menu_entry(_NEW_PLAYLIST_NAME, exact=False)
+            if entry is None:
+                return {"created": False, "error": "new_playlist_unavailable"}
+            entry.click(timeout=4000)
+
+            field = page.locator(_PLAYLIST_TITLE_INPUT).first
+            try:
+                field.wait_for(state="visible", timeout=5000)
+            except Exception:
+                return {"created": False, "error": "title_field_did_not_appear"}
+            field.click(timeout=3000)
+            field.fill(name, timeout=3000)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(1800)
+            return {"created": True, "name": name, "url": page.url}
+        except Exception as exc:
+            log.info("Apple Music: creating a playlist failed: %s", exc)
+            return {"created": False, "error": f"create_failed:{type(exc).__name__}"}
+        finally:
+            self._close_menus()
+
+    def open_library_playlist(self, name: str) -> dict[str, Any]:
+        """Navigate to one of the account's own playlists by name.
+
+        Reuses `list_library_playlists` (the real `/library/all-playlists`
+        reader) rather than guessing a URL, so the href is always one Apple
+        itself produced.
+        """
+        wanted = (name or "").strip().lower()
+        playlists = self.list_library_playlists()
+        available = [item.get("name", "") for item in playlists]
+        if not wanted:
+            return {"opened": False, "error": "missing_name", "available": available}
+        exact = [item for item in playlists if item.get("name", "").strip().lower() == wanted]
+        prefix = [item for item in playlists if item.get("name", "").strip().lower().startswith(wanted)] if not exact else []
+        chosen = exact or prefix
+        if len(chosen) != 1:
+            return {
+                "opened": False,
+                "error": "playlist_not_found" if not chosen else "playlist_ambiguous",
+                "available": available,
+            }
+        target = chosen[0]
+        opened = self.open_result(target["href"])
+        return {
+            "opened": bool(opened),
+            "name": target["name"],
+            "href": target["href"],
+            "url": self._page.url if self._page else "",
+        }
+
+    def current_page_track_titles(self, limit: int = 60) -> list[str]:
+        """Track titles on the page currently open.
+
+        `data-testid="track-title"` was confirmed live on a real playlist
+        page. This is what makes an "add to playlist" genuinely verifiable:
+        the provider re-opens the playlist and checks the song is really
+        listed instead of trusting that a menu click meant something.
+        """
+        page = self._page
+        if page is None:
+            return []
+        titles: list[str] = []
+        try:
+            elements = page.locator("[data-testid='track-title']").all()[: max(1, int(limit))]
+            for element in elements:
+                try:
+                    text = (element.get_attribute("aria-label") or element.inner_text(timeout=200) or "").strip()
+                except Exception:
+                    continue
+                if text:
+                    titles.append(text)
+        except Exception:
+            log.debug("Reading track titles failed", exc_info=True)
+        return titles
 
     # ------------------------------------------------------------------
     # Recently played (Part 11-B fallback when local history is empty)

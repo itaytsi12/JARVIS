@@ -20,7 +20,10 @@ class AutostartTests(unittest.TestCase):
         xml = autostart.task_xml()
         self.assertIn("pythonw.exe", xml.lower())
         self.assertIn(str(autostart.PROJECT_ROOT), xml)
-        self.assertIn("--tray", xml)
+        # The logon task launches the full desktop startup
+        # (startup/launcher.py), not the tray alone.
+        self.assertIn("--start", xml)
+        self.assertNotIn("--tray", xml)
         self.assertIn("IgnoreNew", xml)
         self.assertIn("LeastPrivilege", xml)
 

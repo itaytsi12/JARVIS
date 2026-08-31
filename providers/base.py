@@ -158,6 +158,10 @@ class ModelResponse:
     first_event_ms: float | None = None
     estimated_cost_usd: float | None = None
     raw_stop_details: dict[str, Any] | None = None
+    request_id: str = ""
+    route_id: str = ""
+    capability: str = "chat"
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def wants_tools(self) -> bool:

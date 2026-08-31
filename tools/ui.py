@@ -121,3 +121,57 @@ def click_at(
     )
 
     return f"Clicked at ({x}, {y})."
+
+
+#: `mouse_event` wheel constants. One notch is 120 units (WHEEL_DELTA),
+#: which is what every Windows application treats as "one scroll step".
+_MOUSEEVENTF_WHEEL = 0x0800
+_MOUSEEVENTF_HWHEEL = 0x01000
+_WHEEL_DELTA = 120
+
+
+def scroll_screen(direction: str = "down", clicks: int = 3, x: int | None = None, y: int | None = None) -> dict:
+    """Scroll the window under the pointer.
+
+    The desktop counterpart to `browser_scroll`, which only ever worked
+    inside Playwright's own page. Windows delivers wheel input to whatever
+    is under the CURSOR, not to the focused window, so an optional
+    `x`/`y` moves the pointer first -- that is the only way to scroll a
+    specific pane (a sidebar, a log panel) rather than whatever happened
+    to be under the mouse.
+
+    Scrolling changes nothing and is trivially undone, so this is SAFE and
+    retry-safe. It reports where it scrolled rather than claiming to know
+    that the content moved -- verifying that needs a screenshot, which is
+    the caller's decision, not a cost paid on every scroll.
+    """
+    direction = (direction or "down").strip().lower()
+    if direction not in {"up", "down", "left", "right"}:
+        return {"success": False, "message": f"I can scroll up, down, left or right, not {direction!r}.", "error": "invalid_direction"}
+    try:
+        notches = max(1, min(int(clicks), 30))
+    except (TypeError, ValueError):
+        return {"success": False, "message": "The number of scroll clicks has to be a number.", "error": "invalid_clicks"}
+
+    if x is not None and y is not None:
+        user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.02)
+
+    horizontal = direction in {"left", "right"}
+    sign = -1 if direction in {"down", "left"} else 1
+    event = _MOUSEEVENTF_HWHEEL if horizontal else _MOUSEEVENTF_WHEEL
+    for _ in range(notches):
+        # ctypes maps the negative delta through a signed int; a wheel
+        # delta is a DWORD on the wire, hence the explicit two's complement.
+        delta = sign * _WHEEL_DELTA
+        user32.mouse_event(event, 0, 0, delta & 0xFFFFFFFF, 0)
+        time.sleep(0.01)
+
+    where = f" at ({x}, {y})" if x is not None and y is not None else ""
+    return {
+        "success": True,
+        "verified": False,
+        "message": f"Scrolled {direction} {notches} step{'' if notches == 1 else 's'}{where}.",
+        "direction": direction,
+        "clicks": notches,
+    }

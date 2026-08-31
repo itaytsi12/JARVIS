@@ -1170,6 +1170,263 @@ bitsandbytes are NOT installed in the main JARVIS runtime venv, and tests
 that need them (`tests/test_hf_backend.py` and similar) skip themselves
 (not fail) when run outside that venv.
 
+### Desktop startup and the graphical interface
+
+JARVIS has a windowed front end and one controlled way to bring the whole
+desktop up. Neither replaces anything: `main.py --tray`, `--voice`, the
+typed mode and every headless path still work exactly as before.
+
+- **`main.py --start` is the entry point**, and `startup/launcher.py` is
+  the sequence. Order: single-instance mutex -> logging -> the Qt window
+  (main thread) -> JARVIS's own Chrome and the backend/voice/tray (worker
+  threads, dispatched from Qt's `on_started`). The window is created
+  BEFORE the slow stages so the core is on screen while the wake-word
+  model and Chrome are still loading, not after them. Every stage is
+  individually survivable: Chrome failing, the tray failing or the whole
+  voice stack failing is logged and the rest still comes up. Only the
+  single-instance check stops the sequence, and it exits 0 on purpose.
+- **The CLI flags are per-run overrides of settings, not a second source
+  of truth.** `config/settings.py` owns `ui_enabled`, `ui_fullscreen`,
+  `auto_open_chrome`, `auto_start_voice` and `tray_enabled`;
+  `--no-ui`/`--ui`, `--fullscreen`/`--windowed`, `--no-chrome`,
+  `--no-voice` and `--no-tray` each override exactly one for one run, and
+  a flag that was not typed is `None` and changes nothing. Those flags use
+  their own `start_*` argparse dests: `--no-voice` and `--no-tray`
+  originally reused the dests of the PRE-EXISTING `--voice` and `--tray`
+  flags, argparse allows that silently, and a bare `--start` then
+  inherited `--voice`'s `store_true` default of False -- JARVIS came up
+  with no voice and no tray while the log reported it as configured.
+  Confirmed live; `tests/test_startup_launcher.py::CommandLineTests` is
+  the regression.
+- **One mutex, one microphone.** `voice/single_instance.py`'s Windows
+  named mutex, under the name `startup/launcher.py::MUTEX_NAME` shares
+  with `voice/tray_app.py::run_tray`. If those names ever diverged,
+  `--start` and `--tray` would each think it was the only instance and two
+  processes would fight over the one real audio stream. A second launch
+  prints, logs, and exits 0 having opened no window, started no backend
+  and touched no browser.
+- **One assistant, and the tray owns its lifecycle.** `TrayApplication`
+  takes `assistant=` and `on_exit=` so the window and the tray observe the
+  SAME `AlwaysOnAssistant`. `TrayApplication.run()` starts and stops it in
+  its own `finally`, so the launcher must NOT also start it -- that would
+  start the single microphone owner twice. With `--no-tray` the launcher
+  starts it directly instead. The tray's Exit closes the window through
+  `UiBridge.run_on_gui_thread` (Qt may only be touched on the GUI thread,
+  and Exit runs on the tray's).
+- **JARVIS's Chrome is identified specifically, never as "chrome.exe is
+  running".** `startup/chrome.py` reuses `tools/browser_authenticated.py`
+  -- `resolved_auth_profile_dir` (one resolver shared by detection AND
+  launching, so the directory inspected can never drift from the one a
+  launch would use), a reachable CDP endpoint on `127.0.0.1:9222`, and
+  `jarvis_chrome_is_running`, which matches each chrome.exe's own
+  `--user-data-dir` argument. Confirmed live with 13 of the user's
+  personal chrome.exe processes running: both JARVIS-specific indicators
+  correctly read false, JARVIS's own Chrome was launched, and a later
+  `ensure_jarvis_chrome` then reported `already_running_debuggable` and
+  launched nothing.
+- **Windows auto-start is one per-user scheduled task.**
+  `scripts/autostart.py` registers `main.py --start` under `pythonw.exe`
+  from `.venv-agent`, at logon, `LeastPrivilege` + `InteractiveToken` (no
+  administrator rights), with a 10-second logon delay that is a real Task
+  Scheduler trigger delay and NOT a sleep inside Python. Every path --
+  interpreter, project directory, user name -- is resolved at install
+  time. Install with `python scripts/install_jarvis_autostart.py`, remove
+  with `python scripts/remove_jarvis_autostart.py`; the tray's "Start with
+  Windows" item toggles the same task.
+- **A windowed run has no console, so the log file goes in FIRST.**
+  `config/logging_setup.py::configure_file_logging` (the implementation
+  `voice/tray_app.py::configure_logging` used to own, moved so both use
+  one file) installs `logs/jarvis_background.log` before
+  `configure_logging()` runs -- which also stops it attaching a
+  `StreamHandler` to a `sys.stderr` that is `None` under `pythonw.exe`.
+
+#### `config/events.py` -- how backend state reaches the window
+
+The bus lives in `config` because every layer already depends on it and
+publishing from `providers`/`brain`/`voice` must not create an import
+cycle -- the same one-directional reasoning as `brain/activity_state.py`,
+generalized from one boolean to named events. A subscriber can never break
+a publisher (every callback runs in its own try/except) and publishing
+with nothing subscribed is a dict lookup, so the CLI, the tests and
+`--no-ui` pay nothing.
+
+Real publishers, all at genuine call sites: `providers/anthropic_provider.py`
+(which publishes its TRANSLATED error type, so the UI keys the amber
+rate-limit state on `ProviderRateLimited` rather than on whichever vendor
+class happened to raise), `brain/planner.py`, `brain/intent_router.py`,
+`brain/web_answer.py` and `vision/screen_analyzer.py` via
+`events.model_activity(...)`, `brain/local_intent_model.py`, and
+`voice/background_assistant.py` for assistant state, transcripts and
+replies. There are no simulated animations anywhere in `ui/`.
+
+- `ui/model_status.py` answers "which model modules does this install
+  actually have" from the same sources the runtime uses
+  (`providers/registry.py`, the OpenAI credential, the local intent
+  service, the promoted local model registry). **Gemini is deliberately
+  never reported available** -- nothing in this repository implements it;
+  the node exists and says `not_implemented`. The header count is derived
+  from this, never a hard-coded "5 MODELS ACTIVE", and it reads
+  "DETECTING MODULES" until the first probe lands rather than claiming
+  zero.
+- `ui/ui_bridge.py` is the ONE object QML binds to. Every public setter
+  marshals onto the GUI thread through a `Signal(object)` queued
+  connection, so the audio thread, an agent worker and a provider call can
+  all publish without touching Qt. It also understands the vendor-neutral
+  `model_thinking`/`model_active`/`model_error`/`model_rate_limited`
+  family declared in `config/events.py` for the multi-provider router
+  work, resolving the node id from several plausible payload keys and
+  ignoring quietly (debug, never a warning) anything naming a capability
+  or provider this window does not draw.
+- An unavailable module never lights up, not even red: the optional local
+  intent service reporting "not running" on every command is its normal
+  state, not an alarm. `rate_limited` is amber and deliberately distinct
+  from the red `error` -- a throttled module is configured and working.
+- `ui/app.py` owns the Qt application and nothing else, and
+  `is_available()` reports a missing PySide6 as a normal state --
+  `startup/launcher.py` then logs it and brings JARVIS up without a window
+  rather than failing. `ui/qml/main.qml` plus `components/` (`CoreRing`,
+  `ModelNode`, `ConnectionLine`) draw the core; Escape always leaves
+  fullscreen and F11 toggles it, so you are never trapped. Every HUD
+  detail is painted into a Canvas once on resize and animated with
+  transforms/opacity on the render thread, so the window costs one texture
+  upload at startup and no repaints afterwards.
+
+### The tool catalog is the agent's entire view of JARVIS
+
+`brain/tool_catalog.py::DEFINITIONS` is not documentation -- it is the
+list of tools the model is actually given. A tool that
+`brain/tool_router.py` can dispatch but the catalog does not describe is
+**invisible**: it can never be called, however well it works.
+
+That was not hypothetical. The whole Apple Music family -- 18 implemented,
+tested, dispatchable tools -- had no catalog entry, so a request like
+"open Apple Music and make me a playlist" reached a model holding no music
+tools at all and could not possibly succeed. Describing them was the
+entire fix. The catalog went from 49 tools to 86.
+
+- **`tests/test_tool_catalog_coverage.py` is the invariant.** It parses
+  the router's own dispatch table and fails if anything is dispatchable
+  but undescribed, or described but duplicated. Two tools are excluded on
+  purpose and listed in `INTENTIONALLY_UNDESCRIBED`: `lock_computer`
+  (locking the machine is something the user asks for explicitly, never a
+  step an agent should choose) and `send_whatsapp_message` (irreversible
+  and outward-facing; it keeps the voice path that asks first). Both are
+  still reachable by their own routes -- the catalog controls what the
+  AGENT is offered, not what JARVIS can do.
+- **`ToolDefinition` now carries `retry_safe` and `timeout_seconds`.**
+  `retry_safe` answers "is running this twice the same as running it
+  once": every read-only tool is (normalised in `__post_init__`, so no
+  call site has to remember), and so are the idempotent writers
+  (`create_directory`, `set_volume`, `write_clipboard`, `scroll_screen`).
+  `append_text_file`, `volume_up` and `volume_down` are deliberately NOT
+  -- a retry duplicates the text or moves the volume twice.
+  `timeout_seconds` is advisory: it tells the model a slow tool is
+  expected rather than hung, and it is deliberately not a hard kill,
+  because interrupting a half-finished desktop action is worse than
+  waiting for it.
+
+### Windows tools the agent was missing
+
+New modules, all dispatched in `brain/tool_router.py` and described in the
+catalog like everything else:
+
+- **`tools/clipboard.py`** -- `read_clipboard` / `write_clipboard`. The
+  cheapest bridge to an application JARVIS cannot script, and the
+  read-back half of a verification. The clipboard is a single-owner OS
+  resource, so every operation retries briefly: another process holding
+  it for a moment is ordinary (Chrome and Office both do it) and must not
+  surface as a failure. A write is verified by reading it back, so a
+  clipboard manager winning the race is reported honestly rather than as
+  success.
+- **`tools/machine.py`** -- `system_status` (CPU, memory, disk and battery
+  in ONE call, so "how is this machine doing" costs one model turn, not
+  four), `network_status` (a real TCP connect, because an adapter can be
+  "up" behind a captive portal), `list_processes`, `process_running`
+  (matches the way a person names an app: "chrome", "Chrome",
+  "chrome.exe" and "Google Chrome" all resolve, because the agent gets
+  this argument from a spoken request), `get_volume` and `set_volume`.
+  Volume goes through the real Windows `IAudioEndpointVolume` COM
+  interface, declared inline via `comtypes` (already installed by
+  `pywinauto`; `pycaw` is not, and adding a package for two methods was
+  not worth it). Media keys cannot express "set it to 30%", move in
+  device-defined steps, and cannot report the current level at all --
+  `tools/audio.py`'s relative controls remain untouched as the fallback.
+  `set_volume` reads the level back, so a device that quantizes is
+  reported honestly instead of being claimed.
+- **`tools/files.py`** gained `file_info` (size, kind, age in one call)
+  and `recent_files` -- what actually answers "find the file I worked on
+  yesterday". It walks with `os.walk` and prunes using `tools/code.py`'s
+  existing ignore vocabulary rather than a second one, for the same
+  reason `walk_source_files` exists: descending into a virtualenv to
+  discard the results costs orders of magnitude more than the answer.
+- **`tools/ui.py`** gained `scroll_screen`, the desktop counterpart to
+  `browser_scroll` (which only ever worked inside a Playwright page).
+  Windows delivers wheel input to whatever is under the CURSOR, not to
+  the focused window, which is why it takes optional coordinates. It
+  reports the action and explicitly does NOT claim the content moved --
+  verifying that needs a screenshot, which is the caller's decision.
+
+### JARVIS's Chrome starts itself
+
+`tools/browser_authenticated.py::AuthenticatedBrowserSession._autostart_chrome`
+starts JARVIS's own Chrome when nothing is listening on the debug port,
+once per session object, delegating to
+`startup/chrome.py::ensure_jarvis_chrome` so the "is it already running"
+decision stays in the one place that owns it. Every authenticated-session
+tool used to fail with "Start the JARVIS browser session first" -- a
+correct diagnosis and a useless one, since JARVIS is perfectly able to do
+it. `JARVIS_BROWSER_AUTOSTART=0` restores the old behaviour. It still only
+ever attaches to a real debuggable Chrome and still never touches the
+user's personal profile.
+
+### Apple Music: playlists, and two real search bugs
+
+`music_create_playlist`, `music_add_to_playlist` and
+`music_list_playlists` complete the Apple Music surface. All three were
+built against the REAL signed-in account and the real DOM, and three
+separate defects were found by doing so:
+
+- **The row context menu is `role="button"`, not `role="menuitem"`**, and
+  its Add-to-Playlist submenu is in the DOM but not clickable until the
+  parent entry is activated. Querying `menuitem` found nothing and timed
+  out. `_menu_entry` tries button first and keeps menuitem as a fallback.
+- **"New Playlist" does not navigate.** It reveals an inline field
+  (`data-testid="playlist-title-input"`) on the same page, and committing
+  that creates the playlist with the track already in it -- so the name is
+  set AT creation, not by a rename afterwards, which is both fewer steps
+  and impossible to leave half-done as a stray "New Playlist".
+- **`search()` returned the PREVIOUS query's results.** This is one
+  long-lived tab, so the old query's links are still in the DOM the
+  instant the new URL commits; waiting for "a result link is visible"
+  returned immediately and the caller scored the old page. A search for
+  "Save Your Tears" returned Khalid and twenty one pilots, and
+  `_best_search_match` duly picked "Stressed Out" -- a wrong song chosen
+  with complete confidence. `_wait_for_search_results` now settles on the
+  new query in two observed steps: the SPA's own search box reflecting the
+  new term, then the result count going stable.
+- **The type bonus could carry an unrelated title over the threshold.**
+  Even with correct results, `_fuzzy("Save Your Tears", "Stressed Out")`
+  is 0.44, and the 0.35 "is a song" bonus clears `min_score`. `TITLE_FLOOR`
+  requires the title itself to be plausible, bypassed whenever
+  `_title_matches` already accepts it (so "Starboy" ->
+  "Starboy (feat. Daft Punk)" still works) and disabled for genuinely
+  open-ended requests (`_play_query`, `_play_mood`), which name no title.
+
+Playlist authoring applies one gate playback does not: `_locate_song`
+refuses a match that fails `_title_matches`. Playing the wrong song is
+audible and correctable; adding the wrong song to a playlist is a silent,
+persistent edit to the user's library. Verification is a real re-read of
+the playlist, and it checks for the song the USER asked for -- checking
+for the matched title would be trivially true and prove nothing.
+`_playlist_exists` retries briefly, because Apple's library listing is
+eventually consistent and a single eager read reported a genuinely
+successful creation as `verification_failed` (confirmed live).
+
+`is_signed_in` now waits for the app shell to hydrate. Apple renders a
+"Sign In" control in its initial HTML and swaps it for the account
+affordance once the session loads, so checking immediately after opening a
+fresh tab reported "not signed in" for a perfectly signed-in account.
+
 ## Directories that are data/output, not source
 
 Do not treat these as code to refactor; they're generated or local-only:

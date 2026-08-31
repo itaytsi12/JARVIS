@@ -364,7 +364,23 @@ def _queue_action(song: str | None, contextual: bool, up_next: bool) -> dict[str
 # Search + scoring (Part 8)
 # ---------------------------------------------------------------------
 
-def _best_search_match(controller, search_query: str, score_against: str, prefer_types: tuple[str, ...], min_score: float = 0.45) -> dict[str, Any] | None:
+#: Minimum raw title similarity for a NAMED item (a specific song, album
+#: or artist the user actually said) to be usable. A result that passes
+#: `_title_matches` is accepted regardless of this, so
+#: "Starboy" -> "Starboy (feat. Daft Punk)" still works.
+#:
+#: 0.5 rather than something lower because `difflib` is generous on short
+#: strings: "Save Your Tears" vs "Stressed Out" scores 0.44 on shared
+#: letters alone. Confirmed live -- that pair is exactly the wrong answer
+#: this floor exists to reject.
+TITLE_FLOOR = 0.5
+#: A free-text or mood request ("play something upbeat") is NOT a named
+#: item: there is no title it should resemble, so the floor is disabled
+#: for those callers rather than applied and fudged.
+NO_TITLE_FLOOR = 0.0
+
+
+def _best_search_match(controller, search_query: str, score_against: str, prefer_types: tuple[str, ...], min_score: float = 0.45, title_floor: float = TITLE_FLOOR) -> dict[str, Any] | None:
     """Search for `search_query` (which may combine song+artist/album+artist
     for a better catalog hit rate) but SCORE each candidate's title against
     `score_against` specifically -- e.g. the song title alone, not "song
@@ -401,6 +417,22 @@ def _best_search_match(controller, search_query: str, score_against: str, prefer
     scored.sort(key=lambda pair: pair[0], reverse=True)
     best_score, best = scored[0]
     if best_score < min_score:
+        return None
+    # A TITLE floor, applied separately from the combined score. The type
+    # bonus above is decisive by design (an exact-title album must not beat
+    # the right song), but it is large enough to carry a completely
+    # unrelated title over `min_score` on its own: confirmed live, a search
+    # for "Save Your Tears" whose results genuinely did not contain that
+    # song returned "Stressed Out" -- fuzzy ~0.2 plus the 0.35 song bonus
+    # clears 0.45. Requiring the title itself to be at least plausible is
+    # what turns "the catalog does not have it" into an honest miss instead
+    # of a confident wrong answer.
+    if title_floor and _fuzzy(score_against, best.get("title", "")) < title_floor and not _title_matches(score_against, best.get("title", "")):
+        log.info(
+            "Apple Music: best match %r is too far from the request %r; reporting no match.",
+            best.get("title", ""),
+            score_against,
+        )
         return None
     return best
 
@@ -554,7 +586,9 @@ def _play_query(query: str, contextual: bool) -> dict[str, Any]:
         return _sign_in_required_result()
     except AppleMusicUnavailable as exc:
         return _unavailable_result(exc)
-    match = _best_search_match(controller, query, query, prefer_types=("song", "album", "artist", "playlist"))
+    # Free text: the user did not name a title, so there is nothing for a
+    # title floor to compare against.
+    match = _best_search_match(controller, query, query, prefer_types=("song", "album", "artist", "playlist"), title_floor=NO_TITLE_FLOOR)
     if match is None:
         return _result(False, f"I couldn't find {query}, sir.", error="not_found")
     expected_song = query if match["type"] in {"song", "album", "playlist"} else None
@@ -720,7 +754,8 @@ def _play_mood(mood: str) -> dict[str, Any]:
         return _sign_in_required_result()
     except AppleMusicUnavailable as exc:
         return _unavailable_result(exc)
-    match = _best_search_match(controller, f"{mood} music", mood, prefer_types=("playlist", "album", "song"), min_score=0.3)
+    # A mood is not a title either -- "workout" should reach "Pure Workout".
+    match = _best_search_match(controller, f"{mood} music", mood, prefer_types=("playlist", "album", "song"), min_score=0.3, title_floor=NO_TITLE_FLOOR)
     if match is None:
         return _result(False, f"I couldn't find anything for {mood}, sir.", error="not_found")
     return _play_and_record(controller, match, expected_song=None, expected_artist=None, context_type="mood")
@@ -780,3 +815,306 @@ def music_play(intent: str, song: str | None = None, artist: str | None = None, 
     arguments = {"song": song, "artist": artist, "album": album, "playlist": playlist, "mood": mood,
                  "scope": scope, "contextual": contextual, "shuffle": shuffle}
     return handler(arguments)
+
+
+# ---------------------------------------------------------------------------
+# Playlist authoring (create / add). Part of the same provider so it shares
+# `_ensure_ready`'s sign-in and availability handling rather than growing a
+# second error vocabulary.
+# ---------------------------------------------------------------------------
+#: How many songs one `music_create_playlist` call will look up. A spoken
+#: request naming a dozen songs is realistic; a hundred is a runaway, and
+#: each one costs a real catalog search.
+MAX_PLAYLIST_SONGS = 25
+
+
+def _locate_song(controller, song: str, artist: str | None) -> dict[str, Any] | None:
+    """Find one song in the catalog and open its page.
+
+    Reuses `_best_search_match` with the SAME `prefer_types` as
+    `_play_song`, so a song added to a playlist is chosen exactly like a
+    song that gets played rather than by a second, divergent rule.
+
+    Then it applies one extra, stricter gate that playback does not need:
+    the matched title has to actually match what was asked for. Playing the
+    wrong song is an annoyance the user hears immediately and can correct;
+    adding the wrong song to a playlist is a silent, persistent edit to
+    their library. Confirmed live -- a request for "Save Your Tears"
+    scored a result titled "Stressed Out" highest and was added, and the
+    verification then passed because it checked for the MATCHED title
+    instead of the REQUESTED one. Both halves are fixed here: an
+    unconvincing match is refused outright, and verification upstream
+    compares against the request.
+    """
+    query = f"{song} {artist}".strip() if artist else song
+    match = _best_search_match(controller, query, song, prefer_types=("song", "album"))
+    if match is None:
+        return None
+    if not _title_matches(song, match.get("title", "")):
+        log.info(
+            "Apple Music: refusing to add %r -- the best match was %r, which is a different song.",
+            song,
+            match.get("title", ""),
+        )
+        return None
+    if not controller.open_result(match["href"]):
+        return None
+    return match
+
+
+def _resolve_playlist_name(controller, playlist: str) -> dict[str, Any]:
+    """Match a spoken playlist name to one the account actually has.
+
+    Exact (case-insensitive) first, then an unambiguous prefix -- one
+    candidate, never "the closest of several". Returns the real name so
+    everything downstream uses Apple's spelling rather than the user's.
+    """
+    wanted = (playlist or "").strip().lower()
+    try:
+        available = [item.get("name", "") for item in controller.list_library_playlists() if item.get("name")]
+    except Exception:
+        log.debug("Listing playlists for name resolution failed", exc_info=True)
+        available = []
+    exact = [name for name in available if name.strip().lower() == wanted]
+    if exact:
+        return {"name": exact[0], "available": available}
+    prefix = [name for name in available if name.strip().lower().startswith(wanted)] if wanted else []
+    if len(prefix) == 1:
+        return {"name": prefix[0], "available": available}
+    return {
+        "error": "playlist_ambiguous" if len(prefix) > 1 else "playlist_not_found",
+        "available": available,
+        "candidates": prefix,
+    }
+
+
+def music_add_to_playlist(song: str, playlist: str, artist: str | None = None) -> dict[str, Any]:
+    """Add one song to an existing playlist, and verify it landed.
+
+    Verification is a real re-read: after the menu accepts the entry, the
+    playlist itself is opened and its track titles are checked for the
+    song. Apple's menu closing is not treated as proof -- the same
+    "success is not verification" rule the rest of this module follows.
+    """
+    if not (song or "").strip():
+        return _result(False, "I need a song to add, sir.", error="missing_song")
+    if not (playlist or "").strip():
+        return _result(False, "I need to know which playlist, sir.", error="missing_playlist")
+    try:
+        controller, _page = _ensure_ready()
+    except AppleMusicSignInRequired:
+        return _sign_in_required_result()
+    except Exception as exc:
+        return _unavailable_result(exc)
+
+    # Resolve the playlist name FIRST, against the account's real library.
+    # It is the cheap half of the work, and doing it first means an
+    # unknown name produces the useful "you have: ..." answer instead of
+    # whatever the row menu happened to fail with after a pointless
+    # catalog search -- confirmed live, where a bad name surfaced as
+    # `row_menu_unavailable`, which tells the user nothing.
+    resolved = _resolve_playlist_name(controller, playlist)
+    if resolved.get("error"):
+        available = resolved.get("available") or []
+        if resolved["error"] == "playlist_ambiguous":
+            listed = ", ".join(resolved.get("candidates") or [])
+            return _result(False, f"Several playlists match {playlist}, sir: {listed}. Which one?", error="playlist_ambiguous", candidates=resolved.get("candidates"))
+        listed = ", ".join(available[:6])
+        return _result(
+            False,
+            f"I couldn't find a playlist called {playlist}, sir." + (f" You have: {listed}." if listed else ""),
+            error="playlist_not_found",
+            available=available,
+        )
+    playlist = resolved["name"]
+
+    match = _locate_song(controller, song, artist)
+    if match is None:
+        return _result(False, f"I couldn't find {song} on Apple Music, sir.", error="song_not_found", song=song)
+
+    outcome = controller.add_track_to_playlist(playlist, match.get("title") or song, artist)
+    if not outcome.get("added"):
+        return _result(False, f"I couldn't add {song} to {playlist}, sir.", error=outcome.get("error") or "add_failed")
+
+    target_playlist = outcome.get("playlist") or playlist
+    # Deliberately the REQUESTED song, never the matched title: verifying
+    # that "whatever I added is in the playlist" is trivially true and
+    # proves nothing.
+    verified = _playlist_contains(controller, target_playlist, song)
+    return _result(
+        True if verified else False,
+        f"Added {match.get('title') or song} to {target_playlist}." if verified
+        else f"I asked Apple Music to add {song} to {target_playlist}, but I couldn't confirm it, sir.",
+        verified=verified,
+        error=None if verified else "verification_failed",
+        song=match.get("title") or song,
+        playlist=target_playlist,
+    )
+
+
+def _playlist_contains(controller, playlist: str, song: str) -> bool:
+    """Is `song` genuinely listed in `playlist` right now?
+
+    Re-opens the playlist and reads its real track titles. Uses the same
+    `_title_matches` prefix-aware comparison the playback verification
+    uses, so a catalog title carrying a "(feat. X)" suffix the request
+    never mentioned still counts as a match here exactly as it does there.
+    """
+    try:
+        opened = controller.open_library_playlist(playlist)
+        if not opened.get("opened"):
+            return False
+        titles = controller.current_page_track_titles()
+    except Exception:
+        log.debug("Playlist verification failed", exc_info=True)
+        return False
+    return any(_title_matches(song, title) for title in titles)
+
+
+#: How long to wait for a just-created playlist to appear in the library
+#: listing. Confirmed live: `create_playlist_from_track` genuinely created
+#: "JARVIS Smoke Test", but the very next read of `/library/all-playlists`
+#: still returned the previous 13 names -- Apple's library view is
+#: eventually consistent, and a single eager read reported a real success
+#: as `verification_failed`. Bounded and short: this waits for a fact to
+#: become observable, it never invents one.
+PLAYLIST_SYNC_ATTEMPTS = 4
+PLAYLIST_SYNC_DELAY = 1.5
+
+
+def _playlist_exists(controller, name: str, attempts: int = 1) -> bool:
+    """Is a playlist with this exact name really in the account's library?
+
+    Re-reads `/library/all-playlists` rather than trusting that the create
+    flow's UI acknowledgement meant a playlist now exists -- the same
+    "success is not verification" rule the playback path follows. With
+    `attempts > 1`, re-reads a few times before concluding it is absent,
+    because the listing lags a creation by a second or two.
+    """
+    wanted = name.strip().lower()
+    for attempt in range(max(1, int(attempts))):
+        try:
+            if any(item.get("name", "").strip().lower() == wanted for item in controller.list_library_playlists()):
+                return True
+        except Exception:
+            log.debug("Playlist existence check failed", exc_info=True)
+        if attempt + 1 < attempts:
+            time.sleep(PLAYLIST_SYNC_DELAY)
+    return False
+
+
+def music_create_playlist(name: str, songs: list[str] | str | None = None, artist: str | None = None) -> dict[str, Any]:
+    """Create a playlist called `name`, optionally filled with `songs`.
+
+    Apple Music Web offers no "create an empty playlist called X" control
+    that can be driven reliably, so the playlist is created around its
+    first song and renamed -- which is also why at least one song is
+    required, and why that is reported as a clear error rather than
+    silently creating something called "New Playlist".
+
+    Every song after the first is added through the same verified
+    `music_add_to_playlist` path, so a partial success is reported
+    honestly: the result says which songs made it and which did not.
+    """
+    if not (name or "").strip():
+        return _result(False, "I need a name for the playlist, sir.", error="missing_name")
+    if isinstance(songs, str):
+        songs = [songs]
+    songs = [item for item in (songs or []) if str(item).strip()]
+    if not songs:
+        return _result(
+            False,
+            "I need at least one song to start the playlist with, sir -- Apple Music can't create an empty one from the web player.",
+            error="no_songs",
+        )
+    if len(songs) > MAX_PLAYLIST_SONGS:
+        return _result(False, f"That's more than {MAX_PLAYLIST_SONGS} songs, sir; ask me in smaller batches.", error="too_many_songs")
+
+    try:
+        controller, _page = _ensure_ready()
+    except AppleMusicSignInRequired:
+        return _sign_in_required_result()
+    except Exception as exc:
+        return _unavailable_result(exc)
+
+    # An existing playlist of the same name would make "add the rest"
+    # ambiguous, so say so rather than creating a second one with an
+    # identical name.
+    try:
+        existing = [item.get("name", "").strip().lower() for item in controller.list_library_playlists()]
+    except Exception:
+        existing = []
+    if name.strip().lower() in existing:
+        return _result(False, f"You already have a playlist called {name}, sir.", error="playlist_exists", playlist=name)
+
+    first = str(songs[0])
+    match = _locate_song(controller, first, artist)
+    if match is None:
+        return _result(False, f"I couldn't find {first} on Apple Music, sir.", error="song_not_found", song=first)
+
+    created = controller.create_playlist_from_track(name, match.get("title") or first, artist)
+    if not created.get("created"):
+        return _result(False, "I couldn't create the playlist, sir.", error=created.get("error") or "create_failed")
+
+    # Apple names the playlist at creation, so "did it work" is one
+    # question, not two: does a playlist with this name now exist?
+    # Verified against the account's real library rather than against the
+    # UI's own acknowledgement.
+    if not _playlist_exists(controller, name, attempts=PLAYLIST_SYNC_ATTEMPTS):
+        return _result(
+            False,
+            f"I asked Apple Music to create {name} but couldn't confirm it exists, sir.",
+            error="verification_failed",
+            playlist=name,
+        )
+
+    added = [match.get("title") or first]
+    failed: list[str] = []
+    for song in songs[1:]:
+        outcome = music_add_to_playlist(str(song), name, artist)
+        (added if outcome.get("success") else failed).append(str(song))
+
+    if failed:
+        return _result(
+            True,
+            f"Created {name} with {len(added)} song{'' if len(added) == 1 else 's'}, sir. I couldn't add: {', '.join(failed)}.",
+            verified=True,
+            playlist=name,
+            added=added,
+            failed=failed,
+        )
+    return _result(
+        True,
+        f"Created {name} with {len(added)} song{'' if len(added) == 1 else 's'}, sir.",
+        verified=True,
+        playlist=name,
+        added=added,
+        failed=[],
+    )
+
+
+def music_list_playlists() -> dict[str, Any]:
+    """The account's own playlists, by name.
+
+    Read-only, and the thing the agent needs before it can sensibly act on
+    "add this to my workout playlist" -- otherwise it has to guess a name
+    and find out by failing.
+    """
+    try:
+        controller, _page = _ensure_ready()
+    except AppleMusicSignInRequired:
+        return _sign_in_required_result()
+    except Exception as exc:
+        return _unavailable_result(exc)
+    try:
+        playlists = controller.list_library_playlists()
+    except Exception as exc:
+        return _unavailable_result(exc)
+    names = [item.get("name", "") for item in playlists if item.get("name")]
+    return _result(
+        True,
+        f"You have {len(names)} playlist{'' if len(names) == 1 else 's'}, sir." if names else "I couldn't find any playlists in your library, sir.",
+        verified=True,
+        playlists=names,
+        count=len(names),
+    )

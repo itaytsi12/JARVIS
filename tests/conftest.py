@@ -22,6 +22,8 @@ So the whole suite runs with external providers switched off:
 - `ANTHROPIC_API_KEY` cleared, so `providers.get_agent_provider()`
   returns None and the agent path is exercised only by tests that inject
   a provider deliberately.
+- Browser autostart disabled, so no test can launch a real Chrome window
+  by asking for the authenticated session.
 - Agent databases and the data directory pointed at a temporary
   directory, so a test run never writes to the real `data/`.
 
@@ -46,6 +48,13 @@ _TEST_ENVIRONMENT = {
     "STT_PROVIDER": "whisper",
     "ELEVENLABS_STT_ENABLED": "false",
     "ELEVENLABS_TTS_ENABLED": "false",
+    # Never let a test start a real browser. `tools/browser_authenticated.py`
+    # now launches JARVIS's own Chrome when nothing is listening on the
+    # debug port, which is exactly right in production and exactly wrong
+    # here: observed live, a full-suite run spawned real chrome.exe
+    # processes and slowed the run down by minutes. Tests that exercise
+    # the autostart do so with an explicit `patch.dict`.
+    "JARVIS_BROWSER_AUTOSTART": "0",
     # Agent runtime: deterministic, quiet, and off unless a test opts in.
     "JARVIS_DEBUG": "false",
     "JARVIS_AGENT_ENABLED": "true",

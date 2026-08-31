@@ -6,6 +6,8 @@ from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+from config import events
+
 
 INTENT_SERVICE_URL = "http://127.0.0.1:5050/predict"
 INTENT_SERVICE_TIMEOUT = float(os.getenv("JARVIS_INTENT_SERVICE_TIMEOUT", "0.35"))
@@ -101,6 +103,12 @@ def predict_local_intent(text: str) -> Optional[dict]:
         method="POST",
     )
 
+    # UI/status hook (config/events.py). The service being absent is the
+    # NORMAL state, not a failure -- a refused connection publishes nothing
+    # at all, so the local node stays honestly `offline` instead of
+    # flashing an error every time a command is routed without it.
+    events.publish(events.MODEL_REQUEST_STARTED, model="local")
+
     try:
         with urlopen(
             request,
@@ -112,9 +120,17 @@ def predict_local_intent(text: str) -> Optional[dict]:
             )
 
     except URLError:
+        # The service simply is not running -- the documented, supported
+        # state (`brain/router.py` degrades gracefully). Reported as a
+        # completion, not an error: what matters is that the "started"
+        # above is always balanced, so nothing is left showing as in
+        # flight forever. The bridge renders an unavailable module as
+        # offline regardless, so this never flashes a red node.
+        events.publish(events.MODEL_REQUEST_FAILED, model="local", error="service_unavailable")
         return None
 
     except Exception as exc:
+        events.publish(events.MODEL_REQUEST_FAILED, model="local", error=type(exc).__name__)
         print(
             f"[Intent Model] Error: {exc}"
         )
@@ -123,6 +139,7 @@ def predict_local_intent(text: str) -> Optional[dict]:
     if not data.get("success"):
         return None
 
+    events.publish(events.MODEL_REQUEST_SUCCEEDED, model="local")
     return {
         "intent": data.get("intent"),
         "confidence": data.get("confidence"),

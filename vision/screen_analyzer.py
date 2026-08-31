@@ -4,6 +4,7 @@ import os
 import time
 
 from openai import OpenAI
+from config.events import model_activity
 
 
 # `.env` is loaded exactly once, from the project root, by
@@ -36,24 +37,29 @@ def analyze_screen(image_path: str, question: str) -> dict:
     image_base64,image_bytes,image_dimensions=_bounded_image_payload(image_path)
 
     model=os.getenv("JARVIS_VISION_MODEL","gpt-5-mini");started=time.perf_counter()
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": question
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/png;base64,{image_base64}"
-                    }
-                ]
-            }
-        ]
-    )
+    # UI/status hook: brackets THIS real request with
+    # started/succeeded/failed events (config/events.py). It only
+    # observes -- the request below is unchanged, and a subscriber
+    # that raises can never reach this call site.
+    with model_activity("vision"):
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": question
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{image_base64}"
+                        }
+                    ]
+                }
+            ]
+        )
 
     usage=getattr(response,"usage",None);answer=response.output_text
     return {"success":bool(answer),"message":answer or "I couldn't analyze the screen.","answer":answer,"model":model,"model_calls":1,"input_tokens":getattr(usage,"input_tokens",0) or 0,"output_tokens":getattr(usage,"output_tokens",0) or 0,"latency_ms":(time.perf_counter()-started)*1000,"image_input_bytes":image_bytes,"image_dimensions":image_dimensions,"screenshot_path":str(image_path),"error":None if answer else "empty_vision_response"}

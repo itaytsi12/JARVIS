@@ -2,6 +2,7 @@ import json
 import os
 
 from openai import OpenAI
+from config.events import model_activity
 
 
 # `.env` is loaded exactly once, from the project root, by
@@ -176,26 +177,31 @@ TOOLS = [
 
 
 def classify_intent(message: str):
-    response = client.responses.create(
-        model="gpt-5-mini",
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "You are the intent router for a Windows desktop assistant "
-                    "called Jarvis. "
-                    "If the user wants one or more available computer actions, "
-                    "call all required tools in the correct order. "
-                    "Do not call tools for normal conversation."
-                )
-            },
-            {
-                "role": "user",
-                "content": message
-            }
-        ],
-        tools=TOOLS
-    )
+    # UI/status hook: brackets THIS real request with
+    # started/succeeded/failed events (config/events.py). It only
+    # observes -- the request below is unchanged, and a subscriber
+    # that raises can never reach this call site.
+    with model_activity("openai"):
+        response = client.responses.create(
+            model="gpt-5-mini",
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the intent router for a Windows desktop assistant "
+                        "called Jarvis. "
+                        "If the user wants one or more available computer actions, "
+                        "call all required tools in the correct order. "
+                        "Do not call tools for normal conversation."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": message
+                }
+            ],
+            tools=TOOLS
+        )
     usage=getattr(response,"usage",None);usage_metadata={"input_tokens":getattr(usage,"input_tokens",0) or 0,"output_tokens":getattr(usage,"output_tokens",0) or 0}
 
     actions = []

@@ -16,3 +16,11 @@ pystray>=0.19.5,<0.20
 sounddevice>=0.5.5,<0.6
 soundfile>=0.14,<0.15
 numpy>=2,<3
+# The graphical interface (`ui/`), started by `main.py --start`. The
+# Essentials wheel is deliberate: `ui/qml/` uses Qt Quick only and no
+# module from the much larger Addons package, so nothing here needs it.
+# A missing PySide6 is survivable by design -- `ui/app.py::is_available`
+# reports it and `startup/launcher.py` continues without a window -- but
+# then the logon task silently brings up a JARVIS with no interface,
+# which is exactly the failure this line exists to prevent.
+PySide6-Essentials>=6.7,<7

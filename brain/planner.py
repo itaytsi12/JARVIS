@@ -2,6 +2,7 @@ import json
 import os
 
 from openai import OpenAI
+from config.events import model_activity
 
 from brain.intent_router import TOOLS
 
@@ -20,28 +21,33 @@ client = OpenAI(
 
 
 def create_plan(message: str) -> list[dict]:
-    response = client.responses.create(
-        model="gpt-5-mini",
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "You are the action planner for Jarvis, a Windows desktop assistant. "
-                    "Break the user's request into the minimum number of available tool calls. "
-                    "Call the tools in the exact order they should be executed. "
-                    "Do not add unnecessary actions. "
-                    "Every requested step must be represented and achievable with the available tools. "
-                    "If the available tools cannot complete the entire request, return no tool calls; never return a partial plan or silently omit a step. "
-                    "Do not answer conversationally."
-                )
-            },
-            {
-                "role": "user",
-                "content": message
-            }
-        ],
-        tools=TOOLS
-    )
+    # UI/status hook: brackets THIS real request with
+    # started/succeeded/failed events (config/events.py). It only
+    # observes -- the request below is unchanged, and a subscriber
+    # that raises can never reach this call site.
+    with model_activity("openai"):
+        response = client.responses.create(
+            model="gpt-5-mini",
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the action planner for Jarvis, a Windows desktop assistant. "
+                        "Break the user's request into the minimum number of available tool calls. "
+                        "Call the tools in the exact order they should be executed. "
+                        "Do not add unnecessary actions. "
+                        "Every requested step must be represented and achievable with the available tools. "
+                        "If the available tools cannot complete the entire request, return no tool calls; never return a partial plan or silently omit a step. "
+                        "Do not answer conversationally."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": message
+                }
+            ],
+            tools=TOOLS
+        )
 
     actions = []
 

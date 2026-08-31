@@ -220,3 +220,183 @@ def create_directory(path: str) -> dict:
 		"path": str(p),
 		"error": None if created else "verification_failed",
 	}
+
+# ---------------------------------------------------------------------------
+# Discovery: metadata, and "the file I was working on".
+# ---------------------------------------------------------------------------
+#: Where `recent_files` looks when no path is given. These are the places a
+#: person actually saves work; the whole user profile is deliberately NOT
+#: scanned, because AppData alone would swamp the result with cache churn
+#: that no one ever means by "the file I was working on".
+DEFAULT_RECENT_ROOTS = ("desktop", "documents", "downloads")
+
+#: Never surfaced as "recent work": these change constantly for reasons
+#: that have nothing to do with the user. Shared with tools/code.py's
+#: pruning vocabulary rather than re-invented.
+_RECENT_SKIP_SUFFIXES = {".tmp", ".log", ".lock", ".pyc", ".pyo", ".bak", ".crdownload", ".part"}
+
+#: Hard bound on the walk. A deep tree must not turn one question into a
+#: minutes-long traversal -- `recent_files` is meant to answer in about a
+#: second, and it reports honestly when it hit the bound.
+MAX_RECENT_SCAN = 40_000
+
+
+def _known_root(name: str) -> Path | None:
+	name = (name or "").strip().lower()
+	if name == "desktop":
+		return get_desktop_path()
+	if name in {"documents", "docs"}:
+		return get_documents_path()
+	if name in {"downloads", "download"}:
+		return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Downloads"
+	if name in {"pictures", "photos"}:
+		return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Pictures"
+	if name in {"home", "profile", "user"}:
+		return Path(os.environ.get("USERPROFILE", str(Path.home())))
+	return None
+
+
+def file_info(path: str) -> dict:
+	"""Size, timestamps and kind for one path.
+
+	Answers "when did I last touch this", "how big is it" and "is this a
+	folder" in one call, so the agent does not have to shell out to
+	PowerShell for something the standard library already knows.
+	"""
+	p = Path(path).expanduser()
+	try:
+		p = p.resolve()
+		stat = p.stat()
+	except OSError as exc:
+		return {"success": False, "message": f"I could not read {path}.", "error": f"{type(exc).__name__}", "path": str(p)}
+
+	is_dir = p.is_dir()
+	entries = None
+	if is_dir:
+		try:
+			entries = sum(1 for _ in p.iterdir())
+		except OSError:
+			entries = None
+	modified = time.localtime(stat.st_mtime)
+	return {
+		"success": True,
+		"verified": True,
+		"path": str(p),
+		"name": p.name,
+		"kind": "directory" if is_dir else "file",
+		"suffix": "" if is_dir else p.suffix.lower(),
+		"size_bytes": None if is_dir else stat.st_size,
+		"size_kb": None if is_dir else round(stat.st_size / 1024, 1),
+		"entries": entries,
+		"modified": time.strftime("%Y-%m-%d %H:%M:%S", modified),
+		"modified_epoch": stat.st_mtime,
+		"age_hours": round((time.time() - stat.st_mtime) / 3600, 1),
+		"created_epoch": stat.st_ctime,
+		"read_only": not os.access(p, os.W_OK),
+		"message": (
+			f"{p.name} is a folder with {entries} item{'' if entries == 1 else 's'}, last changed {time.strftime('%Y-%m-%d %H:%M', modified)}."
+			if is_dir
+			else f"{p.name} is {round(stat.st_size / 1024, 1)} KB, last modified {time.strftime('%Y-%m-%d %H:%M', modified)}."
+		),
+	}
+
+
+def recent_files(
+	path: str | None = None,
+	within_hours: float = 48.0,
+	limit: int = 25,
+	suffixes: list[str] | str | None = None,
+) -> dict:
+	"""Files changed recently, newest first.
+
+	This is what answers "find the file I worked on yesterday": the agent
+	gets real, ranked candidates with timestamps instead of having to
+	guess a filename. `path` may be a real directory OR a known-folder
+	name ("desktop", "documents", "downloads"); with no path, all three
+	are scanned.
+
+	Directories that are noise by construction (`.git`, `node_modules`,
+	virtualenvs, caches -- `tools/code.py`'s existing vocabulary) are
+	pruned during the walk rather than filtered afterwards, for the same
+	reason `walk_source_files` exists: `rglob` cannot prune and descending
+	into a virtualenv to throw the results away costs orders of magnitude
+	more than the answer is worth.
+	"""
+	from tools.code import _ignored_directory  # one pruning vocabulary, not two
+
+	roots: list[Path] = []
+	if path:
+		known = _known_root(path)
+		roots = [known] if known is not None else [Path(path).expanduser()]
+	else:
+		roots = [root for root in (_known_root(name) for name in DEFAULT_RECENT_ROOTS) if root is not None]
+
+	wanted_suffixes: set[str] | None = None
+	if suffixes:
+		if isinstance(suffixes, str):
+			suffixes = [suffixes]
+		wanted_suffixes = {("." + item.lstrip(".")).lower() for item in suffixes if item}
+
+	cutoff = time.time() - max(0.0, float(within_hours)) * 3600
+	found: list[dict] = []
+	scanned = 0
+	truncated = False
+	missing_roots: list[str] = []
+
+	for root in roots:
+		try:
+			if not root.is_dir():
+				missing_roots.append(str(root))
+				continue
+		except OSError:
+			missing_roots.append(str(root))
+			continue
+		for directory, subdirectories, filenames in os.walk(root):
+			subdirectories[:] = [name for name in subdirectories if not _ignored_directory(name) and not name.startswith(".")]
+			for filename in filenames:
+				scanned += 1
+				if scanned > MAX_RECENT_SCAN:
+					truncated = True
+					break
+				suffix = Path(filename).suffix.lower()
+				if suffix in _RECENT_SKIP_SUFFIXES or filename.startswith("~$"):
+					continue
+				if wanted_suffixes is not None and suffix not in wanted_suffixes:
+					continue
+				full = Path(directory) / filename
+				try:
+					modified = full.stat().st_mtime
+				except OSError:
+					continue
+				if modified < cutoff:
+					continue
+				found.append({
+					"path": str(full),
+					"name": filename,
+					"modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(modified)),
+					"modified_epoch": modified,
+					"age_hours": round((time.time() - modified) / 3600, 1),
+				})
+			if truncated:
+				break
+		if truncated:
+			break
+
+	found.sort(key=lambda item: item["modified_epoch"], reverse=True)
+	limit = max(1, min(int(limit or 25), 200))
+	shown = found[:limit]
+	if shown:
+		message = f"{len(found)} file{'' if len(found) == 1 else 's'} changed in the last {int(within_hours)} hours; newest is {shown[0]['name']}."
+	else:
+		message = f"Nothing was changed in the last {int(within_hours)} hours under {', '.join(str(root) for root in roots) or 'those folders'}."
+	return {
+		"success": True,
+		"verified": True,
+		"message": message,
+		"items": shown,
+		"matched": len(found),
+		"scanned": scanned,
+		"roots": [str(root) for root in roots],
+		"missing_roots": missing_roots,
+		"scan_truncated": truncated,
+	}

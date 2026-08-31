@@ -80,6 +80,28 @@ class ToolDefinition:
     risk: ActionRisk = ActionRisk.SAFE
     exclusive_resource: str | None = None
     read_only: bool = False
+    #: Is running this tool a second time with the same arguments
+    #: equivalent to running it once? Every read-only tool is; so are the
+    #: idempotent writers (`create_directory` lands on the same end state,
+    #: `write_text_file` overwrites to the same content). `append_text_file`
+    #: is NOT -- a retry duplicates the text -- and neither is anything
+    #: that types, clicks or sends. `brain/recovery.py` and the agent loop
+    #: consult this before ever retrying a failure, instead of each
+    #: re-deriving it from the tool name.
+    retry_safe: bool = False
+    #: How long this tool may reasonably take, in seconds. Advisory: it is
+    #: reported to the model so a slow tool is expected rather than assumed
+    #: hung, and it is what a caller should use when choosing its own
+    #: deadline. It is deliberately NOT a hard kill -- interrupting a
+    #: half-finished desktop action is worse than waiting for it.
+    timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        # A read-only tool that claimed to be retry-unsafe would be a
+        # contradiction, and one nobody would notice; normalise instead of
+        # trusting every call site to remember.
+        if self.read_only and not self.retry_safe:
+            object.__setattr__(self, "retry_safe", True)
 
     def to_spec(self) -> ToolSpec:
         return ToolSpec(name=self.name, description=self.description, input_schema=self.parameters)
@@ -92,10 +114,19 @@ class ToolDefinition:
             "risk": self.risk.value,
             "exclusive_resource": self.exclusive_resource,
             "read_only": self.read_only,
+            "retry_safe": self.retry_safe,
+            "timeout_seconds": self.timeout_seconds,
             "parameters": self.parameters,
         }
 
 
+#: Deliberately NOT described here, though `brain/tool_router.py` can
+#: dispatch them: `lock_computer` (locking the machine is something the
+#: user asks for explicitly, never something an agent should decide is a
+#: reasonable step toward a goal) and `send_whatsapp_message` (sending a
+#: message is irreversible and outward-facing; it stays on the voice path,
+#: which asks first). Both remain reachable through their own routes --
+#: this list controls what the AGENT is offered, not what JARVIS can do.
 DEFINITIONS: tuple[ToolDefinition, ...] = (
     # ---- computer / applications ------------------------------------
     ToolDefinition(
@@ -164,10 +195,10 @@ DEFINITIONS: tuple[ToolDefinition, ...] = (
         exclusive_resource=DESKTOP_INPUT,
     ),
     ToolDefinition(
-        "minimize_window", "Minimize the foreground window.", _schema({}), COMPUTER, exclusive_resource=DESKTOP_INPUT
+        "minimize_window", "Minimize the foreground window.", _schema({"hwnd": _INTEGER}), COMPUTER, exclusive_resource=DESKTOP_INPUT
     ),
     ToolDefinition(
-        "maximize_window", "Maximize the foreground window.", _schema({}), COMPUTER, exclusive_resource=DESKTOP_INPUT
+        "maximize_window", "Maximize the foreground window.", _schema({"hwnd": _INTEGER}), COMPUTER, exclusive_resource=DESKTOP_INPUT
     ),
     ToolDefinition(
         "show_desktop", "Minimize everything and show the desktop.", _schema({}), COMPUTER, exclusive_resource=DESKTOP_INPUT
@@ -176,9 +207,12 @@ DEFINITIONS: tuple[ToolDefinition, ...] = (
         "open_task_manager", "Open Windows Task Manager.", _schema({}), COMPUTER
     ),
     # ---- audio -------------------------------------------------------
-    ToolDefinition("volume_up", "Raise the system volume.", _schema({"amount": _INTEGER}), AUDIO),
-    ToolDefinition("volume_down", "Lower the system volume.", _schema({"amount": _INTEGER}), AUDIO),
-    ToolDefinition("mute_volume", "Toggle system mute.", _schema({}), AUDIO),
+    # NOT retry-safe: each run moves the volume again, so a retry after an
+    # ambiguous failure would change it twice. `set_volume` is the tool to
+    # use when a specific level is wanted.
+    ToolDefinition("volume_up", "Raise the system volume by one step.", _schema({"amount": _INTEGER}), AUDIO),
+    ToolDefinition("volume_down", "Lower the system volume by one step.", _schema({"amount": _INTEGER}), AUDIO),
+    ToolDefinition("mute_volume", "Toggle the system mute on or off.", _schema({}), AUDIO),
     # ---- vision ------------------------------------------------------
     ToolDefinition(
         "take_screenshot",
@@ -270,6 +304,8 @@ DEFINITIONS: tuple[ToolDefinition, ...] = (
         risk=ActionRisk.CAUTION,
     ),
     ToolDefinition(
+        # Retry-safe: the end state is "this directory exists", which a
+        # second run reaches identically.
         "create_directory",
         "Create a directory, including any missing parent directories.",
         _schema({"path": _STRING}, ["path"]),
@@ -391,6 +427,237 @@ DEFINITIONS: tuple[ToolDefinition, ...] = (
         read_only=True,
     ),
     # ---- memory ---------------------------------------------------------
+    # ---- machine state (read-only observation) -----------------------
+    ToolDefinition(
+        "system_status",
+        "Report this machine's CPU load, memory use, free disk space and battery level in one call.",
+        _schema({}),
+        INFO,
+        read_only=True,
+        timeout_seconds=10,
+    ),
+    ToolDefinition(
+        "network_status",
+        "Check whether this machine really has internet access, by opening a connection rather than trusting the adapter state.",
+        _schema({}),
+        INFO,
+        read_only=True,
+        timeout_seconds=10,
+    ),
+    ToolDefinition(
+        "list_processes",
+        "List running processes, largest by memory first. Pass 'name' to list only processes matching it.",
+        _schema({"name": _STRING, "limit": _INTEGER}),
+        COMPUTER,
+        read_only=True,
+        timeout_seconds=15,
+    ),
+    ToolDefinition(
+        "process_running",
+        "Check whether an application is running, and how many processes it has. Accepts a spoken name like 'chrome' or 'Google Chrome'.",
+        _schema({"name": _STRING}, ["name"]),
+        COMPUTER,
+        read_only=True,
+        timeout_seconds=15,
+    ),
+    ToolDefinition(
+        "get_volume",
+        "Report the exact system volume percentage and whether audio is muted.",
+        _schema({}),
+        AUDIO,
+        read_only=True,
+        timeout_seconds=10,
+    ),
+    ToolDefinition(
+        "set_volume",
+        "Set the system volume to an exact percentage from 0 to 100. Use this rather than repeating volume_up/volume_down when a specific level is wanted.",
+        _schema({"level": _INTEGER}, ["level"]),
+        AUDIO,
+        retry_safe=True,
+        timeout_seconds=10,
+    ),
+    # ---- clipboard ---------------------------------------------------
+    ToolDefinition(
+        "read_clipboard",
+        "Read the text currently on the Windows clipboard.",
+        _schema({}),
+        COMPUTER,
+        read_only=True,
+        timeout_seconds=10,
+    ),
+    ToolDefinition(
+        "write_clipboard",
+        "Replace the Windows clipboard with this text, so the user can paste it.",
+        _schema({"text": _STRING}, ["text"]),
+        COMPUTER,
+        retry_safe=True,
+        timeout_seconds=10,
+    ),
+    # ---- file discovery ----------------------------------------------
+    ToolDefinition(
+        "file_info",
+        "Size, last-modified time and kind for one file or folder. Use this to answer 'when did I last change this' without reading the whole file.",
+        _schema({"path": _STRING}, ["path"]),
+        FILESYSTEM,
+        read_only=True,
+        timeout_seconds=10,
+    ),
+    ToolDefinition(
+        "recent_files",
+        "Files changed recently, newest first -- how to find 'the file I was working on yesterday'. "
+        "'path' may be a folder or one of 'desktop', 'documents', 'downloads'; with no path it searches all three. "
+        "'within_hours' defaults to 48; 'suffixes' limits it to e.g. ['.docx', '.py'].",
+        _schema({"path": _STRING, "within_hours": {"type": "number"}, "limit": _INTEGER, "suffixes": {"type": "array", "items": _STRING}}),
+        FILESYSTEM,
+        read_only=True,
+        timeout_seconds=45,
+    ),
+    # ---- desktop scrolling -------------------------------------------
+    ToolDefinition(
+        "scroll_screen",
+        "Scroll the window under the mouse pointer. Give x and y to scroll a specific pane; otherwise it scrolls wherever the pointer already is.",
+        _schema({"direction": _STRING, "clicks": _INTEGER, "x": _INTEGER, "y": _INTEGER}),
+        COMPUTER,
+        exclusive_resource=DESKTOP_INPUT,
+        retry_safe=True,
+        timeout_seconds=15,
+    ),
+    # ---- windows and shell (previously dispatchable but undescribed) --
+    ToolDefinition(
+        "restore_window",
+        "Restore the foreground window from minimised or maximised back to its normal size.",
+        _schema({"hwnd": _INTEGER}),
+        COMPUTER,
+        exclusive_resource=DESKTOP_INPUT,
+        retry_safe=True,
+    ),
+    ToolDefinition(
+        "close_window",
+        "Close the foreground window. Asks the application to close, so unsaved work still prompts.",
+        _schema({"hwnd": _INTEGER}),
+        COMPUTER,
+        risk=ActionRisk.CAUTION,
+        exclusive_resource=DESKTOP_INPUT,
+    ),
+    ToolDefinition(
+        "open_file_explorer",
+        "Open File Explorer, at a specific folder when a path is given.",
+        _schema({"path": _STRING}),
+        FILESYSTEM,
+        retry_safe=True,
+    ),
+    ToolDefinition(
+        "open_folder",
+        "Open one of the user's known folders by name -- desktop, documents, downloads, pictures.",
+        _schema({"name": _STRING}, ["name"]),
+        FILESYSTEM,
+        retry_safe=True,
+    ),
+    ToolDefinition(
+        "get_day",
+        "Report today's day of the week.",
+        _schema({}),
+        INFO,
+        read_only=True,
+        timeout_seconds=5,
+    ),
+    # ---- music -------------------------------------------------------
+    #
+    # These were dispatchable in `brain/tool_router.py` but had no entry
+    # here, which meant the agent runtime was never told they exist: a
+    # request like "open Apple Music and make me a playlist" reached a
+    # model holding no music tools at all. Describing them is the whole
+    # fix -- the implementations were already there and already tested.
+    ToolDefinition(
+        "open_music",
+        "Open Apple Music in JARVIS's browser session. Starts the browser itself if it is not already running.",
+        _schema({}),
+        BROWSER,
+        exclusive_resource="authenticated_browser",
+        retry_safe=True,
+        timeout_seconds=60,
+    ),
+    ToolDefinition(
+        "music_play",
+        "Play music on Apple Music. 'intent' selects what to play: PLAY_SONG, PLAY_ARTIST, PLAY_ALBUM, PLAY_PLAYLIST, "
+        "PLAY_QUERY, PLAY_MOOD, PLAY_LAST, PLAY_RECENT, RESUME_SESSION, PLAY_FAVORITES, PLAY_LIBRARY or PLAY_GENERIC. "
+        "Supply whichever of song/artist/album/playlist/mood the intent needs.",
+        _schema({
+            "intent": _STRING, "song": _STRING, "artist": _STRING, "album": _STRING,
+            "playlist": _STRING, "mood": _STRING, "scope": _STRING,
+            "contextual": _BOOLEAN, "shuffle": _BOOLEAN,
+        }, ["intent"]),
+        BROWSER,
+        exclusive_resource="authenticated_browser",
+        timeout_seconds=90,
+    ),
+    ToolDefinition(
+        "music_now_playing",
+        "Report what Apple Music is playing right now. 'aspect' may be song, artist or album.",
+        _schema({"aspect": _STRING}),
+        BROWSER,
+        exclusive_resource="authenticated_browser",
+        read_only=True,
+        timeout_seconds=45,
+    ),
+    ToolDefinition(
+        "music_list_playlists",
+        "List the playlists in the user's Apple Music library. Check this before acting on a playlist by name.",
+        _schema({}),
+        BROWSER,
+        exclusive_resource="authenticated_browser",
+        read_only=True,
+        timeout_seconds=60,
+    ),
+    ToolDefinition(
+        "music_create_playlist",
+        "Create a new Apple Music playlist called 'name' containing 'songs'. At least one song is required -- "
+        "Apple Music's web player cannot create an empty playlist. Verified against the library afterwards.",
+        _schema({"name": _STRING, "songs": {"type": "array", "items": _STRING}, "artist": _STRING}, ["name", "songs"]),
+        BROWSER,
+        risk=ActionRisk.CAUTION,
+        exclusive_resource="authenticated_browser",
+        timeout_seconds=180,
+    ),
+    ToolDefinition(
+        "music_add_to_playlist",
+        "Add one song to an existing Apple Music playlist, then confirm it is really there. "
+        "Reports the available playlist names if the one asked for does not exist.",
+        _schema({"song": _STRING, "playlist": _STRING, "artist": _STRING}, ["song", "playlist"]),
+        BROWSER,
+        risk=ActionRisk.CAUTION,
+        exclusive_resource="authenticated_browser",
+        timeout_seconds=120,
+    ),
+    ToolDefinition("music_pause", "Pause whatever Apple Music is currently playing.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", timeout_seconds=30),
+    ToolDefinition("music_resume", "Resume Apple Music from where it was paused.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", timeout_seconds=30),
+    ToolDefinition("music_stop", "Stop Apple Music playback.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", timeout_seconds=30),
+    ToolDefinition("music_next", "Skip to the next track.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", timeout_seconds=30),
+    ToolDefinition("music_previous", "Go back to the previous track.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", timeout_seconds=30),
+    ToolDefinition("music_restart_track", "Start the current track again from the beginning.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", timeout_seconds=30),
+    ToolDefinition("music_shuffle_on", "Turn shuffle on for Apple Music playback.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", retry_safe=True, timeout_seconds=30),
+    ToolDefinition("music_shuffle_off", "Turn shuffle off for Apple Music playback.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", retry_safe=True, timeout_seconds=30),
+    ToolDefinition("music_repeat_on", "Turn repeat on for Apple Music playback.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", retry_safe=True, timeout_seconds=30),
+    ToolDefinition("music_repeat_off", "Turn repeat off for Apple Music playback.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", retry_safe=True, timeout_seconds=30),
+    ToolDefinition("music_add_to_library", "Add the current track to the user's library.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", retry_safe=True, timeout_seconds=45),
+    ToolDefinition("music_add_to_favorites", "Mark the current track as a favourite.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", retry_safe=True, timeout_seconds=45),
+    ToolDefinition("music_artist_more", "Open more from the current track's artist.", _schema({}), BROWSER, exclusive_resource="authenticated_browser", timeout_seconds=60),
+    ToolDefinition(
+        "music_queue_add",
+        "Add a song to the end of the Apple Music queue without interrupting what is playing.",
+        _schema({"song": _STRING, "contextual": _BOOLEAN}),
+        BROWSER,
+        exclusive_resource="authenticated_browser",
+        timeout_seconds=90,
+    ),
+    ToolDefinition(
+        "music_queue_next",
+        "Queue a song to play next, without interrupting what is playing.",
+        _schema({"song": _STRING, "contextual": _BOOLEAN}),
+        BROWSER,
+        exclusive_resource="authenticated_browser",
+        timeout_seconds=90,
+    ),
     ToolDefinition(
         "remember_fact",
         (

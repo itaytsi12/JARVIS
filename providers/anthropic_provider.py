@@ -24,6 +24,7 @@ import time
 from typing import Any
 
 from config import estimate_cost, get_config
+from config import events
 from providers.base import (
     Message,
     ModelResponse,
@@ -217,6 +218,12 @@ class AnthropicProvider:
 
         started = time.perf_counter()
         first_event_ms: float | None = None
+        # UI/status hook. Emitted here, in the vendor module itself, rather
+        # than in `providers/usage.py::TrackedProvider` -- that wrapper is
+        # only applied by `brain/agent_service.py`, so a direct provider
+        # call (a benchmark, a script, a future call site) would silently
+        # never light the node up. `publish` never raises.
+        events.publish(events.MODEL_REQUEST_STARTED, model="anthropic")
         try:
             if on_text is None:
                 response = client.messages.create(**request)
@@ -255,8 +262,20 @@ class AnthropicProvider:
                             on_text(chunk)
                     response = stream.get_final_message()
         except Exception as exc:  # translated below; never leaked raw
+            # Translate FIRST, then report the translated type. The UI
+            # distinguishes a rate limit (amber, "wait") from a genuine
+            # failure (red, "broken"), and `ProviderRateLimited` is the
+            # neutral name that decision is keyed on -- publishing the raw
+            # vendor class name would make that mapping depend on which
+            # SDK happened to raise. The exception raised is unchanged.
+            translated = _translate_error(exc)
+            # The event carries the EXCEPTION TYPE only, never its message:
+            # a provider error string is the one place a credential could
+            # plausibly appear, and this payload reaches the UI.
+            events.publish(events.MODEL_REQUEST_FAILED, model="anthropic", error=type(translated).__name__)
             _log_provider_failure(exc, model_id)
-            raise _translate_error(exc) from exc
+            raise translated from exc
+        events.publish(events.MODEL_REQUEST_SUCCEEDED, model="anthropic")
         latency_ms = (time.perf_counter() - started) * 1000
 
         text_parts: list[str] = []

@@ -63,13 +63,17 @@ def state_color(state, disabled: bool = False) -> str:
 
 
 def configure_logging() -> None:
-    LOG_DIR.mkdir(exist_ok=True)
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    if not any(isinstance(item, RotatingFileHandler) for item in root.handlers):
-        root.addHandler(handler)
+    """Install the rotating background log.
+
+    The implementation moved to `config/logging_setup.py` so
+    `startup/launcher.py` can install the SAME handler on the SAME file --
+    a windowed (pythonw.exe) launch has no console, and its startup
+    failures must land where this tray's "Open logs" item points. Calling
+    this still does exactly what it always did.
+    """
+    from config import configure_file_logging
+
+    configure_file_logging(LOG_FILE)
 
 
 def make_icon(state: AssistantState, disabled: bool = False):
@@ -114,10 +118,23 @@ def tray_title(state: AssistantState, detail: str | None = None) -> str:
 
 
 class TrayApplication:
-    def __init__(self):
+    """The notification-area host.
+
+    `assistant` and `on_exit` exist so `startup/launcher.py` can run the
+    tray ALONGSIDE the graphical UI: both surfaces then observe the SAME
+    `AlwaysOnAssistant` (there is only ever one microphone owner), and
+    choosing Exit in the tray also shuts the window down. Passing neither
+    reproduces the original behaviour exactly, which is what `run_tray`
+    and every existing test still do.
+    """
+
+    def __init__(self, assistant=None, on_exit=None):
         self.icon = None
         self._autostart_enabled = False
-        self.assistant = AlwaysOnAssistant(state_callback=self._state_changed)
+        self._on_exit = on_exit
+        self.assistant = assistant if assistant is not None else AlwaysOnAssistant(state_callback=self._state_changed)
+        if assistant is not None and getattr(assistant, "state_callback", None) is None:
+            self.assistant.state_callback = self._state_changed
 
     def _state_changed(self, state, detail=None):
         if self.icon:
@@ -159,6 +176,11 @@ class TrayApplication:
     def _exit(self, icon, _item):
         self.assistant.stop()
         icon.stop()
+        if self._on_exit is not None:
+            try:
+                self._on_exit()
+            except Exception:
+                log.exception("Exit hook failed")
 
     def run(self) -> int:
         import pystray

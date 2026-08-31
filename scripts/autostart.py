@@ -1,4 +1,22 @@
-"""Shared per-user Task Scheduler configuration for JARVIS."""
+"""Shared per-user Task Scheduler configuration for JARVIS.
+
+Installs ONE per-user scheduled task that runs `main.py --start` at logon:
+the full desktop startup in `startup/launcher.py` (window, JARVIS's own
+Chrome, the backend, voice, and the tray). It is a LeastPrivilege,
+InteractiveToken task registered for the CURRENT user only, so it needs no
+administrator rights, and every path in it -- the interpreter, the project
+directory, the user name -- is resolved at install time rather than
+hard-coded.
+
+`pythonw.exe` is used deliberately: no console window is left open at
+logon. That also means nothing printed is visible, which is why
+`startup/launcher.py` installs the rotating log file
+(`logs/jarvis_background.log`) before anything else runs.
+
+`MultipleInstancesPolicy=IgnoreNew` stops Task Scheduler from starting a
+second copy; `voice/single_instance.py`'s named mutex independently stops
+one started any other way.
+"""
 from __future__ import annotations
 
 import os
@@ -24,16 +42,23 @@ def background_python() -> Path:
     return pythonw if pythonw.is_file() else current
 
 
-def task_xml(delay: str = "PT15S") -> str:
+def task_xml(delay: str = "PT10S") -> str:
+    """The task definition. `delay` is a real Task Scheduler logon delay
+    (ISO 8601), NOT a sleep inside Python -- the process starts late, it
+    does not start early and then block."""
     command = escape(str(background_python()))
-    arguments = escape(f'"{PROJECT_ROOT / "main.py"}" --tray')
+    # `--start` is the full desktop sequence (`startup/launcher.py`): the
+    # window, JARVIS's own Chrome, the backend, voice AND the tray. The
+    # older `--tray` action is still supported by `main.py`; it is simply
+    # a strict subset of this, so the logon task uses the whole thing.
+    arguments = escape(f'"{PROJECT_ROOT / "main.py"}" --start')
     working_directory = escape(str(PROJECT_ROOT))
     username = os.environ.get("USERNAME", "")
     domain = os.environ.get("USERDOMAIN", "")
     user = escape(f"{domain}\\{username}" if domain and username else username)
     return f'''<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Start JARVIS tray assistant at user logon.</Description></RegistrationInfo>
+  <RegistrationInfo><Description>Start JARVIS (interface, Chrome, backend and voice) at user logon.</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><Delay>{delay}</Delay><UserId>{user}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
   <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled></Settings>

@@ -150,11 +150,21 @@ def is_cdp_available(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout
         return False
 
 
+def _autostart_enabled() -> bool:
+    """Whether a tool that needs the authenticated session may start Chrome
+    itself. On by default; `JARVIS_BROWSER_AUTOSTART=0` restores the older
+    "tell the user to launch it" behaviour for anyone who wants the
+    browser to appear only when they say so."""
+    return (os.getenv("JARVIS_BROWSER_AUTOSTART", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 class AuthenticatedBrowserSession:
-    """One reused connection to the user's own remote-debugging-enabled
-    Chrome. Never launches a browser itself -- only attaches to one
-    that's already running (see `launch_chrome_for_jarvis` for the
-    separate, explicit, human-driven launch step).
+    """One reused connection to JARVIS's own remote-debugging-enabled
+    Chrome. It attaches to a running one; if none is running it asks
+    `startup/chrome.py::ensure_jarvis_chrome` to start JARVIS's dedicated
+    profile ONCE (see `_autostart_chrome`, disable with
+    `JARVIS_BROWSER_AUTOSTART=0`). It never launches or substitutes any
+    other browser, and never touches the user's personal profile.
 
     THREADING: every method here assumes it is already running on this
     session's Playwright worker thread (`tools/playwright_runtime.py`).
@@ -195,14 +205,15 @@ class AuthenticatedBrowserSession:
             if self.is_connected():
                 return self._browser
             self._discard()
-            if not is_cdp_available(self.host, self.port):
+            if not is_cdp_available(self.host, self.port) and not self._autostart_chrome():
                 log.info(
                     "Authenticated Chrome not reachable at %s -- run: "
                     "python -m tools.browser_authenticated --launch",
                     cdp_endpoint(self.host, self.port),
                 )
                 raise AuthenticatedBrowserUnavailable(
-                    "Authenticated Chrome is not running. Start the JARVIS browser session first."
+                    "Authenticated Chrome is not running, and I could not start it. "
+                    "Start the JARVIS browser session first."
                 )
             try:
                 from playwright.sync_api import sync_playwright
@@ -228,6 +239,52 @@ class AuthenticatedBrowserSession:
             if _debug_enabled() and self._browser.contexts:
                 attach_diagnostics(self._browser.contexts[0])
             return self._browser
+
+    #: One automatic launch attempt per session object. A Chrome that
+    #: refuses to start does so for a persistent reason (no executable, a
+    #: refused profile, a process already holding it), so retrying on every
+    #: subsequent tool call would just add seconds to every failure.
+    _autostart_attempted = False
+
+    def _autostart_chrome(self) -> bool:
+        """Start JARVIS's own Chrome, once, when nothing is listening.
+
+        Music and every other authenticated-session tool used to fail with
+        "Start the JARVIS browser session first" -- a correct diagnosis and
+        a useless one, because the user then had to run a command by hand
+        for something JARVIS is perfectly able to do itself. This closes
+        that gap without changing what a session IS: it still only ever
+        attaches to a real debuggable Chrome, and it still never touches
+        the user's personal profile.
+
+        Deliberately delegates to `startup/chrome.py::ensure_jarvis_chrome`
+        rather than calling `launch_chrome_for_jarvis` directly, so the
+        "is JARVIS's Chrome already running" decision stays in the ONE
+        place that owns it -- including its refusal to start a second copy
+        against the same profile.
+
+        Never raises: a failed autostart falls back to the previous,
+        honest error.
+        """
+        if self._autostart_attempted:
+            return False
+        self._autostart_attempted = True
+        if not _autostart_enabled():
+            return False
+        try:
+            from startup.chrome import ensure_jarvis_chrome
+
+            log.info("Authenticated Chrome is not running; starting JARVIS's own Chrome.")
+            result = ensure_jarvis_chrome()
+        except Exception:
+            log.exception("Automatic JARVIS Chrome startup failed")
+            return False
+        reachable = is_cdp_available(self.host, self.port)
+        log.info(
+            "Automatic JARVIS Chrome startup: action=%s reachable=%s",
+            result.get("action"), reachable,
+        )
+        return reachable
 
     def _discard(self) -> None:
         browser, playwright = self._browser, self._playwright
@@ -435,6 +492,71 @@ def _chrome_running_with_profile(resolved_dir: Path) -> bool:
     return False
 
 
+class ProfileRefusal(ValueError):
+    """An explicitly-configured profile directory that must not be used.
+
+    Carries the human-readable explanation so both the interactive
+    launcher and the automated startup path report the same thing.
+    """
+
+
+def resolved_auth_profile_dir(user_data_dir: Path | str | None = None) -> Path:
+    """The ABSOLUTE profile directory JARVIS's own Chrome uses.
+
+    The single source of truth for "which profile is JARVIS's", used both
+    by `launch_chrome_for_jarvis` below and by `startup/chrome.py`'s
+    detection -- so the directory startup INSPECTS can never drift from
+    the one a launch would actually use.
+
+    Absolute by construction: live-confirmed that a RELATIVE
+    `--user-data-dir` makes Chrome print "Opening in existing browser
+    session." and exit without applying the debug flags, even against a
+    directory nothing has ever touched.
+
+    Raises `ProfileRefusal` for an explicitly-configured directory that
+    does not exist (launching there would silently create a brand-new,
+    signed-out profile instead of reusing the real one) or that is the
+    user's true default profile (remote debugging demonstrably does not
+    turn on there while their ordinary Chrome is running).
+    """
+    explicit_override = user_data_dir or os.getenv("JARVIS_CHROME_USER_DATA_DIR")
+    if explicit_override:
+        resolved = Path(explicit_override)
+        if not resolved.exists():
+            raise ProfileRefusal(
+                f"Profile directory not found: {resolved}. Refusing -- that would silently create "
+                "a brand-new, signed-out profile there instead of reusing the one you meant."
+            )
+    else:
+        resolved = DEFAULT_AUTH_PROFILE_DIR
+        resolved.mkdir(parents=True, exist_ok=True)
+    resolved = resolved.resolve()
+
+    true_default = default_user_data_dir()
+    if true_default is not None and _normalize_dir(str(resolved)) == _normalize_dir(str(true_default)):
+        raise ProfileRefusal(
+            f"Refusing to enable remote debugging on your REGULAR Chrome profile ({resolved}). "
+            "Chrome does not actually turn the debugger on there while your normal Chrome is "
+            "running, so this would silently fail. Unset JARVIS_CHROME_USER_DATA_DIR to use the "
+            f"dedicated profile ({DEFAULT_AUTH_PROFILE_DIR})."
+        )
+    return resolved
+
+
+def jarvis_chrome_is_running(user_data_dir: Path | str | None = None) -> bool:
+    """Is a chrome.exe already running against JARVIS's OWN profile?
+
+    Matches on each process's real `--user-data-dir` command-line
+    argument, never on "is chrome.exe running" -- the user's personal
+    Chrome uses a different profile directory and must never be mistaken
+    for this one.
+    """
+    try:
+        return _chrome_running_with_profile(resolved_auth_profile_dir(user_data_dir))
+    except ProfileRefusal:
+        return False
+
+
 def launch_chrome_for_jarvis(
     port: int = DEFAULT_PORT,
     host: str = DEFAULT_HOST,
@@ -489,34 +611,14 @@ def launch_chrome_for_jarvis(
         print("Could not locate a real installed Chrome executable.")
         return -1
 
-    explicit_override = user_data_dir or os.getenv("JARVIS_CHROME_USER_DATA_DIR")
-    if explicit_override:
-        resolved_dir = Path(explicit_override)
-        if not resolved_dir.exists():
-            print(f"Profile directory not found: {resolved_dir}")
-            print("Refusing to launch -- that would silently create a brand-new, signed-out")
-            print("profile there instead of reusing the one you meant.")
-            return -1
-    else:
-        resolved_dir = DEFAULT_AUTH_PROFILE_DIR
-        resolved_dir.mkdir(parents=True, exist_ok=True)
-    # MUST be absolute: live-confirmed on this machine that passing a
-    # RELATIVE --user-data-dir makes Chrome behave as if the profile is
-    # already in use -- it prints "Opening in existing browser session."
-    # and exits immediately (code 0) without ever starting a new process
-    # or applying the remote-debugging flags, even against a directory
-    # nothing else has ever touched. An absolute path (`.resolve()`) does
-    # not exhibit this at all.
-    resolved_dir = resolved_dir.resolve()
-
-    true_default = default_user_data_dir()
-    if true_default is not None and _normalize_dir(str(resolved_dir)) == _normalize_dir(str(true_default)):
-        print(f"Refusing to enable remote debugging on your REGULAR Chrome profile ({resolved_dir}).")
-        print("Chrome does not actually turn on the debugger there while your normal Chrome")
-        print("is running (confirmed live -- it just forwards to that existing process and")
-        print("does not apply the flag), so this would silently fail. Use a dedicated profile")
-        print(f"instead -- unset JARVIS_CHROME_USER_DATA_DIR to use the default dedicated one")
-        print(f"({DEFAULT_AUTH_PROFILE_DIR}), sign in there once, and JARVIS will reuse it from then on.")
+    # One resolver, shared with `startup/chrome.py`'s detection, so the
+    # directory that gets INSPECTED and the one that gets LAUNCHED can
+    # never drift apart. Both refusals below are unchanged in meaning --
+    # they now just live in the resolver.
+    try:
+        resolved_dir = resolved_auth_profile_dir(user_data_dir)
+    except ProfileRefusal as refusal:
+        print(str(refusal))
         return -1
 
     if _chrome_running_with_profile(resolved_dir):

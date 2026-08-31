@@ -23,6 +23,8 @@ import logging
 import sys
 import time
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 from config import get_config
@@ -44,6 +46,39 @@ JARVIS_LOGGERS = (
 NOISY_THIRD_PARTIES = ("httpx", "httpcore", "urllib3", "anthropic", "openai", "asyncio", "PIL")
 
 _CONFIGURED = False
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOG_DIR = PROJECT_ROOT / "logs"
+#: Where a windowed (pythonw.exe) run writes its log. There is no console
+#: to read in that case -- the Windows logon task and `main.py --start`
+#: both run detached -- so a file handler is the only thing that makes a
+#: startup failure diagnosable at all.
+DEFAULT_LOG_FILE = LOG_DIR / "jarvis_background.log"
+
+
+def configure_file_logging(path: Path | str | None = None, root_level: int = logging.INFO) -> Path:
+    """Install the rotating log file, exactly once per process.
+
+    This is the implementation `voice/tray_app.py::configure_logging` has
+    always had; it lives here now because `startup/launcher.py` needs the
+    identical behaviour and the identical PATH. Two copies would mean a
+    windowed run writing its startup failures to a file the tray's
+    "Open logs" menu item does not show.
+
+    Idempotent: a second call with a RotatingFileHandler already installed
+    changes nothing, so whichever of the launcher and the tray runs first
+    decides the file and the other reuses it.
+    """
+    target = Path(path) if path is not None else DEFAULT_LOG_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    root.setLevel(root_level)
+    if any(isinstance(item, RotatingFileHandler) for item in root.handlers):
+        return target
+    handler = RotatingFileHandler(target, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(handler)
+    return target
 
 
 def configure_logging(force: bool = False) -> None:

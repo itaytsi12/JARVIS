@@ -42,8 +42,9 @@ def register_provider(name: str, factory: ProviderFactory) -> None:
 
 def _default_factories() -> dict[str, ProviderFactory]:
     from providers.anthropic_provider import AnthropicProvider
+    from providers.bootstrap import build_multi_model_provider
 
-    return {"anthropic": AnthropicProvider}
+    return {"multi_model": build_multi_model_provider, "anthropic": AnthropicProvider}
 
 
 def _ensure_defaults() -> None:

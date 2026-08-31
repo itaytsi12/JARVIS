@@ -3,6 +3,7 @@ import logging,os,re,time,threading
 from collections import OrderedDict
 from dataclasses import dataclass,field
 from openai import OpenAI
+from config.events import model_activity
 
 # `.env` is loaded exactly once, from the project root, by
 # `config/settings.py` -- importing it here is what guarantees that has
@@ -31,7 +32,11 @@ class WebAnswerService:
                 return WebAnswer(cached.answer,True,list(cached.sources),cached.model,0,0,cache_hit=True)
             if self.client is None:
                 self.client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            response=self.client.responses.create(model=self.model,tools=[{"type":"web_search","search_context_size":self.search_context}],include=["web_search_call.action.sources"],input=[{"role":"system","content":"Answer in English using current web information. Reply in one to three concise natural sentences suitable for speech. Do not include Markdown, raw URLs, or a spoken source list."},{"role":"user","content":question}],max_output_tokens=180,store=False,timeout=self.timeout)
+            # UI/status hook: brackets THIS real request with
+            # started/succeeded/failed events (config/events.py). Observes
+            # only -- the request itself is unchanged.
+            with model_activity("openai"):
+                response=self.client.responses.create(model=self.model,tools=[{"type":"web_search","search_context_size":self.search_context}],include=["web_search_call.action.sources"],input=[{"role":"system","content":"Answer in English using current web information. Reply in one to three concise natural sentences suitable for speech. Do not include Markdown, raw URLs, or a spoken source list."},{"role":"user","content":question}],max_output_tokens=180,store=False,timeout=self.timeout)
             if cancellation_token is not None:cancellation_token.raise_if_cancelled()
             web_ms=(time.perf_counter()-started)*1000; processing=time.perf_counter(); text=self._spoken_text(getattr(response,"output_text","") or ""); sources=self._sources(response); processing_ms=(time.perf_counter()-processing)*1000
             if not text:return WebAnswer(FAILURE,False,sources,self.model,web_ms,processing_ms,"empty_response")

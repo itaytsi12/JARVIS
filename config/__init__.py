@@ -17,6 +17,7 @@ __all__ = [
     "estimate_cost",
     "get_pricing_table",
     "configure_logging",
+    "configure_file_logging",
     "log_startup_status",
     "StageTimer",
 ]
@@ -29,7 +30,13 @@ def __getattr__(name):
     report, and `providers` imports `config` -- importing it eagerly here
     would make that a cycle.
     """
-    if name in {"configure_logging", "log_startup_status", "StageTimer", "describe_runtime"}:
+    if name in {
+        "configure_logging",
+        "configure_file_logging",
+        "log_startup_status",
+        "StageTimer",
+        "describe_runtime",
+    }:
         from config import logging_setup
 
         return getattr(logging_setup, name)

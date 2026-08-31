@@ -384,5 +384,63 @@ class DiagnoseCliTests(unittest.TestCase):
         self.assertNotIn("secret", str(report))  # query string redacted
 
 
+class ChromeAutostartTests(unittest.TestCase):
+    """The session starts JARVIS's own Chrome when nothing is listening.
+
+    Every authenticated-session tool used to fail with "Start the JARVIS
+    browser session first" -- correct, and useless, since JARVIS can do it
+    itself. These pin the two things that make that safe: it happens at
+    most once, and it is off in the test suite.
+    """
+
+    def _session(self):
+        from tools.browser_authenticated import AuthenticatedBrowserSession
+
+        return AuthenticatedBrowserSession()
+
+    def test_autostart_is_disabled_for_the_whole_test_suite(self):
+        """`tests/conftest.py` sets JARVIS_BROWSER_AUTOSTART=0. Without it a
+        full-suite run spawned real chrome.exe processes -- observed live."""
+        from tools.browser_authenticated import _autostart_enabled
+
+        self.assertFalse(_autostart_enabled())
+
+    def test_it_starts_chrome_once_and_reports_whether_that_worked(self):
+        session = self._session()
+        with patch.dict(os.environ, {"JARVIS_BROWSER_AUTOSTART": "1"}), patch(
+            "startup.chrome.ensure_jarvis_chrome", return_value={"action": "launched"}
+        ) as ensure, patch("tools.browser_authenticated.is_cdp_available", return_value=True):
+            self.assertTrue(session._autostart_chrome())
+            # A second call must not launch anything: a Chrome that refuses
+            # to start does so for a persistent reason, and retrying on
+            # every tool call would add seconds to every failure.
+            self.assertFalse(session._autostart_chrome())
+        self.assertEqual(ensure.call_count, 1)
+
+    def test_a_launch_that_leaves_nothing_listening_is_a_failure(self):
+        """`ensure_jarvis_chrome` returning is not proof the debugger is
+        reachable -- only the port answering is."""
+        session = self._session()
+        with patch.dict(os.environ, {"JARVIS_BROWSER_AUTOSTART": "1"}), patch(
+            "startup.chrome.ensure_jarvis_chrome", return_value={"action": "failed"}
+        ), patch("tools.browser_authenticated.is_cdp_available", return_value=False):
+            self.assertFalse(session._autostart_chrome())
+
+    def test_an_exception_while_launching_never_escapes(self):
+        session = self._session()
+        with patch.dict(os.environ, {"JARVIS_BROWSER_AUTOSTART": "1"}), patch(
+            "startup.chrome.ensure_jarvis_chrome", side_effect=OSError("no chrome")
+        ):
+            self.assertFalse(session._autostart_chrome())
+
+    def test_the_opt_out_is_honoured(self):
+        session = self._session()
+        with patch.dict(os.environ, {"JARVIS_BROWSER_AUTOSTART": "0"}), patch(
+            "startup.chrome.ensure_jarvis_chrome"
+        ) as ensure:
+            self.assertFalse(session._autostart_chrome())
+        ensure.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

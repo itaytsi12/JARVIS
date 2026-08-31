@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
@@ -213,6 +214,12 @@ class AgentLoop:
         specs = list(tool_specs) if tool_specs is not None else self.catalog.specs()
         messages: list[Message] = [Message.user(context.user_prompt)]
         attempts: dict[str, int] = {}
+        request_id = uuid.uuid4().hex
+        checkpoint = None
+        successful_actions: dict[str, tuple[str, str]] = {}
+        if getattr(self.provider, "name", "") == "multi_model":
+            from providers.pool import TaskCheckpoint
+            checkpoint = TaskCheckpoint(original_goal=goal)
         consecutive_failures = 0
         deadline = started + self.limits.timeout_seconds
 
@@ -228,7 +235,7 @@ class AgentLoop:
                 )
 
             try:
-                response = self._call_model(messages, context.system_prompt, specs)
+                response = self._call_model(messages, context.system_prompt, specs, request_id=request_id, checkpoint=checkpoint)
             except ProviderUnavailable as exc:
                 run.errors.append(str(exc))
                 log.error("Agent run has no usable provider: %s", exc)
@@ -288,6 +295,13 @@ class AgentLoop:
                     return self._stop(run, started, CANCELLED, "I stopped that, sir.")
 
                 signature = _signature(call)
+                definition = self.catalog.get(call.name)
+                prior = successful_actions.get(signature)
+                if prior and definition is not None and not definition.read_only and prior[0] != response.provider:
+                    outcome_text = "Already completed successfully by the previous model route; this side effect was not executed again. " + prior[1]
+                    outcomes.append(ToolOutcome(call.id, outcome_text, is_error=False))
+                    self._record_step(run, call, ToolResult(True, call.name, outcome_text, {"deduplicated": True}), outcome_text, 0, response.text)
+                    continue
                 attempts[signature] = attempts.get(signature, 0) + 1
                 attempt = attempts[signature]
                 if attempt > self.limits.max_action_retries + 1:
@@ -336,6 +350,10 @@ class AgentLoop:
                 if result.success:
                     consecutive_failures = 0
                     attempts[signature] = 0
+                    successful_actions[signature] = (response.provider, observation[:500])
+                    if checkpoint is not None:
+                        checkpoint.completed_steps.append(f"{call.name}({call.arguments}) succeeded")
+                        checkpoint.important_tool_results.append(observation[:500])
                 else:
                     consecutive_failures += 1
                     if result.error:
@@ -362,14 +380,11 @@ class AgentLoop:
         )
 
     # ------------------------------------------------------------------
-    def _call_model(self, messages: list[Message], system: str, specs: list[ToolSpec]) -> ModelResponse:
-        return self.provider.complete(
-            messages,
-            system=system,
-            tools=specs,
-            effort=self.effort,
-            on_text=self.on_answer_text,
-        )
+    def _call_model(self, messages: list[Message], system: str, specs: list[ToolSpec], *, request_id: str = "", checkpoint: Any = None) -> ModelResponse:
+        kwargs = {"system": system, "tools": specs, "effort": self.effort, "on_text": self.on_answer_text}
+        if getattr(self.provider, "name", "") == "multi_model":
+            kwargs.update(request_id=request_id, checkpoint=checkpoint)
+        return self.provider.complete(messages, **kwargs)
 
     # ------------------------------------------------------------------
     def _parallel_safe(self, calls: list[ToolCall]) -> bool:
