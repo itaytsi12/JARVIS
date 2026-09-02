@@ -7,12 +7,13 @@ import tempfile
 import traceback
 from pathlib import Path
 from urllib.request import Request, urlopen
+from config.settings import env_text
 
 
 _API_URL = "https://api.openai.com/v1/audio/speech"
-_MODEL = os.getenv("JARVIS_OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-_VOICE = os.getenv("JARVIS_OPENAI_TTS_VOICE", "cedar")
-_INSTRUCTIONS = os.getenv(
+_MODEL = env_text("JARVIS_OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+_VOICE = env_text("JARVIS_OPENAI_TTS_VOICE", "cedar")
+_INSTRUCTIONS = env_text(
     "JARVIS_OPENAI_TTS_INSTRUCTIONS",
     (
         "Speak like a polished AI assistant: calm, confident, warm, concise, "

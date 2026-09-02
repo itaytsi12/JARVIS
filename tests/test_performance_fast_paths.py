@@ -9,6 +9,7 @@ from brain.router import route_command
 from brain import local_intent_model
 from brain import intent_router
 from urllib.error import URLError
+from tests.conftest import allow_cloud_calls
 
 
 class PerformanceFastPathTests(unittest.TestCase):
@@ -60,7 +61,7 @@ class PerformanceFastPathTests(unittest.TestCase):
 
     def test_cloud_intent_router_preserves_reported_token_usage(self):
         response=SimpleNamespace(output=[],usage=SimpleNamespace(input_tokens=41,output_tokens=3))
-        with patch.object(intent_router.client.responses,"create",return_value=response):route=intent_router.classify_intent("unknown request")
+        with allow_cloud_calls(),patch.object(intent_router.client.responses,"create",return_value=response):route=intent_router.classify_intent("unknown request")
         self.assertEqual(route["model_calls"],1);self.assertEqual((route["input_tokens"],route["output_tokens"]),(41,3))
 
 if __name__ == "__main__":

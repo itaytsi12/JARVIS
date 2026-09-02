@@ -28,12 +28,13 @@ import sqlite3
 import threading
 import time
 import uuid
+from config.settings import env_text
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_DEFAULT_DB_PATH = Path(os.getenv("JARVIS_MUSIC_STATE_DB", "data/music_state.db"))
+_DEFAULT_DB_PATH = Path(env_text("JARVIS_MUSIC_STATE_DB", "data/music_state.db"))
 SCHEMA_VERSION = 1
 
 

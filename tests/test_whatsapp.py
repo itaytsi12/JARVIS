@@ -1,6 +1,8 @@
-import json,sys,tempfile,threading,time,unittest
+import json,os,sys,tempfile,threading,time,unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+from config.settings import reload_config
 from unittest.mock import Mock,patch
 
 from brain.session_context import SessionContext
@@ -48,8 +50,14 @@ class WhatsAppTests(unittest.TestCase):
     def test_translation_only_when_needed_and_literal_bypasses(self):
         response=SimpleNamespace(output_text="אני בדרך.",usage=SimpleNamespace(input_tokens=8,output_tokens=4))
         client=Mock();client.responses.create.return_value=response
-        with patch("openai.OpenAI",return_value=client):
+        # `JARVIS_ALLOW_CLOUD_CALLS` is off for the whole suite so a
+        # fake-but-non-empty key can never reach the real API. This test
+        # is specifically about the translation call, so it opts back in
+        # while patching the constructor -- nothing leaves the process.
+        with patch.dict(os.environ,{"JARVIS_ALLOW_CLOUD_CALLS":"1"}),patch("openai.OpenAI",return_value=client):
+            reload_config()
             translated,meta=whatsapp._translate("I'm on my way.","he")
+        reload_config()
         self.assertEqual(translated,"אני בדרך.");self.assertTrue(meta["translated"]);self.assertEqual(client.responses.create.call_count,1)
         with patch("openai.OpenAI") as api:
             same,meta=whatsapp._translate("אני בדרך","he")

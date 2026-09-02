@@ -7,6 +7,7 @@ from brain.models import Action,Plan,ToolResult
 from brain.plan_validator import validate_generated_actions,validate_plan_preflight
 from brain.session_context import SessionContext
 from brain.task_planner import assess_plan_completeness,create_task_plan
+from tests.conftest import allow_cloud_calls
 
 
 class GeneratedPlanValidationTests(unittest.TestCase):
@@ -108,7 +109,7 @@ class GeneratedPlanValidationTests(unittest.TestCase):
     def test_cloud_planner_prompt_forbids_partial_goal_completion(self):
         from brain import planner
         response=SimpleNamespace(output=[])
-        with patch.object(planner.client.responses,"create",return_value=response) as create:
+        with allow_cloud_calls(),patch.object(planner.client.responses,"create",return_value=response) as create:
             self.assertEqual(planner.create_plan("Open Settings and turn Bluetooth on."),[])
         system=create.call_args.kwargs["input"][0]["content"]
         self.assertIn("entire request",system);self.assertIn("never return a partial plan",system)

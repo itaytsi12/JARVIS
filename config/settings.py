@@ -88,6 +88,19 @@ env_int = _int
 env_float = _float
 
 
+def env_text(name: str, default: str = "") -> str:
+    """A text setting, where a set-but-EMPTY value means "use the default".
+
+    The same hazard as the numeric readers above, and it bites just as
+    quietly: `JARVIS_OPENAI_TTS_INSTRUCTIONS=` in `.env` made
+    `os.getenv(name, "<a careful voice prompt>")` return `""`, so JARVIS
+    shipped an empty instruction string to the TTS API on every spoken
+    line and the configured voice character was silently gone.
+    """
+    raw = os.getenv(name)
+    return default if raw is None or raw.strip() == "" else raw
+
+
 def _text(name: str, default: str = "") -> str:
     raw = os.getenv(name)
     return default if raw is None or raw.strip() == "" else raw.strip()

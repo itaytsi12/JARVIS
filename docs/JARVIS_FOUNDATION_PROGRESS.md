@@ -80,16 +80,34 @@ all. All three are general fixes, not per-variable patches:
    `data/jarvis_memory.sqlite3`. `memory/memory_manager.py` already had a
    correct pytest-isolation branch; the real `.env` was disabling it.
 
-| Point | Collected | Passed | Failed | Skipped | Errors |
-| --- | --- | --- | --- | --- | --- |
-| Before any change | 0 (43 collection errors) | - | - | - | 43 |
-| After the three fixes above | 2016 | 1950 | 51 | 22 | 1 |
-| After the interpreter + isolation fixes | 2016 | see below | | | |
+| Point | Collected | Passed | Failed | Errors |
+| --- | --- | --- | --- | --- |
+| Before any change | 0 (43 collection errors) | - | - | 43 |
+| After the empty-`.env` fix alone | 2016 | 1950 | 51 | 1 |
+| After the interpreter + isolation fixes | 2016 | 1986 | 7 | 1 |
+| After the cloud-call switch | 2040 | see final report | | |
 
-Remaining known-environmental failure: `tests/test_multi_model_backend.py`
-errors with `PermissionError: [WinError 5]` on
-`C:\Users\Ori\AppData\Local\Temp\pytest-of-Ori` -- a permission state on
-this machine's temp directory, not a code defect.
+The 7 that appeared at step three were not regressions: they were tests
+that had been making REAL, paid OpenAI calls on the user's own key during
+collection, which the new isolation correctly blocked. Each now either
+degrades honestly or opts in explicitly through
+`tests/conftest.py::allow_cloud_calls`, so "which tests touch a cloud
+path" is one grep.
+
+The remaining error is environmental, not a code defect:
+`tests/test_multi_model_backend.py` fails with `PermissionError:
+[WinError 5]` on this machine's `Temp\pytest-of-Ori` directory. It
+predates this work and is unrelated to it.
+
+### One more general fix found along the way
+
+`tests/test_provider_wiring.py` walked the repository with
+`PROJECT_ROOT.rglob("*.py")`, which cannot prune, so it descended into
+every virtualenv, `.git`, the model artifacts and the caches. One
+assertion took **205 seconds** -- longer than the rest of the suite put
+together -- and was what made a full run appear to hang. It now uses the
+project's own pruning walker (`tools/code.py::walk_source_files`, which
+exists for exactly this reason): same answer, **0.37 seconds**.
 
 ## Architecture decisions
 

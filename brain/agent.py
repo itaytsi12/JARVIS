@@ -58,6 +58,13 @@ def _command_for_log(command):
 
 
 def ask_ai(message: str) -> str:
+    from brain.intent_router import cloud_intent_available
+
+    if not cloud_intent_available():
+        # No paid call may be made. Say so plainly rather than raising a
+        # 401 up through the whole request -- the same degradation every
+        # other cloud call site in this codebase applies.
+        return "I can't answer that without a cloud model, sir. Everything local still works."
     response = client.responses.create(
         model="gpt-5-mini",
         input=message

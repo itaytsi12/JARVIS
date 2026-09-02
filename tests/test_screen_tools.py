@@ -6,6 +6,7 @@ from PIL import Image
 
 from vision import screenshot,screen_analyzer
 from brain import tool_router
+from tests.conftest import allow_cloud_calls
 
 
 class ScreenToolTests(unittest.TestCase):
@@ -19,7 +20,7 @@ class ScreenToolTests(unittest.TestCase):
         response=SimpleNamespace(output_text="Notepad is open.",usage=SimpleNamespace(input_tokens=20,output_tokens=5))
         with tempfile.TemporaryDirectory() as folder:
             image=Path(folder)/"screen.png";image.write_bytes(b"image")
-            with patch.object(screen_analyzer.client.responses,"create",return_value=response):result=screen_analyzer.analyze_screen(str(image),"What is open?")
+            with allow_cloud_calls(),patch.object(screen_analyzer.client.responses,"create",return_value=response):result=screen_analyzer.analyze_screen(str(image),"What is open?")
         self.assertTrue(result["success"]);self.assertEqual(result["model_calls"],1);self.assertEqual(result["input_tokens"],20)
         self.assertNotIn("data:image",str(result));self.assertNotIn("base64",str(result))
 

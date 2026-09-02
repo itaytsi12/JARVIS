@@ -32,6 +32,7 @@ locally with `patch.dict(os.environ, ...)`; this only changes the default.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import tempfile
@@ -156,3 +157,31 @@ def isolated_environment():
             os.environ[key] = value
     reload_config()
     shutil.rmtree(root, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def allow_cloud_calls():
+    """Temporarily re-enable the outbound-call switch for one test.
+
+    The suite runs with `JARVIS_ALLOW_CLOUD_CALLS=0` so a fake-but-
+    non-empty API key can never reach a real endpoint. A handful of tests
+    exercise a cloud call site ON PURPOSE, with the client itself patched,
+    and need the guard lifted -- this is the one, explicit way to do it,
+    so "which tests touch a cloud path" stays greppable.
+
+    Nothing leaves the process: the caller is still responsible for
+    patching the client.
+    """
+    from config.settings import reload_config
+
+    previous = os.environ.get("JARVIS_ALLOW_CLOUD_CALLS")
+    os.environ["JARVIS_ALLOW_CLOUD_CALLS"] = "1"
+    reload_config()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("JARVIS_ALLOW_CLOUD_CALLS", None)
+        else:
+            os.environ["JARVIS_ALLOW_CLOUD_CALLS"] = previous
+        reload_config()

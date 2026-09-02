@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import logging
 import os
-from config.settings import env_float, env_int
+from config.settings import env_float, env_int, env_text
 import subprocess
 import threading
 import time
@@ -436,7 +436,7 @@ def reset_authenticated_browser_session_for_tests(session: AuthenticatedBrowserS
 #: user's regular browsing this way, confirmed live: a fresh launch
 #: against an unused directory got a working CDP endpoint immediately
 #: even with 20+ unrelated chrome.exe processes already running.
-DEFAULT_AUTH_PROFILE_DIR = Path(os.getenv("JARVIS_AUTH_CHROME_PROFILE_DIR", "data/browser_profiles/authenticated_chrome"))
+DEFAULT_AUTH_PROFILE_DIR = Path(env_text("JARVIS_AUTH_CHROME_PROFILE_DIR", "data/browser_profiles/authenticated_chrome"))
 
 
 def default_user_data_dir() -> Path | None:

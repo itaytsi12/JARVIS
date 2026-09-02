@@ -34,6 +34,9 @@ log = logging.getLogger("jarvis.vault.tools")
 #: context budget the priming layer just spent care staying inside.
 MAX_NOTE_CHARS = 6000
 MAX_SEARCH_RESULTS = 12
+#: How well a note must match before it is reported to the model as a
+#: search hit. One incidental word in a quick summary is not a result.
+MIN_SEARCH_SCORE = 2.0
 
 
 def _result(success: bool, tool: str, message: str, data: dict[str, Any] | None = None, error: str | None = None) -> dict:
@@ -52,6 +55,12 @@ def vault_search(query: str, note_type: str = "", limit: int = 8) -> dict:
         retriever = get_retriever()
         types = [note_type.strip().lower()] if note_type.strip() else None
         candidates, scanned, scan_ms = retriever.scan(query, types=types)
+        # A floor, because this result goes to the MODEL. `scan` reports
+        # everything that scored at all so a trace can explain a decision,
+        # but a single incidental word match ("nothing" appearing in a
+        # note's quick summary) is noise here, and noise in a tool result
+        # is something the model may act on.
+        candidates = [item for item in candidates if item.score >= MIN_SEARCH_SCORE]
         top = candidates[: max(1, min(int(limit or 8), MAX_SEARCH_RESULTS))]
         if not top:
             return _result(

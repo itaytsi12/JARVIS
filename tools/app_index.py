@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from config.settings import env_float, env_int
+from config.settings import env_float, env_int, env_text
 import re
 import threading
 import time
@@ -40,7 +40,7 @@ except ImportError:  # pragma: no cover - this module only ever runs on Windows
     winreg = None
 
 
-CACHE_PATH = Path(os.getenv("JARVIS_APP_INDEX_CACHE_PATH", "data/app_index_cache.json"))
+CACHE_PATH = Path(env_text("JARVIS_APP_INDEX_CACHE_PATH", "data/app_index_cache.json"))
 CACHE_TTL_SECONDS = max(0.0, env_float("JARVIS_APP_INDEX_CACHE_TTL", 24 * 3600))
 
 _TRAILING_WORDS = {"app", "application"}

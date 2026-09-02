@@ -40,6 +40,23 @@ from providers.registry import (
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _project_python_files():
+    """Every `.py` file that is genuinely part of this project.
+
+    `PROJECT_ROOT.rglob("*.py")` cannot prune: it descends into every
+    virtualenv, `.git`, the model artifacts and the caches, then leaves
+    the caller to discard the results. That is the same defect
+    `tools/code.py::walk_source_files` exists to fix (98 seconds there),
+    and here it made one assertion take 205 SECONDS -- longer than the
+    rest of the suite put together. Reusing the project's own pruning
+    walker gives the identical answer for a fraction of the work.
+    """
+    from tools.code import walk_source_files
+
+    for path in walk_source_files(PROJECT_ROOT):
+        if path.suffix == ".py":
+            yield path
+
 class _Provider(CallableProvider):
     """A stand-in registered under the real provider name, so the code under
     test resolves it exactly as it resolves Anthropic."""
@@ -84,10 +101,7 @@ class DotenvIsLoadedFromTheProjectRootTests(unittest.TestCase):
         """A second, CWD-relative `load_dotenv()` re-introduces the ordering
         hazard: whichever import ran first decided the configuration."""
         offenders = []
-        for path in PROJECT_ROOT.rglob("*.py"):
-            parts = set(path.parts)
-            if parts & {".venv", ".venv-agent", ".venv-intent", ".venv-code-model", "work"}:
-                continue
+        for path in _project_python_files():
             if path.name.startswith("."):
                 continue
             relative = path.relative_to(PROJECT_ROOT).as_posix()
@@ -217,10 +231,7 @@ class BothRuntimesUseTheSameProviderTests(unittest.TestCase):
 
     def test_only_the_anthropic_provider_module_imports_the_sdk(self):
         offenders = []
-        for path in PROJECT_ROOT.rglob("*.py"):
-            parts = set(path.parts)
-            if parts & {".venv", ".venv-agent", ".venv-intent", ".venv-code-model", "work"}:
-                continue
+        for path in _project_python_files():
             relative = path.relative_to(PROJECT_ROOT).as_posix()
             if relative in {"providers/anthropic_provider.py"} or relative.startswith("tests/"):
                 continue

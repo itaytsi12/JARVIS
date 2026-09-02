@@ -31,14 +31,16 @@ class WebAnswerService:
             if cached is not None:
                 if cancellation_token is not None:cancellation_token.raise_if_cancelled()
                 return WebAnswer(cached.answer,True,list(cached.sources),cached.model,0,0,cache_hit=True)
-            from brain.intent_router import cloud_intent_available
-
-            if not cloud_intent_available():
-                # No paid call may be made. This is the same honest
-                # failure the method already returns for an empty or
-                # errored response, so every caller handles it already.
-                return WebAnswer(FAILURE,False,[],self.model,(time.perf_counter()-started)*1000,0,"no_openai_credential")
             if self.client is None:
+                from brain.intent_router import cloud_intent_available
+
+                # The guard applies only where a REAL client would be built
+                # from the environment. A client the caller injected is the
+                # caller's business -- every test in this suite supplies a
+                # fake one, and refusing those would be disabling dependency
+                # injection rather than preventing an outbound call.
+                if not cloud_intent_available():
+                    return WebAnswer(FAILURE,False,[],self.model,(time.perf_counter()-started)*1000,0,"no_openai_credential")
                 self.client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             # UI/status hook: brackets THIS real request with
             # started/succeeded/failed events (config/events.py). Observes

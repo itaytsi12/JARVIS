@@ -199,7 +199,11 @@ class DailyNote:
         if note is None:
             return
         events = len(re.findall(r"^### ", extract_section(note.body, SECTION_TIMELINE), re.M))
-        bullets = [f"{events} recorded pieces of work today." if events else "No work recorded yet today."]
+        bullets = [
+            f"{events} recorded piece{'s' if events != 1 else ''} of work today."
+            if events
+            else "No work recorded yet today."
+        ]
         for label, heading in (
             ("Corrections learned", SECTION_CORRECTIONS),
             ("Working methods discovered", SECTION_METHODS),
@@ -218,7 +222,7 @@ class DailyNote:
 
         def mutate(target: Note) -> Note:
             target.body = replace_section(target.body, "Quick Summary", "\n".join(f"- {item}" for item in bullets))
-            summary = f"{events} pieces of work recorded"
+            summary = f"{events} piece{'s' if events != 1 else ''} of work recorded"
             corrections = extract_section(target.body, SECTION_CORRECTIONS)
             if corrections.strip() and corrections.strip() != _EMPTY:
                 summary += ", including user corrections that changed stored knowledge"

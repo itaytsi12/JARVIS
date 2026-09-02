@@ -50,6 +50,11 @@ def _language(text):
     return "he" if hebrew>latin else "en"
 def _translate(message,target_language):
     if not target_language or _language(message)==target_language:return message,{"translated":False,"translation_ms":0.0,"translation_model":None,"translation_input_tokens":0,"translation_output_tokens":0}
+    from brain.intent_router import cloud_intent_available
+    # No paid call may be made, so send the message untranslated rather
+    # than failing to send it at all -- the same "translated: False" shape
+    # this function already returns when no translation is needed.
+    if not cloud_intent_available():return message,{"translated":False,"translation_ms":0.0,"translation_model":None,"translation_input_tokens":0,"translation_output_tokens":0,"translation_skipped":"no_openai_credential"}
     from openai import OpenAI
     began=time.perf_counter();model=os.getenv("JARVIS_TRANSLATION_MODEL","gpt-5-mini")
     response=OpenAI(api_key=os.getenv("OPENAI_API_KEY")).responses.create(model=model,input=[{"role":"system","content":f"Translate only the message into {target_language}. Preserve meaning, casual tone, names, numbers, URLs, emojis, and punctuation. Return only the translation."},{"role":"user","content":message}],max_output_tokens=160,store=False,timeout=float(os.getenv("JARVIS_TRANSLATION_TIMEOUT","10")))

@@ -163,7 +163,7 @@ class DailyNoteTests(VaultTestCase):
         today.add_correction("Always reuse an open window.")
         today.refresh_quick_summary()
         note = self.vault.read(today.relative_path)
-        self.assertIn("1 recorded pieces of work today.", note.quick_summary)
+        self.assertIn("1 recorded piece of work today.", note.quick_summary)
         self.assertIn("Corrections learned: 1.", note.quick_summary)
         self.assertIn("user corrections", note.summary)
 

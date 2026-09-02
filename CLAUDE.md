@@ -40,6 +40,84 @@ Command flow, top to bottom:
   `whatsapp.py`, etc.). This is the only place OS/browser/app automation
   should live.
 
+### The Obsidian vault is JARVIS's long-term memory
+
+`data/vault/` (override: `JARVIS_VAULT_PATH`) is a real Obsidian vault of
+plain Markdown notes, and it is JARVIS's persistent brain. The model's
+context window is temporary working memory; the vault is what survives.
+Full detail is in `docs/JARVIS_VAULT_ARCHITECTURE.md`. The invariants:
+
+- **Markdown is canonical.** JARVIS reads and writes the files directly
+  and Obsidian never has to be running. `data/vault_index_cache.json`
+  lives OUTSIDE the vault, is keyed on each file's `(mtime, size)`, and
+  can be deleted at any time -- it is a performance cache, never a second
+  source of truth. Do not add a database that the user cannot inspect.
+- **Every note states its purpose in one sentence.** Frontmatter (`type`,
+  `summary`, `tags`, `updated`) plus a `## Quick Summary`. `vault/note.py`
+  is the ONLY place notes are parsed or written; `build_note_text` is the
+  only creation path and it requires a summary, which is why the format
+  is a guarantee. Parsing is tolerant on purpose -- a note a human broke
+  degrades to "no metadata" and must never stop a scan.
+- **Two stages, always.** `vault/index.py` ranks METADATA (stage 1, no
+  bodies); `vault/retrieval.py` deep-reads only the selection, inside a
+  character budget. Never load the vault into a prompt. Measured on 418
+  notes: 1,544 of 505,360 characters reached the model.
+- **A structural bonus may reorder, never qualify.** "Is the requested
+  type" and "was touched recently" apply only to a note that already
+  matched topically. Together they came to 1.15, cleared a 1.0 threshold
+  alone, and loaded a video-editing Skill into an Apple Music mission.
+- **Missions and daily notes are excluded from the knowledge scan.** They
+  are records of past work, not knowledge; a completed mission note is
+  nearly a copy of the request and outscored the correct Job 48.6 to 22.0
+  on a repeat. They remain searchable via `vault_search`.
+- **Jobs and Skills ARE notes, discovered from the vault.** There is no
+  list of Jobs in Python anywhere, deliberately: dropping
+  `jobs/write-sales-email.md` in makes it selectable with no code change.
+  A Job names its Skills as wikilinks. `status: placeholder` makes a Job
+  visible but never auto-selected (`jobs/clipping.md`).
+- **The vault Skill layer is NOT the code `skills/` package.** The code
+  skill selects a TOOLSET; the vault Skill is knowledge about how to do
+  the work and is editable at runtime by a correction. Both are used;
+  do not merge them.
+- **A mission is written before the work starts.** `missions/active/`,
+  appended to as it happens, never batched to the end -- a process that
+  dies at 3am must leave a readable, resumable record. Anything still in
+  `active/` at startup is marked `interrupted`; its outcome is never
+  guessed.
+- **A correction is knowledge, a request is not.** `vault/learning.py`
+  writes only PERSISTENT feedback ("from now on", "always", or a rule
+  that states the situation it applies in) and rewrites it as a clean
+  rule -- never pastes the user's sentence. Immediacy wins ties: wrongly
+  writing a standing rule is worse than wrongly treating one request as
+  local. `vault/consolidation.py` refines or supersedes rather than
+  stacking contradictions, and nothing is ever deleted.
+- **`system/` and every safety topic are protected.** `vault/protected.py`
+  refuses an automatic edit that would weaken a confirmation step, a
+  credential rule, a financial guard or a destructive-action guard --
+  wherever it appears, not only under `system/`. A refusal is recorded
+  and reported, never silent.
+- **Two hooks, both on paths BOTH surfaces already share.**
+  `brain/agent_service.py::run_agent_task` primes before the loop and
+  completes the mission, learning and Daily Note after it;
+  `brain/agent.py::run_agent` observes corrections on the single funnel
+  voice and typed input both pass through. Vault knowledge is delivered
+  through the EXISTING `ContextBuilder.build(extra=...)`, so it is
+  budgeted, truncated and reported by the same machinery as everything
+  else -- never a second context path.
+- **The vault can never break a request.** Every entry point in
+  `vault/session.py` is wrapped: a failure is logged and the task runs
+  exactly as it did before the vault existed. `JARVIS_VAULT_ENABLED=0`
+  turns it off entirely.
+- **Deterministic fast paths pay nothing.** `vault/policy.py` decides
+  offline whether a request is mission-shaped. "Volume down" creates no
+  mission and loads ~1.5KB; it never reaches the vault at all when a
+  deterministic route already handled it.
+- **`python -m vault` is the diagnostic.** `scan`, `prime`, `status`,
+  `jobs`, `skills`, `missions`, `daily`, `recover`, `learn` -- `prime`
+  in particular prints exactly which notes were considered, which were
+  read and why, which is how "JARVIS ignored the note I wrote" is
+  diagnosed in one command.
+
 ### Agent runtime (Claude as a provider, not as the architecture)
 
 A second, additive layer sits above the deterministic router for requests
@@ -1429,6 +1507,13 @@ fresh tab reported "not signed in" for a perfectly signed-in account.
 
 ## Directories that are data/output, not source
 
+`data/vault/` is the exception that matters most: it is JARVIS's REAL
+long-term memory (the user's preferences, projects, missions and daily
+history), it is git-ignored because it is personal data, and it must
+never be deleted, reset or "cleaned up". `vault/bootstrap.py` regenerates
+the structure and the seed notes idempotently -- it never overwrites a
+note the user or JARVIS has since edited.
+
 Do not treat these as code to refactor; they're generated or local-only:
 `data/` (sqlite runtime DB), `logs/`, `screenshots/`, `models/` (binary
 model artifacts — some are tracked deliberately, see `.gitignore`),
@@ -1447,7 +1532,19 @@ disposable cache, even though they live under `data/`.
 ## Tests
 
 Run `python -m pytest` (uses `pytest.ini`, `testpaths = tests`) for the
-full regression suite. Tests mock at the tool-execution/subprocess
+full regression suite.
+
+`tests/conftest.py` applies its isolation at IMPORT time, not in a
+fixture, and that ordering is load-bearing: pytest imports test modules
+during COLLECTION, before any fixture runs, and `brain/agent.py` builds a
+`MemoryManager` at module scope. It also CLEARS `MEMORY_DB_PATH` and
+`TRAINING_DATA_DB_PATH` rather than redirecting them, so each module's
+own existing pytest-isolation branch takes effect instead of a second,
+competing one -- the developer's real `.env` sets both, which is what had
+the suite writing into the user's live memory and 47MB training dataset.
+`JARVIS_ALLOW_CLOUD_CALLS=0` is what makes a paid OpenAI call impossible
+from the suite: a fake-but-non-empty key is not "absent" to the SDK, and
+the real key was being captured at import time during collection. Tests mock at the tool-execution/subprocess
 boundary rather than requiring a real browser or real audio hardware, so
 the full suite is safe to run without special gating or flags.
 
