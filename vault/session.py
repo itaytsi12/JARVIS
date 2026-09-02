@@ -23,6 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from vault.authoring import AuthoredJob, JobAuthor, get_job_author
 from vault.daily import DailyJournal, get_journal
 from vault.index import VaultIndex, get_index
 from vault.learning import CorrectionLearner, LearningOutcome, classify_feedback, get_correction_learner
@@ -79,6 +80,8 @@ class VaultSession:
     steps: list[StepObservation] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     enabled: bool = True
+    #: Set when this mission had no Job and JARVIS wrote one for itself.
+    authored: AuthoredJob | None = None
 
     # ------------------------------------------------------------ begin
     @classmethod
@@ -127,6 +130,15 @@ class VaultSession:
                 job=session.primed.job_title,
             )
 
+            # A mission-shaped request that matched NO Job is a kind of
+            # work JARVIS has never done. Write the Job note now, before
+            # the work starts, so this mission has something to follow and
+            # the next one begins from experience rather than nothing.
+            # Only for real missions: `policy.persist_mission` is false for
+            # "volume down", and a Job note for that would be pure noise.
+            if policy.persist_mission and session.primed is not None and not session.primed.job_title:
+                session._author_job(goal)
+
             if policy.persist_mission:
                 store = missions or get_mission_store(vault=vault, index=session.index)
                 session.mission = store.create(
@@ -145,6 +157,37 @@ class VaultSession:
         except Exception:
             log.exception("Vault priming failed; the request continues without vault knowledge")
         return session
+
+    def _author_job(self, goal: str) -> None:
+        """Write a draft Job for a kind of work with no Job yet.
+
+        Wrapped like everything else here: failing to author a Job must
+        never stop the mission that prompted it.
+        """
+        try:
+            author = get_job_author(vault=self.vault, index=self.index)
+            authored = author.create_for(goal, skills=self.primed.skill_titles if self.primed else ())
+            if authored is None or not authored.created:
+                return
+            self.authored = authored
+            # Re-prime so THIS mission actually follows the Job it just
+            # wrote, rather than the note only helping the next one.
+            primer = get_primer(vault=self.vault, index=self.index)
+            self.primed = primer.prime(
+                goal,
+                budget_chars=self.policy.budget_chars,
+                include_continuity=self.policy.is_full,
+            )
+            log.info("Authored a new Job for this mission: %s", authored.describe())
+            if self.journal is not None:
+                self.journal.today().add_event(
+                    f"New kind of work: {authored.job.title}",
+                    request=goal,
+                    did=f"No Job covered this, so JARVIS wrote a draft one at `{authored.job.relative_path}`.",
+                    result="The draft is improved by what this mission actually does.",
+                )
+        except Exception:
+            log.exception("Could not author a Job for this mission; it continues without one")
 
     # ------------------------------------------------------------ during
     def extra_context(self) -> dict[str, str]:
@@ -195,6 +238,11 @@ class VaultSession:
             _publish("vault.learning", detail="Recording what this mission learned")
             learned = self._learn_successful_method(success=success, verified=verified)
             report["learned"] = learned
+            # A Job JARVIS wrote for itself is improved by what actually
+            # happened -- and only a verified success promotes it out of
+            # draft, because a procedure nobody has run is a guess however
+            # plausible it reads.
+            report["authored_job"] = self._improve_authored_job(success=success, verified=verified)
 
             if self.mission is not None:
                 for artifact in artifacts:
@@ -242,6 +290,41 @@ class VaultSession:
             learned.append(target.title)
             log.info("Recorded a working method on Skill %s", target.title)
         return learned
+
+    def _improve_authored_job(self, *, success: bool, verified: bool) -> str | None:
+        """Fold this mission's outcome into the Job JARVIS authored for it.
+
+        Also applies when the Job was authored by an EARLIER mission: a
+        draft Job improves every time it runs, which is the whole reason
+        it was written down.
+        """
+        title = ""
+        if self.authored is not None and self.authored.job is not None:
+            title = self.authored.job.title
+        elif self.primed is not None and self.primed.job is not None:
+            status = self.primed.job.status
+            if status == "draft":
+                title = self.primed.job.title
+        if not title:
+            return None
+        try:
+            tools = [step.tool for step in self.steps if step.success]
+            worked = (
+                f"A verified run used: {', '.join(dict.fromkeys(tools))}."
+                if success and verified and tools
+                else ""
+            )
+            get_job_author(vault=self.vault, index=self.index).record_outcome(
+                title,
+                succeeded=success,
+                worked=worked,
+                failed=self.failures[:3],
+                verified=verified,
+            )
+            return title
+        except Exception:
+            log.exception("Could not improve the authored Job")
+            return None
 
     def _record_daily(
         self,
@@ -318,11 +401,21 @@ class VaultSession:
         try:
             learner = learner or get_correction_learner(vault=self.vault, index=self.index)
             candidates = list(self.primed.notes_read) if self.primed is not None else []
-            outcome = learner.apply(correction, candidate_paths=candidates, feedback=feedback)
+            # The Job this mission selected. A preference-shaped correction
+            # goes to THAT Job's preference note rather than into its
+            # procedure -- taste and method are different knowledge.
+            job_title = self.primed.job_title if self.primed is not None else ""
+            outcome = learner.apply(
+                correction,
+                candidate_paths=candidates,
+                feedback=feedback,
+                job_title=job_title,
+            )
             if outcome.applied and self.journal is not None:
-                self.journal.today().add_correction(
-                    f"{outcome.rule} (recorded in [[{outcome.target_title}]], section '{outcome.section}')"
-                )
+                entry = f"{outcome.rule} (recorded in [[{outcome.target_title}]], section '{outcome.section}')"
+                if outcome.archived:
+                    entry += f" -- replaced and archived: \"{outcome.archived}\""
+                self.journal.today().add_correction(entry)
                 self.journal.today().refresh_quick_summary()
             elif outcome.protection is not None and self.journal is not None:
                 self.journal.today().add_correction(

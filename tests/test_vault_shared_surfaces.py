@@ -58,7 +58,7 @@ class CorrectionOnTheSharedFunnelTests(SharedSurfaceTestCase):
 
     def test_a_typed_correction_updates_the_vault(self):
         self._run("From now on, always keep your spoken answers short.")
-        preferences = VaultManager(self.root).read("user/preferences.md").section("Preferences")
+        preferences = VaultManager(self.root).read("preferences/global.md").section("Preferences")
         self.assertIn("short", preferences.lower())
 
     def test_a_spoken_correction_updates_the_same_vault(self):
@@ -68,20 +68,20 @@ class CorrectionOnTheSharedFunnelTests(SharedSurfaceTestCase):
             "From now on, always use metric units.",
             spoken="From now on, always use metric units.",
         )
-        preferences = VaultManager(self.root).read("user/preferences.md").section("Preferences")
+        preferences = VaultManager(self.root).read("preferences/global.md").section("Preferences")
         self.assertIn("metric", preferences.lower())
 
     def test_an_ordinary_command_writes_nothing(self):
         vault = VaultManager(self.root)
-        before = vault.read("user/preferences.md").to_markdown()
+        before = vault.read("preferences/global.md").to_markdown()
         self._run("what time is it")
-        self.assertEqual(vault.read("user/preferences.md").to_markdown(), before)
+        self.assertEqual(vault.read("preferences/global.md").to_markdown(), before)
 
     def test_a_one_off_instruction_writes_nothing(self):
         vault = VaultManager(self.root)
-        before = vault.read("user/preferences.md").to_markdown()
+        before = vault.read("preferences/global.md").to_markdown()
         self._run("Make this answer shorter.")
-        self.assertEqual(vault.read("user/preferences.md").to_markdown(), before)
+        self.assertEqual(vault.read("preferences/global.md").to_markdown(), before)
 
     def test_the_correction_is_recorded_in_todays_daily_note(self):
         self._run("From now on, always tell me the exit code.")

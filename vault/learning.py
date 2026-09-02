@@ -174,6 +174,33 @@ def classify_feedback(text: str) -> Feedback:
     return Feedback(text=body, kind=ONE_TIME, confidence=0.4, signals=signals or ["no scope marker; treated as this task only"])
 
 
+#: Language that marks a correction as being about what the USER WANTS,
+#: rather than about what the work mechanically requires.
+#:
+#: The distinction decides where the rule is written. "Don't use emojis in
+#: emails" is taste: it belongs in the Email Job's preference note, and
+#: putting it into the Job's Procedure would tell every future reader that
+#: avoiding emoji is part of how one writes an email. "Re-run the tests
+#: after every change" is method: it belongs in the Procedure.
+_PREFERENCE_SHAPED = re.compile(
+    r"\b(i (?:prefer|like|want|hate|don'?t (?:like|want))|"
+    r"don'?t (?:use|include|add|put|write|say|send|mention)|"
+    r"stop (?:using|including|adding|putting|writing|saying)|"
+    r"no more |never (?:use|include|add|put|write|say|mention)|"
+    r"always (?:use|include|add|write|say|sign|address|call|keep|make)|"
+    r"keep (?:it|them|these|your|the) |make (?:it|them|these|your|the) |"
+    r"when you (?:do|write|make|send|run|work on)|"
+    r"style|tone|wording|format|shorter|longer|briefer|concise|verbose|"
+    r"detailed (?:answer|response|reply|explanation|technical explanation)s?|emoji)\b",
+    re.I,
+)
+
+
+def is_preference_shaped(text: str) -> bool:
+    """Is this correction about taste rather than about method?"""
+    return bool(_PREFERENCE_SHAPED.search(text or ""))
+
+
 # --------------------------------------------------------------- rewriting
 
 _IMPERATIVE_PREFIX = re.compile(
@@ -227,6 +254,9 @@ class LearningOutcome:
     reason: str = ""
     protection: ProtectionVerdict | None = None
     summary_updated: bool = False
+    #: The rule this one replaced, now in the archive. "" when nothing was
+    #: superseded.
+    archived: str = ""
 
     def describe(self) -> dict[str, Any]:
         payload = {
@@ -237,6 +267,7 @@ class LearningOutcome:
             "section": self.section,
             "reason": self.reason,
             "summary_updated": self.summary_updated,
+            "archived": self.archived or None,
         }
         if self.protection is not None:
             payload["protection"] = self.protection.describe()
@@ -302,8 +333,17 @@ class CorrectionLearner:
         candidate_paths: Iterable[str] = (),
         feedback: Feedback | None = None,
         target_path: str = "",
+        job_title: str = "",
     ) -> LearningOutcome:
-        """Classify, locate, rewrite and record. The whole Milestone 8 loop."""
+        """Classify, locate, rewrite and record. The whole Milestone 8 loop.
+
+        `job_title` is the Job the mission actually selected. When it is
+        given and the correction is about how the user WANTS the work done
+        -- rather than about how the work mechanically has to be done --
+        the rule goes to that Job's preference note, not into the Job's
+        procedure. "Don't use emojis in emails" is a preference; it does
+        not belong in the generic instructions for writing an email.
+        """
         feedback = feedback or classify_feedback(correction)
         if feedback.kind != PERSISTENT:
             return LearningOutcome(
@@ -315,6 +355,11 @@ class CorrectionLearner:
         rule = rewrite_as_rule(correction)
         if not rule:
             return LearningOutcome(applied=False, kind=feedback.kind, reason="Nothing usable remained after removing the conversational wrapping.")
+
+        if not target_path and is_preference_shaped(correction):
+            if job_title:
+                return self._apply_to_job_preferences(rule, feedback, job_title=job_title, correction=correction)
+            return self._apply_to_preferences(rule, feedback)
 
         note = self.vault.read(target_path) if target_path else self.find_target(correction, candidate_paths=candidate_paths)
         if note is None:
@@ -353,22 +398,63 @@ class CorrectionLearner:
             reason=f"Recorded in the '{section}' section of {note.title}.",
         )
 
-    def _apply_to_preferences(self, rule: str, feedback: Feedback) -> LearningOutcome:
-        path = "user/preferences.md"
-        note = self.vault.read(path)
-        if note is None:
-            return LearningOutcome(applied=False, kind=feedback.kind, rule=rule, reason="No preferences note exists to record this in.")
-        result = integrate_rule(self.vault, path, "Preferences", rule)
-        self.index.invalidate()
-        self.index.refresh()
+    def _apply_to_job_preferences(
+        self,
+        rule: str,
+        feedback: Feedback,
+        *,
+        job_title: str,
+        correction: str,
+    ) -> LearningOutcome:
+        """Record a preference against the Job the mission selected.
+
+        Goes through `PreferenceStore.record`, which is what archives the
+        rule this one supersedes -- so the old wording survives with its
+        date and reason, and can never influence behaviour again.
+        """
+        from vault.preferences import get_preferences
+
+        verdict = check_edit(None, correction=correction)
+        if not verdict.allowed:
+            return LearningOutcome(
+                applied=False,
+                kind=feedback.kind,
+                rule=rule,
+                reason=verdict.reason,
+                protection=verdict,
+            )
+        store = get_preferences(vault=self.vault, index=self.index)
+        result = store.record(rule, job_title=job_title, reason="the user stated a new preference")
         return LearningOutcome(
-            applied=result.applied,
+            applied=bool(result.get("applied")),
             kind=feedback.kind,
-            target_path=path,
-            target_title=note.title,
-            rule=result.rule or rule,
+            target_path=str(result.get("path") or ""),
+            target_title=f"Preferences - {job_title}",
+            rule=str(result.get("rule") or rule),
             section="Preferences",
-            reason=result.reason,
+            reason=str(result.get("reason") or ""),
+            archived=str(result.get("replaced") or ""),
+        )
+
+    def _apply_to_preferences(self, rule: str, feedback: Feedback) -> LearningOutcome:
+        """A preference that belongs to no particular Job: global.
+
+        Goes through `PreferenceStore.record`, so a rule it supersedes is
+        archived with its date and reason rather than overwritten.
+        """
+        from vault.preferences import get_preferences
+
+        store = get_preferences(vault=self.vault, index=self.index)
+        result = store.record(rule, reason="the user stated a new preference")
+        return LearningOutcome(
+            applied=bool(result.get("applied")),
+            kind=feedback.kind,
+            target_path=str(result.get("path") or ""),
+            target_title="Global Preferences",
+            rule=str(result.get("rule") or rule),
+            section="Preferences",
+            reason=str(result.get("reason") or ""),
+            archived=str(result.get("replaced") or ""),
         )
 
     def _write_rule(self, note: Note, *, section: str, rule: str) -> Note | None:

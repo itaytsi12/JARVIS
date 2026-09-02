@@ -34,13 +34,15 @@ JARVIS at an Obsidian vault you already have is one setting.
 
 ```
 data/vault/
-  VAULT_INDEX.md            generated map of every note
+  VAULT_INDEX.md            generated map of active, scannable notes
   identity/
     jarvis.md               who JARVIS is
     core_rules.md           the standing operating rules
   user/
     profile.md              durable facts about the user
-    preferences.md          standing instructions
+  preferences/
+    global.md               standing instructions for every Job
+    jobs/                   one override note per Job (not scanned)
   jobs/                     recurring KINDS of mission
     INDEX.md
     fix-software-bug.md
@@ -66,6 +68,7 @@ data/vault/
     current.md              what JARVIS is working on now
   system/
     protected_rules.md      never edited automatically
+  archive/                  superseded rules/notes (never scanned)
 ```
 
 A JSON index cache lives at `data/vault_index_cache.json` -- OUTSIDE the
@@ -122,7 +125,8 @@ has a summary" is a guarantee rather than a hope.
      identity/core_rules.md
      jobs/fix-apple-music-playlist.md
      skills/apple-music-control.md
-     user/preferences.md
+     preferences/global.md
+     preferences/jobs/fix-apple-music-playlist.md
 ```
 
 Measured on a 418-note vault: 1,544 characters entered the model's
@@ -136,11 +140,15 @@ already matched the request topically. Before that rule existed, "is a
 skill" (0.75) plus "touched today" (0.4) cleared a 1.0 threshold on its
 own and loaded a video-editing Skill into an Apple Music mission.
 
-**Missions and daily notes are excluded from the knowledge scan.** They
+**Missions, daily notes, the archive and per-Job preferences are excluded
+from the knowledge scan.** Missions and daily notes
 are records of past work, not knowledge about how to do it, and a
 completed mission note is nearly a verbatim copy of the request -- it
 scored 48.6 against the correct Job's 22.0 on a repeat. They stay fully
-searchable through `vault_search`.
+searchable through `vault_search`. Archived knowledge is reachable only
+through explicit archive/history access. Global preferences load by
+policy; Job preferences load deterministically after Job selection and
+override conflicting global rules.
 
 Every selection is traced: `RetrievalTrace.explain()` prints what was
 considered, what was chosen and why. `python -m vault scan "..."` and
@@ -241,7 +249,12 @@ standing rule is worse than wrongly treating one request as local.
 pile of contradictions. A new rule is compared against what is there and
 either duplicated (nothing happens), refined ("keep responses short" plus
 "when coding, give detail" becomes one scoped rule), superseded (the old
-rule moves to `## Superseded`, dated), or added. Nothing is ever deleted.
+rule moves into `archive/`, dated), or added. Nothing is ever deleted.
+
+An existing `user/preferences.md` is migrated into
+`preferences/global.md` at startup and then archived intact. Every Job,
+including a user-authored one discovered during bootstrap, receives an
+empty `preferences/jobs/<job>.md` and an explicit wikilink to it.
 
 **Protected knowledge** (`vault/protected.py`) is what automation may
 never touch: everything under `system/`, plus any correction that would
@@ -260,6 +273,11 @@ own content after every event, because it is what a LATER session reads
 first and it has to be true.
 
 Credentials are redacted before any write.
+
+Daily Notes are deep-read for continuity only when the request refers to
+earlier work (or a mission is already in progress). Unrelated requests do
+not spend context budget on them. Explicit project names similarly bypass
+fuzzy ranking and load the named project note directly.
 
 ## Startup memory recovery
 

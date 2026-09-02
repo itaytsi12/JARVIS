@@ -85,7 +85,7 @@ all. All three are general fixes, not per-variable patches:
 | Before any change | 0 (43 collection errors) | - | - | 43 |
 | After the empty-`.env` fix alone | 2016 | 1950 | 51 | 1 |
 | After the interpreter + isolation fixes | 2016 | 1986 | 7 | 1 |
-| **Final** | **2153** | **2131** (+22 skipped) | **0** | 1 |
+| **Final foundation polish** | **2161** | **2139** (+22 skipped) | **0** | **0** |
 
 The 7 that appeared at step three were not regressions: they were tests
 that had been making REAL, paid OpenAI calls on the user's own key during
@@ -183,23 +183,35 @@ tests/conftest.py          import-time isolation, vault redirected
 
 | What | Measurement |
 | --- | --- |
-| Full suite | 2131 passed, 22 skipped, 0 failed, 1 environmental error (9m27s) |
-| Vault tests added | 129 |
+| Full suite | 2139 passed, 22 skipped, 0 failed (11m04s) |
+| Vault tests | 145 passed (2m09s) |
 | Deterministic routing | 0.01-0.10ms per command (unchanged) |
 | Priming, 418-note vault, cold | 1,660ms |
 | Priming, 418-note vault, warm | ~350ms (one filesystem scan) |
 | Scan vs full read | 57 summaries scanned, 5 notes read, 2,332 of 6,000 budgeted chars |
 | Vault content vs context | 1,544 of 505,360 characters reached the model |
 
+## Foundation polish (2026-09-02)
+
+- Preferences are split into `preferences/global.md` and one excluded,
+  explicitly linked note under `preferences/jobs/` for every Job. A Job's
+  rules override conflicting global rules.
+- Superseded preferences and notes move to `archive/`, which is excluded
+  from ordinary scanning and priming. Existing `user/preferences.md`
+  installs migrate automatically and are archived intact.
+- Meaningful mission types with no matching Job author a reusable draft
+  Job before work begins; trivial commands still create no Job.
+- Explicit project names load their project notes, while Daily Notes are
+  deep-read only for requests that refer to earlier work.
+- Personality/initiative guidance and Git/GitHub workflow knowledge are
+  now seeded in the vault.
+- Focused vault regression result: **145 passed**.
+
 ## Known issues
 
-1. `tests/test_multi_model_backend.py::test_registry_cache_last_known_good`
-   errors inside pytest's own `tmp_path` fixture with
-   `PermissionError: [WinError 5]` on this machine's
-   `Temp\pytest-of-Ori` directory. Its ACLs are broken at the OS level --
-   `icacls` cannot even read it. Removing that directory as Administrator
-   fixes it. Not done here: it is outside the repository, and deleting a
-   user directory is not this task's call.
+1. pytest cannot write `.pytest_cache` on this checkout (`WinError 5`), so
+   it emits one cache warning. Test execution and temporary test storage
+   are unaffected.
 2. Ranking is lexical, not semantic. A note describing the same thing in
    entirely different words will not rank. The note format compensates
    (every note carries a hand-written summary and tags), and an embedding

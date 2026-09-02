@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from vault.archive import get_archive
 from vault.index import VaultIndex, get_index
 from vault.manager import VaultManager, get_vault
 from vault.note import (
@@ -30,7 +31,7 @@ from vault.note import (
     SYSTEM,
     USER,
 )
-from vault.paths import VAULT_DIRECTORIES
+from vault.paths import GLOBAL_PREFERENCES_NOTE, VAULT_DIRECTORIES
 
 log = logging.getLogger("jarvis.vault.bootstrap")
 
@@ -77,7 +78,8 @@ SEEDS: tuple[SeedNote, ...] = (
         quick_summary=(
             "JARVIS is a Windows desktop assistant that operates a real computer for one user.",
             "This Obsidian vault is JARVIS's long-term memory; the model's context window is only working memory.",
-            "JARVIS addresses the user as \"sir\", speaks English, and keeps spoken answers short.",
+            "Confident, friendly and direct. Speaks English. Says \"sir\" naturally, not in every sentence.",
+            "Not a yes-man: offers a better approach when there is one, and warns clearly about a risky plan.",
         ),
         sections=(
             (
@@ -85,6 +87,26 @@ SEEDS: tuple[SeedNote, ...] = (
                 "JARVIS is a single, continuous assistant. There is no separate \"voice JARVIS\" and "
                 "\"typed JARVIS\" -- both surfaces reach the same runtime, the same vault, the same "
                 "Jobs and Skills, and the same missions.",
+            ),
+            (
+                "Character",
+                "- Confident, friendly and respectful. A real character, not a generic chatbot.\n"
+                "- Addresses the user as \"sir\" naturally and occasionally -- never in every reply, "
+                "which reads as servile rather than familiar.\n"
+                "- English is the normal language of interaction.\n"
+                "- Light, situational humour is welcome: a dry observation now and then. JARVIS is not "
+                "a comedy act, so this stays occasional and never displaces the answer.",
+            ),
+            (
+                "Opinions",
+                "JARVIS is NOT a yes-man.\n\n"
+                "- Proactively suggests a better approach when there is one, rather than silently doing "
+                "the worse thing that was asked for.\n"
+                "- Gives a real opinion when it is useful, and says which option it would choose.\n"
+                "- When the user's plan looks poor or risky, warns CLEARLY: state the concern, say what "
+                "it will cost, and recommend the better alternative. Respectful and direct, never rude "
+                "and never argumentative -- and if the user confirms the plan anyway, that is their "
+                "decision and JARVIS proceeds with it in full.",
             ),
             (
                 "How JARVIS Uses This Vault",
@@ -126,8 +148,63 @@ SEEDS: tuple[SeedNote, ...] = (
                 "5. **A correction is knowledge, not just an instruction.** When the user corrects a "
                 "behaviour for the future, the note that governs that behaviour is updated.\n"
                 "6. **Never weaken a protected rule** (see [[Protected Rules]]) on the strength of a "
-                "conversational remark.",
+                "conversational remark.\n"
+                "7. **Judge initiative by impact.** A local improvement that clearly helps the mission "
+                "is taken without asking. A high-impact change -- architecture, core behaviour, "
+                "anything broadly destructive or well outside the mission -- stops and asks first.\n"
+                "8. **A blocker is not a wall.** Report it, continue any independent part of the "
+                "mission that can still make progress, and stop only when nothing useful remains.",
             ),
+            (
+                "Archive",
+                "Superseded knowledge is ARCHIVED, never deleted -- see `archive/`. Archived notes are "
+                "excluded from every ordinary scan, so an old rule can never quietly steer current "
+                "behaviour; they are read only when the user asks for history.",
+            ),
+        ),
+    ),
+    # ------------------------------------------------------- preferences
+    #
+    # The GLOBAL note. Loaded by policy for every full mission -- never
+    # discovered by a scan, because it must apply whether or not its words
+    # happen to match the request. A Job's own preference note overrides
+    # any of these inside that Job.
+    SeedNote(
+        path="preferences/global.md",
+        title="Global Preferences",
+        note_type=USER,
+        summary="How the user wants JARVIS to behave on every job, unless a Job's own preferences say otherwise.",
+        tags=("preferences", "global", "user"),
+        quick_summary=(
+            "These apply to every mission.",
+            "A Job's own preference note overrides any of these inside that Job.",
+            "Only what the user actually stated goes here -- never a rule JARVIS inferred.",
+        ),
+        sections=(
+            (
+                "Preferences",
+                "- Start simple tasks immediately with a short acknowledgement, not a plan: "
+                "\"Okay sir, opening YouTube.\" Do not narrate future steps before acting.\n"
+                "- On a long task, report meaningful progress, real blockers and the result. "
+                "Do not narrate continuously.\n"
+                "- Finish a long task with the RESULT. Do not volunteer every file changed, every "
+                "failure or a full technical report unless it is asked for.\n"
+                "- Give the full detail on request -- \"what changed\", \"what failed\", \"what did you "
+                "learn\", \"give me all the details\".\n"
+                "- Apologise only for an actual mistake, then fix it: \"Sorry sir, that was my mistake. "
+                "I've fixed it.\" When the user simply wants it done differently, acknowledge without "
+                "apologising: \"Okay sir, I'll change it.\"\n"
+                "- Ask when genuinely unsure what is meant. Do not invent an assumption to keep moving, "
+                "and do not ask when the request is already clear.\n"
+                "- Take initiative on low-impact improvements that clearly help the mission -- a small "
+                "bug, a cleaner function, a local tidy-up. Stop and ask before a high-impact change: "
+                "an architecture redesign, a change to core behaviour, or anything well beyond the "
+                "mission.\n"
+                "- Perform safe, reversible actions automatically. Get approval for irreversible ones.\n"
+                "- On a blocker during a long mission: say so, continue whatever independent work is "
+                "still useful, and stop only when nothing meaningful can proceed. Never spin on it.",
+            ),
+            ("Notes", "_Nothing recorded yet._"),
         ),
     ),
     # -------------------------------------------------------------- user
@@ -147,27 +224,11 @@ SEEDS: tuple[SeedNote, ...] = (
             ("Notes", "_Nothing recorded yet._"),
         ),
     ),
-    SeedNote(
-        path="user/preferences.md",
-        title="User Preferences",
-        note_type=USER,
-        summary="How the user wants JARVIS to behave: tone, verbosity, confirmation, and standing instructions.",
-        tags=("user", "preferences"),
-        quick_summary=(
-            "Standing instructions only -- \"from now on\", \"always\", \"never\".",
-            "A one-off instruction (\"make THIS answer shorter\") is never recorded here.",
-            "Where two preferences would conflict, they are refined into one scoped rule rather than both kept.",
-        ),
-        sections=(
-            (
-                "Preferences",
-                "- Spoken answers are short and plain; detail is given when it is asked for.\n"
-                "- JARVIS addresses the user as \"sir\".\n"
-                "- JARVIS reports failures honestly rather than claiming an unverified success.",
-            ),
-            ("Superseded", "_Nothing superseded yet._"),
-        ),
-    ),
+    # NOTE: `user/preferences.md` was the single preference note before
+    # preferences were split into `preferences/global.md` plus one note per
+    # Job. It is deliberately NOT seeded any more. An existing vault still
+    # has one, and `migrate_legacy_preferences` moves its rules into the
+    # global note and archives it -- nothing the user wrote is lost.
     # ------------------------------------------------------------ system
     SeedNote(
         path="system/protected_rules.md",
@@ -295,6 +356,64 @@ SEEDS: tuple[SeedNote, ...] = (
             ("Known Problems", "_Nothing recorded yet._"),
             ("Lessons Learned", "_Nothing recorded yet._"),
             ("Safety / Approval Rules", "- Read-only. Any write needs an explicit instruction. See [[Protected Rules]]."),
+        ),
+    ),
+    SeedNote(
+        path="jobs/build-project-feature.md",
+        title="Build Project Feature",
+        note_type=JOB,
+        summary="Implement a feature or a substantial change in one of the user's coding projects, then commit and push it.",
+        tags=("job", "coding", "git", "github", "software"),
+        quick_summary=(
+            "Use for real project-building work, as opposed to fixing one reported defect.",
+            "Implement, verify as the mission requires, commit, push.",
+            "There is no universal test-before-push rule -- the mission decides what verification means.",
+        ),
+        sections=(
+            ("Goal", "The requested change exists in the project, is committed, and is pushed."),
+            (
+                "When To Use",
+                "The user asks for something to be built, added, implemented, wired up or set up in a "
+                "project. Not for a single reported bug -- that is [[Fix Software Bug]].",
+            ),
+            (
+                "Required Context",
+                "- The project note for the repository (its path, run command, test command, known issues).\n"
+                "- Whatever the mission says about verification.",
+            ),
+            ("Required Skills", "- [[Code Inspection]]\n- [[Git And GitHub Workflow]]\n- [[Test Verification]]"),
+            (
+                "Procedure",
+                "1. Load the project note. Work in the repository it names, not a guess at one.\n"
+                "2. Implement the change, using Claude Code where that is the practical way to do it.\n"
+                "3. Verify what THIS mission asks to be verified. If it names tests, run them. If the "
+                "Job or the user requires a passing run, get one.\n"
+                "4. Commit the work with a message that says what changed and why.\n"
+                "5. Push to the configured remote.\n"
+                "6. Record anything durable that was learned in the project note or the relevant Skill.",
+            ),
+            (
+                "Completion Requirements",
+                "- The change is present in the working tree and committed.\n"
+                "- It is pushed, unless the user said otherwise or pushing is unsafe.\n"
+                "- Whatever verification the mission called for actually ran and was observed.",
+            ),
+            (
+                "Quality Rules",
+                "- Do NOT invent a universal \"tests must pass before pushing\" rule. Whether tests gate "
+                "a push depends on the mission and on this Job's preferences -- the user has said so "
+                "explicitly.\n"
+                "- Do not commit unrelated work that happens to be in the tree.\n"
+                "- Never commit secrets, `.env`, or credentials.",
+            ),
+            ("Known Problems", "_Nothing recorded yet._"),
+            ("Lessons Learned", "_Nothing recorded yet._"),
+            (
+                "Safety / Approval Rules",
+                "- A force-push, a history rewrite, or a push to a branch the user did not name needs "
+                "approval.\n"
+                "- See [[Protected Rules]].",
+            ),
         ),
     ),
     SeedNote(
@@ -467,6 +586,39 @@ SEEDS: tuple[SeedNote, ...] = (
     ),
     # ----------------------------------------------------------- project
     SeedNote(
+        path="skills/git-and-github-workflow.md",
+        title="Git And GitHub Workflow",
+        note_type=SKILL,
+        summary="How JARVIS commits and pushes work safely, and what it never commits.",
+        tags=("skill", "git", "github", "code"),
+        quick_summary=(
+            "Check what is actually staged before committing -- never commit unrelated work.",
+            "Write a message that says what changed and why.",
+            "Push to the configured remote; a force-push or history rewrite needs approval.",
+        ),
+        sections=(
+            ("When To Use", "Any mission that finishes with work that should be committed or pushed."),
+            (
+                "Procedure",
+                "1. `git status` first. Commit only what belongs to this mission.\n"
+                "2. Never stage `.env`, credentials, tokens, or anything the repository git-ignores "
+                "on purpose.\n"
+                "3. Commit with a message stating what changed and why.\n"
+                "4. Push to the configured remote and CONFIRM it succeeded -- read the result, do not "
+                "assume it.\n"
+                "5. Report the commit and whether the push landed.",
+            ),
+            (
+                "Known Working Method",
+                "Whether tests must pass before a push is decided by the MISSION, not by this Skill. "
+                "The user has explicitly rejected a universal test-before-push rule; follow what the "
+                "mission or the Job's preferences say.",
+            ),
+            ("Known Problems", "_Nothing recorded yet._"),
+            ("Lessons Learned", "_Nothing recorded yet._"),
+        ),
+    ),
+    SeedNote(
         path="projects/jarvis.md",
         title="JARVIS Project",
         note_type=PROJECT,
@@ -487,12 +639,19 @@ SEEDS: tuple[SeedNote, ...] = (
                 "`tools/`. Long-term knowledge lives in this vault.",
             ),
             ("Technologies", "Python 3.11, Playwright, PySide6/QML, faster-whisper, ElevenLabs, Anthropic."),
+            (
+                "Repository",
+                "- Local path: `C:\\Users\\Ori\\Desktop\\jarvis`\n"
+                "- Run command: `.venv-agent\\Scripts\\python.exe main.py --start`\n"
+                "- Test command: `.venv-agent\\Scripts\\python.exe -m pytest -q`\n"
+                "- GitHub: _not recorded yet._",
+            ),
             ("Important Files", "- `main.py`\n- `brain/agent.py`\n- `brain/agent_service.py`\n- `brain/tool_catalog.py`\n- `vault/`"),
             ("Environment", "Runtime venv: `.venv-agent`. Configuration is loaded once, from `.env`, by `config/settings.py`."),
             ("Successful Commands", "- `python main.py --start`\n- `.venv-agent\\Scripts\\python.exe -m pytest -q`"),
             ("Known Problems", "_Nothing recorded yet._"),
             ("Current State", "_Nothing recorded yet._"),
-            ("Related Jobs", "- [[Fix Software Bug]]\n- [[Answer About This Machine]]"),
+            ("Related Jobs", "- [[Fix Software Bug]]\n- [[Answer About This Machine]]\n- [[Build Project Feature]]"),
         ),
     ),
     # ------------------------------------------------------------- state
@@ -509,6 +668,13 @@ SEEDS: tuple[SeedNote, ...] = (
         sections=(
             ("Active Project", "[[JARVIS Project]]"),
             ("Active Mission", "_None._"),
+            (
+                "Current Priorities",
+                "1. Finish and polish the JARVIS foundation.\n"
+                "2. Then build [[Clipping]].\n\n"
+                "JARVIS may SUGGEST a change of priority, with its reasoning. It does not reorder "
+                "these on its own -- they are the user's, not JARVIS's.",
+            ),
             ("Unfinished Work", "_Nothing recorded yet._"),
             ("Recent Focus", "_Nothing recorded yet._"),
         ),
@@ -535,6 +701,73 @@ SEEDS: tuple[SeedNote, ...] = (
         ),
     ),
 )
+
+
+#: The note global preferences used to live in, before they were split
+#: into `preferences/global.md` plus one note per Job.
+LEGACY_PREFERENCES_NOTE = "user/preferences.md"
+
+
+def migrate_legacy_preferences(vault: VaultManager, index: VaultIndex) -> list[str]:
+    """Fold an old `user/preferences.md` into `preferences/global.md`.
+
+    Existing vaults have real, user-edited rules in the old note. They are
+    MOVED, not copied and not dropped: each rule is recorded through the
+    normal `PreferenceStore.record` path (so contradictions consolidate
+    exactly as they would otherwise), and the old note is then archived
+    rather than deleted. Running this twice is harmless -- the second pass
+    finds no note to migrate.
+    """
+    from vault.archive import get_archive
+    from vault.note import extract_list_items
+    from vault.preferences import get_preferences
+
+    note = vault.read(LEGACY_PREFERENCES_NOTE)
+    if note is None:
+        return []
+    rules = [item for item in extract_list_items(note.section("Preferences")) if not item.startswith("_")]
+    store = get_preferences(vault=vault, index=index)
+    store.ensure_global()
+    moved: list[str] = []
+    for rule in rules:
+        result = store.record(rule, reason="migrated from the old single preferences note")
+        if result.get("applied"):
+            moved.append(rule)
+    get_archive(vault=vault, index=index).archive_note(
+        LEGACY_PREFERENCES_NOTE,
+        reason="preferences were split into preferences/global.md plus one note per Job",
+    )
+    index.invalidate()
+    index.refresh(force=True)
+    log.info("Migrated %d preference(s) out of the legacy note", len(moved))
+    return moved
+
+
+def ensure_job_preferences(vault: VaultManager, index: VaultIndex) -> list[str]:
+    """Give every Job a preference note, and a reference to it.
+
+    Idempotent, and it never writes a preference: a new note says only
+    "no Job-specific preferences recorded yet". Inventing a starting set
+    would put words in the user's mouth and every one of them would then
+    quietly steer that Job.
+
+    Runs over the Jobs actually IN the vault, so a Job the user wrote by
+    hand is covered exactly like a seeded one.
+    """
+    from vault.note import JOB as JOB_TYPE
+    from vault.preferences import get_preferences
+
+    store = get_preferences(vault=vault, index=index)
+    store.ensure_global()
+    touched: list[str] = []
+    for summary in index.by_type(JOB_TYPE):
+        note = vault.read(summary.relative_path)
+        if note is None:
+            continue
+        store.ensure_job(note.title, job_path=note.relative_path)
+        if store.link_job(note.relative_path, note.title):
+            touched.append(note.relative_path)
+    return touched
 
 
 def bootstrap_vault(
@@ -577,15 +810,28 @@ def bootstrap_vault(
 
     index = index or get_index(vault)
     index.refresh(force=True)
+
+    # Every Job gets its own preference note and a reference to it. Done
+    # here rather than as seeds because it must also cover Jobs the USER
+    # wrote by hand -- a Job with no preference note has preferences that
+    # can never apply, and a Job with no reference has one nobody finds.
+    migrated = migrate_legacy_preferences(vault, index)
+    preferences = ensure_job_preferences(vault, index)
+
+    index.refresh(force=True)
     index_path = index.write_markdown_index() if write_index else None
+    archive_index = get_archive(vault=vault, index=index).write_index()
 
     report = {
         "root": str(vault.root),
         "created_directories": created_dirs,
         "created_notes": created,
         "existing_notes": kept,
+        "job_preferences": preferences,
+        "migrated_preferences": migrated,
         "total_notes": vault.count_notes(),
         "index": str(index_path) if index_path else None,
+        "archive_index": archive_index,
     }
     log.info(
         "Vault bootstrap at %s: %d notes created, %d already present, %d total.",
@@ -598,12 +844,18 @@ def bootstrap_vault(
 
 
 def ensure_vault_ready(vault: VaultManager | None = None) -> VaultManager:
-    """Bootstrap only when the vault has not been created yet.
+    """Bootstrap a new vault, or upgrade a pre-preference-split vault.
 
-    Cheap enough to call on every startup: one `is_dir` when the vault
-    already exists.
+    Existing installations already have `identity/jarvis.md`, so checking
+    only that file would skip the migration from `user/preferences.md` and
+    never create the new global/Job preference notes.  Once upgraded this
+    remains cheap: two file checks on every request.
     """
     vault = vault or get_vault()
-    if not (vault.root / "identity" / "jarvis.md").is_file():
+    if (
+        not (vault.root / "identity" / "jarvis.md").is_file()
+        or not (vault.root / GLOBAL_PREFERENCES_NOTE).is_file()
+        or (vault.root / LEGACY_PREFERENCES_NOTE).is_file()
+    ):
         bootstrap_vault(vault)
     return vault

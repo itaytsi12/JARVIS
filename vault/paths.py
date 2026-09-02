@@ -28,11 +28,23 @@ MISSIONS_COMPLETED_DIR = "missions/completed"
 DAILY_DIR = "daily"
 STATE_DIR = "state"
 SYSTEM_DIR = "system"
+#: Two-level preferences. `preferences/global.md` applies to every
+#: mission; `preferences/jobs/<slug>.md` applies only to its own Job and
+#: is loaded only after that Job has been selected.
+PREFERENCES_DIR = "preferences"
+JOB_PREFERENCES_DIR = "preferences/jobs"
+#: Superseded knowledge. Never deleted, never scanned.
+ARCHIVE_DIR = "archive"
+ARCHIVE_PREFERENCES_DIR = "archive/preferences"
+ARCHIVE_METHODS_DIR = "archive/methods"
+ARCHIVE_NOTES_DIR = "archive/notes"
 
 #: Every directory the bootstrap creates, in display order.
 VAULT_DIRECTORIES: tuple[str, ...] = (
     IDENTITY_DIR,
     USER_DIR,
+    PREFERENCES_DIR,
+    JOB_PREFERENCES_DIR,
     JOBS_DIR,
     SKILLS_DIR,
     PROJECTS_DIR,
@@ -42,10 +54,60 @@ VAULT_DIRECTORIES: tuple[str, ...] = (
     DAILY_DIR,
     STATE_DIR,
     SYSTEM_DIR,
+    ARCHIVE_DIR,
+    ARCHIVE_PREFERENCES_DIR,
+    ARCHIVE_METHODS_DIR,
+    ARCHIVE_NOTES_DIR,
 )
 
-#: The generated map of the whole vault, at the vault root.
+#: The global preference note, loaded for every full mission by policy --
+#: never discovered by a scan, because it must apply whether or not its
+#: words happen to match the request.
+GLOBAL_PREFERENCES_NOTE = f"{PREFERENCES_DIR}/global.md"
+
+# ---------------------------------------------------------------- scanning
+#
+# Why two kinds of note are kept OUT of the ordinary summary scan.
+#
+# ARCHIVE: superseded knowledge is kept so a decision's history survives,
+# but an archived rule that could still be retrieved would be an archived
+# rule that can still change behaviour -- which defeats the point of
+# superseding it. Archive is reachable only through the explicit
+# history/archive tools.
+#
+# JOB PREFERENCES: there is one per Job, so they scale with the Jobs and
+# would come to dominate a scan while carrying no signal about WHICH Job
+# fits a request -- they say how to do a job, not when it applies. They
+# are loaded deterministically, after their Job has been selected.
+#
+# Neither is hidden from an explicit lookup: resolving `[[Preferences -
+# Send Email]]` from a Job note is a deliberate reference, not a search.
+
+#: Why a note is excluded from the ordinary scan. "" means it is active.
+EXCLUDED_ARCHIVE = "archive"
+EXCLUDED_JOB_PREFERENCE = "job_preference"
+
+
+def exclusion_reason(relative_path: str) -> str:
+    """Why `relative_path` is kept out of the ordinary scan, or "".
+
+    One predicate, consulted once per note by `VaultIndex.refresh`, so
+    every consumer of the index inherits the rule instead of each
+    re-deriving it.
+    """
+    path = (relative_path or "").replace("\\", "/").lstrip("./")
+    if path == ARCHIVE_DIR or path.startswith(ARCHIVE_DIR + "/"):
+        return EXCLUDED_ARCHIVE
+    if path.startswith(JOB_PREFERENCES_DIR + "/"):
+        return EXCLUDED_JOB_PREFERENCE
+    return ""
+
+#: The generated map of the ACTIVE vault, at the vault root.
 VAULT_INDEX_FILE = "VAULT_INDEX.md"
+#: The generated map of the archive. Deliberately a SEPARATE file, and
+#: deliberately not part of priming: it exists so the user can browse
+#: what was superseded, not so JARVIS can retrieve it by accident.
+ARCHIVE_INDEX_FILE = "archive/ARCHIVE_INDEX.md"
 #: A per-directory index, generated for the browsable collections.
 DIRECTORY_INDEX_FILE = "INDEX.md"
 #: Directories that get their own `INDEX.md`.

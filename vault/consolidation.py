@@ -108,24 +108,52 @@ def _overlap(left: str, right: str) -> float:
     return len(a & b) / min(len(a), len(b))
 
 
+#: Nouns that name a thing JARVIS PRODUCES. The verbosity opposition
+#: (short vs detailed) only applies when both rules name one of these,
+#: because "short" and "long" are about length only when there is an
+#: output to be long. Verbs are deliberately absent: "report" as a verb
+#: appears in rules that have nothing to do with verbosity.
+_OUTPUT_NOUNS = frozenset(
+    "answer answers response responses explanation explanations reply replies "
+    "output summary summaries email emails message messages note notes "
+    "description descriptions detail details".split()
+)
+
+#: The verbosity pair, which needs the subject test above rather than
+#: ordinary token overlap.
+_VERBOSITY = _OPPOSITES[0]
+
+
 def _contradicts(existing: str, incoming: str) -> bool:
-    """Do these two rules take opposite positions on the same subject?
+    """Do these two rules take opposite positions on the SAME subject?
 
-    An opposite PAIR is itself the evidence that the two rules are about
-    the same subject; shared vocabulary is not required and demanding it
-    was wrong. "Keep responses short." and "When coding, give detailed
-    technical explanations." share not one word -- `short` versus
-    `detailed` IS the disagreement -- so an overlap test rejected the
-    single most important case this module exists to handle.
+    Two conditions, not one. An opposite pair must appear across the two
+    rules, AND they must be about the same thing.
 
-    The pairs in `_OPPOSITES` are deliberately few and concrete for the
-    same reason: a general-purpose contradiction detector would be wrong
-    far more often than right, and a wrong "supersede" silently deletes a
-    rule the user meant.
+    The subject test is what stops a plausible-looking disaster. "Spoken
+    answers are short and plain" and "On a LONG task, report progress"
+    hit the short/long pair while sharing no subject at all -- one is
+    about verbosity, the other about duration -- and superseding on that
+    basis silently replaced a real rule with an unrelated one. Observed
+    during the preference migration.
+
+    So: the verbosity pair requires an output noun in BOTH rules, and
+    every other pair requires at least one shared content word. "Always
+    use emojis in emails" and "Never use emojis in emails" share
+    `emojis` and `emails`; "Keep responses short" and "When coding, give
+    detailed explanations" share no word but name `responses` and
+    `explanations`, which are both outputs.
     """
     left, right = _tokens(existing), _tokens(incoming)
     for first, second in _OPPOSITES:
-        if (left & first and right & second) or (left & second and right & first):
+        opposed = (left & first and right & second) or (left & second and right & first)
+        if not opposed:
+            continue
+        if (first, second) == _VERBOSITY:
+            if left & _OUTPUT_NOUNS and right & _OUTPUT_NOUNS:
+                return True
+            continue
+        if left & right:
             return True
     return False
 

@@ -35,12 +35,22 @@ from config.settings import env_float
 from vault.manager import VaultManager, get_vault
 from vault.note import INDEX, Note, build_note_text, utc_now
 from vault import paths as vault_paths
-from vault.paths import DIRECTORY_INDEX_FILE, INDEXED_DIRECTORIES, VAULT_INDEX_FILE
+from vault.paths import (
+    ARCHIVE_INDEX_FILE,
+    DIRECTORY_INDEX_FILE,
+    INDEXED_DIRECTORIES,
+    VAULT_INDEX_FILE,
+    exclusion_reason,
+)
 
 log = logging.getLogger("jarvis.vault.index")
 
 #: Index entries are never the thing being searched FOR.
-_GENERATED = {VAULT_INDEX_FILE.lower(), DIRECTORY_INDEX_FILE.lower()}
+_GENERATED = {
+    VAULT_INDEX_FILE.lower(),
+    DIRECTORY_INDEX_FILE.lower(),
+    ARCHIVE_INDEX_FILE.rsplit("/", 1)[-1].lower(),
+}
 
 
 @dataclass
@@ -66,6 +76,14 @@ class NoteSummary:
     size: int = 0
     mtime: float = 0.0
     malformed: bool = False
+    #: Why this note is kept OUT of the ordinary scan ("archive",
+    #: "job_preference"), or "" when it is active. Set by the index from
+    #: the note's path -- see `vault/paths.py::exclusion_reason`.
+    excluded_reason: str = ""
+
+    @property
+    def scannable(self) -> bool:
+        return not self.excluded_reason
 
     def digest(self) -> str:
         parts = [f"- {self.title} [{self.note_type}] ({self.relative_path})"]
@@ -215,7 +233,9 @@ class VaultIndex:
                 note = self.vault.read(relative)
                 if note is None:
                     continue
-                self._summaries[relative] = NoteSummary.from_note(note)
+                summary = NoteSummary.from_note(note)
+                summary.excluded_reason = exclusion_reason(relative)
+                self._summaries[relative] = summary
                 self._signatures[relative] = signature
                 reparsed += 1
             for missing in set(self._summaries) - seen:
@@ -239,18 +259,39 @@ class VaultIndex:
         with self._lock:
             self._last_refresh = 0.0
 
-    def summaries(self, *, refresh: bool = True) -> list[NoteSummary]:
+    def summaries(self, *, refresh: bool = True, include_excluded: bool = False) -> list[NoteSummary]:
+        """The ACTIVE notes, unless `include_excluded` says otherwise.
+
+        This is the one place the archive and the per-Job preference notes
+        are filtered out, so every consumer -- the retriever, priming, Job
+        and Skill selection, the generated index -- inherits the rule
+        rather than each remembering to apply it.
+        """
         if refresh:
-            return self.refresh()
-        with self._lock:
-            self._load_cache()
-            return list(self._summaries.values())
+            everything = self.refresh()
+        else:
+            with self._lock:
+                self._load_cache()
+                everything = list(self._summaries.values())
+        return everything if include_excluded else [item for item in everything if item.scannable]
+
+    def excluded(self, reason: str = "", *, refresh: bool = True) -> list[NoteSummary]:
+        """The notes deliberately kept out of the scan.
+
+        `reason` narrows to one kind ("archive", "job_preference"). This is
+        how the explicit archive/history tools reach superseded knowledge
+        without a second filesystem walk.
+        """
+        found = [item for item in self.summaries(refresh=refresh, include_excluded=True) if item.excluded_reason]
+        return [item for item in found if item.excluded_reason == reason] if reason else found
 
     def by_type(self, note_type: str, *, refresh: bool = True) -> list[NoteSummary]:
         return [item for item in self.summaries(refresh=refresh) if item.note_type == note_type]
 
     def get(self, relative_path: str, *, refresh: bool = False) -> NoteSummary | None:
-        for item in self.summaries(refresh=refresh):
+        # Addressed by path, so an excluded note IS returned: naming a note
+        # exactly is a deliberate lookup, not a search.
+        for item in self.summaries(refresh=refresh, include_excluded=True):
             if item.relative_path == relative_path:
                 return item
         return None
@@ -264,7 +305,11 @@ class VaultIndex:
         wanted = (title or "").strip().lower()
         if not wanted:
             return None
-        candidates = self.summaries(refresh=refresh)
+        # Excluded notes are included here on purpose: a Job note pointing
+        # at `[[Preferences - Send Email]]` is naming one specific note,
+        # which is a reference, not a search. Refusing to resolve it would
+        # break the very mechanism that keeps preferences out of the scan.
+        candidates = self.summaries(refresh=refresh, include_excluded=True)
         for item in candidates:
             if item.title.strip().lower() == wanted:
                 return item

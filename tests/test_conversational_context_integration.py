@@ -11,6 +11,7 @@ throwaway `SessionContext` in `setUp` and restores the original in
 (or the harness itself) might depend on.
 """
 import unittest
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 from brain import agent, router
@@ -60,7 +61,23 @@ class ConversationalContextTestCase(unittest.TestCase):
                 return ToolResult(True, action.tool, "Opened.", {"path": action.args["path"], "verified": True})
             return ToolResult(True, action.tool, "ok", {"verified": True})
 
-        return patch.object(agent.executor, "execute_action", side_effect=execute_action)
+        # Multi-step local plans execute through AgentRuntime's executor;
+        # single direct tools still use agent.executor. Keep both mocked so
+        # this integration helper stays at the real execution boundary and
+        # can never touch a desktop application.
+        @contextmanager
+        def mocked_execution():
+            with ExitStack() as stack:
+                direct = stack.enter_context(patch.object(agent.executor, "execute_action", side_effect=execute_action))
+                runtime_executor = agent.agent_runtime.executor
+                if runtime_executor is not agent.executor:
+                    stack.enter_context(patch.object(runtime_executor, "execute_action", side_effect=execute_action))
+                stack.enter_context(
+                    patch.object(runtime_executor, "execute_action_unlocked_plan", side_effect=execute_action)
+                )
+                yield direct
+
+        return mocked_execution()
 
     def _fake_runtime_execute(self, extra=None):
         """Patches agent.agent_runtime.execute (SESSION_AWARE_SINGLE_TOOLS:

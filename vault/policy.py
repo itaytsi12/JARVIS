@@ -34,7 +34,7 @@ LIGHT = "light"
 
 #: Verbs that mean the request CHANGES something or has to be worked out.
 _SUBSTANTIAL = re.compile(
-    r"\b(fix|repair|debug|diagnose|implement|build|create|write|refactor|rewrite|patch|"
+    r"\b(fix|repair|debug|diagnose|implement|build|create|write|draft|compose|prepare|refactor|rewrite|patch|"
     r"migrate|optimi[sz]e|troubleshoot|investigate|analyse|analyze|review|audit|"
     r"research|plan|design|organi[sz]e|clean\s+up|set\s+up|configure|install|deploy|"
     r"run\s+the\s+tests?|verify|test|generate|produce|summari[sz]e|compare|"

@@ -196,13 +196,13 @@ class ApplyCorrectionTests(VaultLearningTestCase):
     def test_a_correction_with_no_governing_note_lands_in_preferences(self):
         outcome = self.learner.apply("From now on keep your spoken reports much shorter.")
         self.assertTrue(outcome.applied, outcome.reason)
-        self.assertEqual(outcome.target_path, "user/preferences.md")
-        self.assertIn("shorter", self.vault.read("user/preferences.md").section("Preferences").lower())
+        self.assertEqual(outcome.target_path, "preferences/global.md")
+        self.assertIn("shorter", self.vault.read("preferences/global.md").section("Preferences").lower())
 
     def test_a_contradicting_preference_is_refined_not_stacked(self):
         self.learner.apply("From now on keep responses short.")
         self.learner.apply("When we are coding, always give detailed technical explanations.")
-        preferences = self.vault.read("user/preferences.md").section("Preferences")
+        preferences = self.vault.read("preferences/global.md").section("Preferences")
         self.assertIn("coding", preferences.lower())
         # Not two absolutes: the scoped rule refined the earlier one.
         self.assertNotIn("- Keep responses short.\n- When we are coding", preferences)

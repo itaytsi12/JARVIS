@@ -127,7 +127,7 @@ def recover_session(
         if identity is not None:
             recovery.identity_summary = identity.summary
 
-        preferences = vault.read("user/preferences.md")
+        preferences = vault.read("preferences/global.md")
         if preferences is not None:
             recovery.preferences = (preferences.section("Preferences") or preferences.quick_summary)[:600]
 

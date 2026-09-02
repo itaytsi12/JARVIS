@@ -32,19 +32,46 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+import re
+from pathlib import Path
+
 from vault.daily import DailyJournal, get_journal
 from vault.index import VaultIndex, get_index
 from vault.jobs import Job, JobRegistry, get_job_registry
 from vault.manager import VaultManager
 from vault.note import DAILY, IDENTITY, LESSON, MISSION, PROJECT, USER, Note
 from vault.retrieval import RetrievalTrace, VaultRetriever, get_retriever
+from vault.preferences import PreferenceStore, ResolvedPreferences, get_preferences
 from vault.skills import SkillLibrary, VaultSkill, get_skill_library
 
 log = logging.getLogger("jarvis.vault.priming")
 
 #: Notes read on every primed mission. They are what makes JARVIS itself
 #: rather than a search engine over Markdown, and they are small.
-ALWAYS_READ = ("identity/core_rules.md", "user/preferences.md")
+ALWAYS_READ = ("identity/core_rules.md",)
+
+#: Phrases that reach BACKWARDS in time. Recent Daily Notes are loaded
+#: only when one of these appears, or when a mission is already running.
+#:
+#: A Daily Note is a record of what happened, not knowledge about how to
+#: work, so loading yesterday into an unrelated task spends budget on
+#: noise and invites the model to act on it. "Continue what we were doing
+#: yesterday" needs it; "fix the login bug" does not.
+_REFERENCES_EARLIER_WORK = re.compile(
+    r"\b(yesterday|earlier|before|last (?:time|night|session|week)|previous(?:ly)?|"
+    r"continue|carry on|resume|pick up|finish|where (?:we|i|you) (?:left|got|stopped)|"
+    r"what (?:we|i|you) (?:were|was) (?:doing|working)|still|again|the other day|"
+    r"this morning|recent(?:ly)?|so far|update me|catch me up)\b",
+    re.I,
+)
+
+
+def references_earlier_work(request: str) -> bool:
+    """Does this request reach back to previous work?
+
+    Deterministic and free -- it runs on every primed mission.
+    """
+    return bool(_REFERENCES_EARLIER_WORK.search(request or ""))
 
 #: Priority order for the priming sections, lowest number first. This is
 #: the order the budget is spent in: identity and the Job survive a tight
@@ -70,6 +97,12 @@ class PrimedContext:
     skills: list[VaultSkill] = field(default_factory=list)
     missing_skills: list[str] = field(default_factory=list)
     project: Note | None = None
+    #: Every project note loaded, in order. A request naming two projects
+    #: loads both, and `project` is simply the first of them.
+    projects: list[Note] = field(default_factory=list)
+    preferences: ResolvedPreferences | None = None
+    #: True when recent Daily Notes were deep-read, and why.
+    continuity_reason: str = ""
     notes_read: list[str] = field(default_factory=list)
     sections: dict[str, str] = field(default_factory=dict)
     trace: RetrievalTrace | None = None
@@ -96,6 +129,9 @@ class PrimedContext:
             "skills": self.skill_titles,
             "missing_skills": list(self.missing_skills),
             "project": self.project.title if self.project else None,
+            "projects": [note.title for note in self.projects],
+            "preferences": self.preferences.describe() if self.preferences else None,
+            "continuity": self.continuity_reason or None,
             "notes_read": list(self.notes_read),
             "scanned_notes": self.scanned,
             "used_chars": self.used_chars,
@@ -113,7 +149,15 @@ class PrimedContext:
         lines.append(f"Skills loaded: {', '.join(self.skill_titles) or '(none)'}")
         if self.missing_skills:
             lines.append(f"Skills named but NOT found in the vault: {', '.join(self.missing_skills)}")
-        lines.append(f"Project: {self.project.title if self.project else '(none)'}")
+        lines.append(f"Projects: {', '.join(note.title for note in self.projects) or '(none)'}")
+        if self.preferences is not None:
+            described = self.preferences.describe()
+            lines.append(
+                f"Preferences: {described['global_rules']} global"
+                + (f" + {described['job_rules']} for this Job" if described["job_rules"] else "")
+                + (f"; {len(described['overridden'])} global rule(s) overridden by the Job" if described["overridden"] else "")
+            )
+        lines.append(f"Recent daily notes: {self.continuity_reason or 'not loaded (nothing referenced earlier work)'}")
         lines.append(f"Notes read in full: {', '.join(self.notes_read) or '(none)'}")
         lines.append(f"Context used: {self.used_chars}/{self.budget_chars} characters" + (f"; dropped {', '.join(self.dropped)}" if self.dropped else ""))
         return "\n".join(lines)
@@ -137,6 +181,7 @@ class Primer:
         self.jobs = jobs or get_job_registry(index=self.index, vault=self.vault)
         self.skills = skills or get_skill_library(index=self.index, vault=self.vault)
         self.journal = journal or get_journal(vault=self.vault, index=self.index)
+        self.preferences = get_preferences(vault=self.vault, index=self.index)
 
     def prime(
         self,
@@ -181,11 +226,26 @@ class Primer:
         primed.skills = loaded
         primed.missing_skills = missing
 
-        project = self._select_project(candidates)
+        # A project named EXPLICITLY is loaded whether or not the task
+        # looks like it needs one -- "what's the run command for JARVIS"
+        # is a simple request whose answer lives in one specific note.
+        # Naming two projects loads both, kept as separate blocks so one
+        # project's facts can never be reported as the other's.
+        projects = self._mentioned_projects(request)
+        if not projects:
+            found = self._select_project(candidates)
+            projects = [found] if found is not None else []
+        primed.projects = projects
+        project = projects[0] if projects else None
         primed.project = project
 
         lessons = self._select(candidates, LESSON, limit=2)
-        preferences = self._select(candidates, USER, limit=2)
+        # Preferences are NOT discovered by scanning. The global note is
+        # loaded by policy, because it must apply whether or not its words
+        # happen to match the request; the Job's own note is loaded only
+        # HERE, after the Job has been selected.
+        resolved = self.preferences.resolve(job.title if job is not None else "")
+        primed.preferences = resolved
 
         # -- stage 3: deep-read, in priority order, within the budget ---
         blocks: list[tuple[str, str, str]] = []  # (section, path, text)
@@ -203,17 +263,18 @@ class Primer:
         for skill in loaded:
             blocks.append(("vault_skills", skill.relative_path, skill.guidance()))
 
-        if project is not None:
-            blocks.append(("vault_project", project.relative_path, _project_block(project)))
+        for note in projects:
+            blocks.append(("vault_project", note.relative_path, _project_block(note)))
 
-        preference_note = self.vault.read("user/preferences.md")
-        if preference_note is not None:
-            text = preference_note.section("Preferences") or preference_note.quick_summary
-            if text:
-                blocks.append(("vault_preferences", preference_note.relative_path, f"## What the user prefers\n{text}"))
-        for note in preferences:
-            if note.relative_path != "user/preferences.md":
-                blocks.append(("vault_preferences", note.relative_path, f"## {note.title}\n{note.quick_summary or note.summary}"))
+        rendered_preferences = resolved.render()
+        if rendered_preferences:
+            # Attributed to the note that supplied most of it; every
+            # contributing note is recorded below so the mission's own
+            # record names the files that shaped the behaviour.
+            anchor = resolved.paths[0] if resolved.paths else ""
+            blocks.append(("vault_preferences", anchor, rendered_preferences))
+            for extra in resolved.paths[1:]:
+                primed.notes_read.append(extra)
 
         for note in lessons:
             blocks.append(("vault_lessons", note.relative_path, f"## Lesson: {note.title}\n{note.quick_summary or note.summary}"))
@@ -221,9 +282,18 @@ class Primer:
         if mission_brief:
             blocks.append(("vault_mission", "", f"## This mission so far\n{mission_brief}"))
 
-        if include_continuity:
+        # Recent Daily Notes: only when the request actually reaches
+        # backwards, or a mission is already in flight. `include_continuity`
+        # stays as the caller's veto (a light request never gets it).
+        wants_history = references_earlier_work(request) or bool(mission_brief)
+        if include_continuity and wants_history:
             continuity = self._continuity()
             if continuity:
+                primed.continuity_reason = (
+                    "the request refers to earlier work"
+                    if references_earlier_work(request)
+                    else "a mission is already in progress"
+                )
                 blocks.append(("vault_continuity", "", continuity))
 
         order = {name: position for position, name in enumerate(_SECTION_PRIORITY)}
@@ -275,12 +345,59 @@ class Primer:
         found = self._select(candidates, PROJECT, limit=1, min_score=0.9)
         return found[0] if found else None
 
+    def _mentioned_projects(self, request: str, *, limit: int = 3) -> list[Note]:
+        """Project notes whose name the request actually says.
+
+        Matched against each project's TITLE, its filename stem and any
+        `aliases` in its frontmatter -- an exact word-boundary match, not
+        a fuzzy one, because this bypasses the relevance threshold
+        entirely. "Fix the login bug in Northwind" must load Northwind's
+        note even though the request is short and mentions no Job.
+
+        Every match is returned, so a request naming two projects loads
+        both. They stay separate blocks in the primed context: merging
+        them is how Project A's run command gets reported as Project B's.
+        """
+        text = (request or "").lower()
+        if not text:
+            return []
+        found: list[Note] = []
+        for summary in self.index.by_type(PROJECT):
+            names = {summary.title.lower(), Path(summary.relative_path).stem.replace("-", " ").lower()}
+            note = None
+            for alias in self._aliases(summary.relative_path):
+                names.add(alias.lower())
+            for name in names:
+                cleaned = name.replace(" project", "").strip()
+                if len(cleaned) < 3:
+                    continue
+                if re.search(rf"\b{re.escape(cleaned)}\b", text):
+                    note = self.vault.read(summary.relative_path)
+                    break
+            if note is not None and note.relative_path not in {item.relative_path for item in found}:
+                found.append(note)
+            if len(found) >= limit:
+                break
+        return found
+
+    def _aliases(self, relative_path: str) -> list[str]:
+        note = self.vault.read(relative_path)
+        if note is None:
+            return []
+        value = note.metadata.get("aliases")
+        if isinstance(value, str):
+            return [value]
+        return [str(item) for item in value] if isinstance(value, list) else []
+
     def _continuity(self) -> str:
         """Today's and the previous day's context, summaries only.
 
         This is what makes "carry on with what we were doing yesterday" a
         question JARVIS can answer. It reads the Quick Summary and the
-        unfinished-work section, never the whole day.
+        unfinished-work section, never the whole day -- and, per
+        `references_earlier_work`, only when the request actually reaches
+        backwards. Loading yesterday's work into an unrelated task spends
+        budget on noise and invites the model to act on it.
         """
         parts: list[str] = []
         today = self.journal.existing(self.journal.today().date)
