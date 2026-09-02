@@ -63,6 +63,11 @@ class MissionPolicy:
     budget_chars: int = 1500
 
     @property
+    def selects_job(self) -> bool:
+        """Only reusable execution missions may use lexical Job retrieval."""
+        return self.mode == FULL and self.persist_mission
+
+    @property
     def is_full(self) -> bool:
         return self.mode == FULL
 
@@ -80,6 +85,45 @@ def assess(request: str, *, budget_chars: int = 6000) -> MissionPolicy:
     text = (request or "").strip()
     if not text:
         return MissionPolicy(mode=LIGHT, reasons=("empty request",))
+
+    from brain.request_intent import RequestKind, classify_request_kind
+
+    request_kind = classify_request_kind(text).kind
+    # Verbs that name REAL work: something is changed, or a deliverable is
+    # produced, or a long-running job is started.
+    #
+    # This list only decides whether the gate below may force a request
+    # down to LIGHT. It can never force one UP -- the scoring further down
+    # still makes that call -- so a missing verb silently loses a Job while
+    # an extra one costs nothing. It was originally change-verbs only,
+    # which sent "Research the options and write me a summary" and, worse,
+    # "run the clipping job tonight" to LIGHT: the flagship long-running
+    # mission this whole architecture exists for could not select a Job.
+    execution_change = re.search(
+        r"\b(fix|repair|debug|implement|build|create|change|modify|edit|patch|refactor|migrate|"
+        r"install|deploy|configure|set\s+up|clean\s+up|"
+        # produces a deliverable
+        r"research|write|draft|compose|summari[sz]e|generate|produce|prepare|design|plan|"
+        r"analy[sz]e|review|audit|organi[sz]e|convert|export|publish|post|"
+        # starts real work, including overnight jobs
+        r"run|execute|start|schedule|troubleshoot|investigate|optimi[sz]e)\b",
+        text,
+        re.I,
+    )
+    information_shape = re.match(
+        r"^(?:please\s+)?(?:explain|what|why|who|when|where|how|which|tell me|summari[sz]e(?: in))\b",
+        text,
+        re.I,
+    )
+    if request_kind == RequestKind.QUESTION or (information_shape and not execution_change):
+        return MissionPolicy(mode=LIGHT, reasons=("informational request; no execution Job",))
+    # A ONE-SHOT action is what deserves the downgrade. A request with
+    # several sequenced clauses is not one -- "open Apple Music and play
+    # the album, then verify it is playing" is a mission whichever verbs it
+    # happens to use, and forcing it to LIGHT denied it a Job purely
+    # because "play" was not on the verb list above.
+    if request_kind == RequestKind.ACTION and not execution_change and not _MULTI_STEP.search(text):
+        return MissionPolicy(mode=LIGHT, reasons=("deterministic or one-shot action; no Job",))
 
     reasons: list[str] = []
     score = 0

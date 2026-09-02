@@ -150,3 +150,10 @@ data/app_index_cache.json
 # `python -m vault bootstrap` -- nothing is lost by not committing it.
 data/vault/
 data/vault_index_cache.json
+
+# Discovered model routes and their capabilities, per machine and per set
+# of configured credentials. Rebuilt automatically on the next discovery
+# pass, so it is a cache and never a source of truth -- and it names which
+# providers this particular machine has keys for, which is not something
+# to publish.
+data/model_registry_cache.json

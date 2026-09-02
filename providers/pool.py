@@ -21,12 +21,14 @@ log = logging.getLogger("jarvis.providers.pool")
 
 def classify_capability(messages: list[Message], tools: list[ToolSpec] | None = None) -> str:
     text = " ".join(message.content for message in messages if message.content).lower()
+    # Tool schemas are a hard wire-protocol requirement, not a soft task
+    # theme. Check them before vision/coding/reasoning text heuristics.
+    if tools:
+        return "tool_use"
     if any(x in text for x in ("image", "screenshot", "photo", "what do you see")):
         return "vision"
     if any(x in text for x in ("code", "debug", "repository", "pytest", "traceback", "function", "class ")):
         return "coding"
-    if tools:
-        return "tool_use"
     if any(x in text for x in ("plan", "multi-step", "step by step", "autonomous")):
         return "planning"
     if any(x in text for x in ("reason", "analyze", "prove", "compare", "why")):
@@ -125,6 +127,10 @@ class MultiModelProvider:
                 if health.cooldown_until and health.cooldown_until <= now:
                     health.state, health.cooldown_until = "degraded", 0.0
             attempted += 1
+            log.info(
+                "model_route_selected request_id=%s capability=%s provider=%s model=%s route=%s",
+                request_id, capability, route.provider, route.provider_model_name, route.route_id,
+            )
             events.publish("route_selected", request_id=request_id, capability=capability, provider=route.provider, model=route.model_id, route_id=route.route_id, state="active")
             events.publish("model_active", request_id=request_id, capability=capability, provider=route.provider, model=route.model_id, route_id=route.route_id, state="thinking")
             continuation_system = system
@@ -133,9 +139,20 @@ class MultiModelProvider:
             started = time.perf_counter()
             try:
                 response = provider.complete(messages, system=continuation_system, tools=tools, max_tokens=max_tokens, temperature=temperature, timeout=timeout or route.timeout, model=route.provider_model_name, effort=effort, cache=cache, on_text=on_text)
-            except ProviderRequestError:
+            except ProviderRequestError as exc:
                 events.publish("model_error", request_id=request_id, capability=capability, provider=route.provider, model=route.model_id, route_id=route.route_id, state="invalid_request")
-                raise
+                message = str(exc).lower()
+                capability_rejected = capability == "tool_use" and (
+                    "tool calling" in message or "tool use" in message or "tools are not supported" in message
+                )
+                if not capability_rejected:
+                    raise
+                errors.append(f"{route.route_id}: {type(exc).__name__}: {exc}")
+                self.registry.mark_capability_unsupported(route.route_id, capability)
+                self._failed(route, exc)
+                checkpoint.continuation_count += 1
+                events.publish("fallback_started", request_id=request_id, capability=capability, provider=route.provider, model=route.model_id, route_id=route.route_id, state="fallback", reason="unsupported_capability")
+                continue
             except ProviderError as exc:
                 errors.append(f"{route.route_id}: {type(exc).__name__}: {exc}")
                 self._failed(route, exc)

@@ -104,6 +104,27 @@ class FoundationPolishTests(unittest.TestCase):
         self.assertTrue(self.vault.note_exists(mission.authored.job.relative_path))
         self.assertTrue(self.vault.note_exists(mission.authored.preference_path))
 
+    def test_questions_and_deterministic_actions_never_select_lexical_jobs(self):
+        for request in (
+            "Explain in one sentence why the sky is blue.",
+            "What does Python IndexError mean?",
+            "Search for Jynxzi on YouTube.",
+        ):
+            with self.subTest(request=request):
+                session = VaultSession.begin(request, vault=self.vault, index=self.index)
+                self.assertIsNotNone(session.primed)
+                self.assertIsNone(session.primed.job)
+                self.assertIsNone(session.mission)
+
+    def test_real_project_fix_selects_matching_job_and_named_project(self):
+        session = VaultSession.begin(
+            "Open my JARVIS project and fix the IndexError.",
+            vault=self.vault,
+            index=self.index,
+        )
+        self.assertEqual(session.primed.job_title, "Fix Software Bug")
+        self.assertEqual(session.primed.project.title, "JARVIS Project")
+
     def test_explicit_project_name_loads_project_note_and_unrelated_request_skips_daily_notes(self):
         named = self.primer().prime("What is the run command for the JARVIS project?")
         self.assertIn("projects/jarvis.md", named.notes_read)

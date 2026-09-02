@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-CAPABILITIES = frozenset({"fast", "chat", "reasoning", "coding", "vision", "planning", "tool_use", "local"})
+CAPABILITIES = frozenset({"fast", "chat", "reasoning", "coding", "vision", "planning", "tool_use", "structured_output", "local"})
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,9 @@ class ModelRoute:
 def infer_capabilities(model_name: str) -> frozenset[str]:
     name = model_name.lower()
     caps = {"chat"}
+    # These are classifiers, audio generators/transcribers, or provider
+    # orchestration endpoints—not general function-calling chat models.
+    non_tool_roles = ("guard", "safety", "whisper", "orpheus", "lyria", "compound")
     if any(x in name for x in ("flash", "small", "mini", "instant", "8b", "3b", "1b")):
         caps.add("fast")
     if any(x in name for x in ("reason", "deepseek-r1", "qwq", "thinking", "gpt-oss", "kimi")):
@@ -54,9 +57,14 @@ def infer_capabilities(model_name: str) -> frozenset[str]:
         caps.add("coding")
     if any(x in name for x in ("vision", "vl", "multimodal", "gemini")):
         caps.add("vision")
-    if any(x in name for x in ("llama", "qwen", "mistral", "gemini", "gpt", "claude", "command")):
+    if not any(x in name for x in non_tool_roles) and any(x in name for x in ("llama", "qwen", "mistral", "gemini", "gpt", "claude", "command")):
         caps.add("tool_use")
     return frozenset(caps)
+
+
+def _known_non_tool_role(model_name: str) -> bool:
+    name = model_name.lower()
+    return any(x in name for x in ("guard", "safety", "whisper", "orpheus", "lyria", "compound"))
 
 
 class ModelRegistry:
@@ -88,7 +96,19 @@ class ModelRegistry:
 
     def add_route(self, route: ModelRoute) -> None:
         caps = route.capabilities or infer_capabilities(route.provider_model_name)
-        self.add_model(ModelInfo(route.model_id, route.model_id, caps, "tool_use" in caps, "vision" in caps))
+        # Revalidate cached/discovered claims against known model roles so an
+        # old heuristic-produced cache cannot keep a safety/audio model alive
+        # as a tool route after the inference rule is fixed.
+        if _known_non_tool_role(route.provider_model_name):
+            caps = frozenset(caps - {"tool_use"})
+        if caps != route.capabilities:
+            raw = asdict(route)
+            raw["capabilities"] = caps
+            route = ModelRoute(**raw)
+        self.add_model(ModelInfo(
+            route.model_id, route.model_id, caps, "tool_use" in caps, "vision" in caps,
+            context_window=route.metadata.get("context_window"), metadata=dict(route.metadata),
+        ))
         with self._lock:
             self.routes[route.route_id] = route
 
@@ -103,6 +123,18 @@ class ModelRegistry:
         with self._lock:
             routes = [r for r in self.routes.values() if r.enabled and (capability in r.capabilities or capability == "chat")]
         return sorted(routes, key=lambda r: (r.priority, r.provider, r.provider_model_name))
+
+    def mark_capability_unsupported(self, route_id: str, capability: str) -> None:
+        """Persist a provider-confirmed negative capability for a route."""
+        with self._lock:
+            route = self.routes.get(route_id)
+            if route is None or capability not in route.capabilities:
+                return
+            raw = asdict(route)
+            raw["capabilities"] = frozenset(route.capabilities - {capability})
+            raw["metadata"] = {**route.metadata, f"unsupported_{capability}": True}
+            self.routes[route_id] = ModelRoute(**raw)
+        self.save_cache()
 
     def discovery_stale(self, provider: str, now: float | None = None) -> bool:
         return (now or time.time()) - self.discovered_at.get(provider, 0) >= self.cache_ttl_seconds

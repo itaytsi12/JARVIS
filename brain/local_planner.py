@@ -34,14 +34,15 @@ def create_local_plan(command: str) -> list[Action] | None:
 
 
 def parse_local_action(text: str) -> Action | None:
-    lowered = text.lower().strip()
+    text = text.strip().rstrip(".?!,;:")
+    lowered = text.lower()
 
     # -------------------------
     # YouTube search
     # -------------------------
 
     match = re.match(
-        r"^(?:search youtube for|youtube search)\s+(.+)$",
+        r"^(?:search(?: for)?\s+(.+?)\s+on youtube|find\s+(.+?)\s+on youtube|search youtube for\s+(.+)|youtube search\s+(.+))$",
         text,
         flags=re.IGNORECASE
     )
@@ -50,7 +51,7 @@ def parse_local_action(text: str) -> Action | None:
         return Action(
             tool="youtube_search",
             args={
-                "query": match.group(1).strip()
+                "query": next(group for group in match.groups() if group).strip()
             }
         )
 
@@ -92,6 +93,10 @@ def parse_local_action(text: str) -> Action | None:
                 "app_name": APP_ALIASES.get(key,key)
             }
         )
+
+    match = re.match(r"^(?:open|go to)\s+([\w-]+\.(?:com|org|net|io|co|ai))$", text, re.IGNORECASE)
+    if match:
+        return Action(tool="open_website", args={"url": match.group(1)})
 
     match = re.match(
         r"^(?:תפתח|פתח)\s+(.+)$",
@@ -178,7 +183,7 @@ def parse_local_action(text: str) -> Action | None:
     # Generic searches in multi-step commands
     # -------------------------
     search_map = {
-        r"^(?:search google for|google search|google)\s+(.+)$": "https://www.google.com/search?q={}",
+        r"^(?:search(?: for)?\s+(.+?)\s+on google|find\s+(.+?)\s+on google|search google for\s+(.+)|google search\s+(.+)|google\s+(.+))$": "https://www.google.com/search?q={}",
         r"^(?:search youtube for|youtube search|youtube)\s+(.+)$": "https://www.youtube.com/results?search_query={}",
         r"^(?:search reddit for|reddit search|reddit)\s+(.+)$": "https://www.reddit.com/search/?q={}",
         r"^(?:search github for|github search|github)\s+(.+)$": "https://github.com/search?q={}",
@@ -187,7 +192,7 @@ def parse_local_action(text: str) -> Action | None:
     for pattern, template in search_map.items():
         mm = re.match(pattern, text, flags=re.IGNORECASE)
         if mm:
-            q = urllib.parse.quote_plus(mm.group(1).strip())
+            q = urllib.parse.quote_plus(next(group for group in mm.groups() if group).strip())
             return Action(
                 tool="open_website",
                 args={"url": template.format(q)}

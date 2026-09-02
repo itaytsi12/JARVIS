@@ -51,6 +51,23 @@ _TEST_ENVIRONMENT = {
     # every OpenAI call site checks (`JarvisConfig.openai_available`).
     "JARVIS_ALLOW_CLOUD_CALLS": "0",
     "ANTHROPIC_API_KEY": "",
+    "OPENROUTER_API_KEY": "",
+    "GROQ_API_KEY": "",
+    "NVIDIA_API_KEY": "",
+    "CEREBRAS_API_KEY": "",
+    "GOOGLE_API_KEY": "",
+    "MISTRAL_API_KEY": "",
+    "HF_TOKEN": "",
+    "MOONSHOT_API_KEY": "",
+    "GITHUB_TOKEN": "",
+    "VERCEL_AI_GATEWAY_API_KEY": "",
+    # Declared in `config/settings.py` but not yet wired to a provider.
+    # Cleared anyway: the guard is meant to be exhaustive, so wiring one up
+    # later cannot quietly give the suite a live credential.
+    "CLOUDFLARE_API_TOKEN": "",
+    "CLOUDFLARE_ACCOUNT_ID": "",
+    "JARVIS_PROVIDER_ORDER": "anthropic",
+    "ENABLE_ANTHROPIC_FALLBACK": "false",
     "ELEVENLABS_API_KEY": "",
     "ELEVENLABS_VOICE_ID": "",
     # Voice providers: local paths only.
@@ -80,6 +97,21 @@ _TEST_ENVIRONMENT = {
 #: therefore too late: the real, live databases have already been opened.
 #: `tests/test_memory_system.py::test_global_agent_memory_is_isolated_during_pytest`
 #: exists precisely to catch this, and was correctly failing.
+#: Give pytest's own `tmp_path` factory a temp root we know is writable.
+#:
+#: pytest builds `<temproot>/pytest-of-<user>` and reuses it forever. On
+#: this machine that directory exists with broken ACLs -- `os.scandir` and
+#: `mkdir` both raise `PermissionError: [WinError 5]` -- so EVERY test
+#: using `tmp_path` errored before its body ran. That silently included
+#: two of the model-capability regression tests, which meant the behaviour
+#: they cover was never actually being verified.
+#:
+#: `PYTEST_DEBUG_TEMPROOT` is pytest's own supported override. Redirecting
+#: it fixes the suite without deleting anything outside the repository,
+#: and makes the suite robust on any machine whose temp root is poisoned.
+_PYTEST_TEMPROOT = tempfile.mkdtemp(prefix="jarvis-pytest-temproot-")
+os.environ.setdefault("PYTEST_DEBUG_TEMPROOT", _PYTEST_TEMPROOT)
+
 _TEST_ROOT = tempfile.mkdtemp(prefix="jarvis-tests-")
 _TEST_PATHS = {
     "JARVIS_DATA_DIR": _TEST_ROOT,

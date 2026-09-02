@@ -120,6 +120,7 @@ class VaultSession:
                 goal,
                 budget_chars=policy.budget_chars,
                 include_continuity=policy.is_full,
+                select_job=policy.selects_job,
             )
             log.info("Vault priming for %r:\n%s", goal[:80], session.primed.explain())
             _publish(
@@ -177,6 +178,7 @@ class VaultSession:
                 goal,
                 budget_chars=self.policy.budget_chars,
                 include_continuity=self.policy.is_full,
+                select_job=self.policy.selects_job,
             )
             log.info("Authored a new Job for this mission: %s", authored.describe())
             if self.journal is not None:

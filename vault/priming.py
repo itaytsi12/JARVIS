@@ -190,6 +190,7 @@ class Primer:
         budget_chars: int = 6000,
         include_continuity: bool = True,
         mission_brief: str = "",
+        select_job: bool = True,
     ) -> PrimedContext:
         primed = PrimedContext(request=request, budget_chars=budget_chars)
 
@@ -208,7 +209,7 @@ class Primer:
         primed.scanned = scanned
 
         # -- stage 2: decide what is worth reading ---------------------
-        job = self.jobs.select(request)
+        job = self.jobs.select(request) if select_job else None
         primed.job = job
 
         skill_titles: list[str] = []

@@ -74,7 +74,10 @@ def _escalation_helps(complexity) -> bool:
 
 
 def route_command(command: str, context=None) -> dict:
-    text = command.lower().strip()
+    # Sentence-final punctuation from STT must not change routing. Keep the
+    # original `command` for exact payloads, but use one canonical command
+    # shape for deterministic matching and planning.
+    text = command.lower().strip().rstrip(".?!,;:")
 
     if text.rstrip(".?!,;:") in {
         "what are you doing",
@@ -237,6 +240,26 @@ def route_command(command: str, context=None) -> dict:
     music_route = route_music_command(command)
     if music_route is not None:
         return music_route
+
+    # "Open <provider> and search for <query>" does not require two UI
+    # operations: direct search navigation is both faster and more reliable.
+    open_search = re.fullmatch(
+        r"open\s+(youtube|google)\s+and\s+(?:search|find)(?:\s+for)?\s+(.+)",
+        text,
+        re.I,
+    )
+    if open_search:
+        provider, query = open_search.groups()
+        template = (
+            "https://www.youtube.com/results?search_query={}"
+            if provider.lower() == "youtube"
+            else "https://www.google.com/search?q={}"
+        )
+        return {
+            "type": "tool",
+            "tool": "open_website",
+            "arguments": {"url": template.format(urllib.parse.quote_plus(query.strip()))},
+        }
 
     # Deterministic coding-task routing (Part A, Phase A1): a genuine
     # coding/self-improvement request goes to the student-first pipeline
@@ -498,8 +521,8 @@ def route_command(command: str, context=None) -> dict:
         # YouTube / Google / Reddit / GitHub searches (single command)
         # -------------------------
         search_patterns = [
-            (r"^(?:search google for|google search|google)\s+(.+)$", "https://www.google.com/search?q={}"),
-            (r"^(?:search youtube for|youtube search|youtube)\s+(.+)$", "https://www.youtube.com/results?search_query={}"),
+            (r"^(?:search(?: for)?\s+(.+?)\s+on google|find\s+(.+?)\s+on google|search google for\s+(.+)|google search\s+(.+)|google\s+(.+))$", "https://www.google.com/search?q={}"),
+            (r"^(?:search(?: for)?\s+(.+?)\s+on youtube|find\s+(.+?)\s+on youtube|search youtube for\s+(.+)|youtube search\s+(.+)|youtube\s+(.+))$", "https://www.youtube.com/results?search_query={}"),
             (r"^(?:search reddit for|reddit search|reddit)\s+(.+)$", "https://www.reddit.com/search/?q={}"),
             (r"^(?:search github for|github search|github)\s+(.+)$", "https://github.com/search?q={}"),
         ]
@@ -507,7 +530,8 @@ def route_command(command: str, context=None) -> dict:
         for pattern, url_template in search_patterns:
             m = re.match(pattern, text, flags=re.IGNORECASE)
             if m:
-                q = urllib.parse.quote_plus(m.group(1).strip())
+                query = next(group for group in m.groups() if group)
+                q = urllib.parse.quote_plus(query.strip().rstrip(".?!,;:"))
                 return {
                     "type": "tool",
                     "tool": "open_website",

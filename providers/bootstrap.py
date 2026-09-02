@@ -60,6 +60,11 @@ def build_multi_model_provider() -> MultiModelProvider:
         providers["anthropic"] = AnthropicProvider()
     for provider, (model, priority) in _SEEDS.items():
         caps = infer_capabilities(model)
+        # OpenRouter's auto/free router filters downstream models by request
+        # parameters, including tools; it is the configured cross-provider
+        # fallback when a concrete Groq model cannot call tools.
+        if provider == "openrouter" and model == "openrouter/free":
+            caps = caps | {"tool_use"}
         registry.add_route(ModelRoute(f"{provider}:{model}", model, provider, model, priority, credential_ref=provider, capabilities=caps))
     if config.enable_anthropic_fallback:
         registry.add_route(ModelRoute(f"anthropic:{config.agent_model}", config.agent_model, "anthropic", config.agent_model, 1000, free_tier=False, credential_ref="ANTHROPIC_API_KEY", capabilities=frozenset({"chat", "reasoning", "coding", "vision", "planning", "tool_use"})))

@@ -256,3 +256,55 @@ recovery and the morning report are already in place.
   for every reasoning provider, preserves exact payloads, avoids repetitive
   filler, and uses “sir” occasionally rather than mechanically. TTS provider
   selection remains centralized and independent from reasoning-provider choice.
+
+## Live routing repair (2026-09-03)
+
+- Deterministic routing now canonicalizes sentence-final STT punctuation before
+  matching. Volume, site navigation, direct Google/YouTube searches, and simple
+  compound open/navigation commands remain entirely local and bypass vault
+  priming, Jobs, missions, and reasoning providers.
+- Search parsing accepts provider-first and natural provider-last forms and uses
+  URL-encoded direct navigation instead of browser UI clicking.
+- Job selection is gated by request shape before lexical retrieval. General
+  questions and one-shot actions cannot acquire a Job; reusable execution and
+  project-modification missions still can.
+- Tool schemas are now a hard model capability requirement. Known classifier,
+  safety, audio, and provider-orchestration models are excluded from tool use;
+  OpenRouter discovery consumes declared supported parameters, modalities, and
+  context lengths. A provider-confirmed unsupported-tools response removes and
+  caches that capability before falling through to the next compatible route.
+- Tests clear every live cloud credential and disable Anthropic fallback before
+  collection, so routing regressions cannot spend provider credit.
+
+### Completing the repair: two over-narrow gates and a poisoned temp root
+
+The request-shape gate above was correct in direction and too aggressive in
+two places. Both were found by the full suite, and both fixed at the level
+they occur rather than by loosening the gate as a whole.
+
+- **The execution-verb list only named CHANGE verbs.** A request that
+  produces a deliverable or starts a long-running job matched none of them,
+  so "Research the options and write me a summary" -- and, far worse, "run
+  the clipping job tonight" -- were forced down to LIGHT and could not
+  select a Job at all. That is the flagship overnight mission this whole
+  architecture exists for. The list now also covers deliverable verbs
+  (research, write, draft, summarise, generate, design, analyse, review,
+  ...) and work-starting verbs (run, execute, schedule, investigate, ...).
+  This can only ever PREVENT a forced downgrade: the pre-existing scoring
+  still decides FULL vs LIGHT, so an extra verb costs nothing while a
+  missing one silently loses a Job.
+- **A multi-clause request is not a one-shot action.** "Open Apple Music
+  and play the album, then verify it is playing" is a mission whichever
+  verbs it uses, and the ACTION branch downgraded it purely because "play"
+  was not on the verb list. The branch now also consults the existing
+  `_MULTI_STEP` detector, so a sequenced request is never treated as
+  one-shot.
+- **`tmp_path` had never worked on this machine.** pytest reuses
+  `<temproot>/pytest-of-<user>`, and that directory exists here with broken
+  ACLs -- `os.scandir` and `mkdir` both raise `PermissionError: [WinError 5]`.
+  Every test using `tmp_path` errored before its body ran, which silently
+  included two of the new model-capability regression tests: the behaviour
+  they cover was never actually being verified. `tests/conftest.py` now sets
+  pytest's own `PYTEST_DEBUG_TEMPROOT` to a directory it creates, which
+  fixes the suite without deleting anything outside the repository and makes
+  it robust on any machine with a poisoned temp root.

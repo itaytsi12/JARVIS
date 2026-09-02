@@ -145,9 +145,20 @@ class OpenAICompatibleProvider:
             if free_only and not is_free and not str(name).endswith(":free"):
                 continue
             caps = infer_capabilities(str(name))
+            supported = item.get("supported_parameters") if isinstance(item, dict) else None
+            if isinstance(supported, list):
+                if "tools" in supported or "tool_choice" in supported:
+                    caps = caps | {"tool_use"}
+                if "response_format" in supported or "structured_outputs" in supported:
+                    caps = caps | {"structured_output"}
+            architecture = item.get("architecture") if isinstance(item, dict) else None
+            modality = str((architecture or {}).get("modality") or "").lower() if isinstance(architecture, dict) else ""
+            if "image" in modality:
+                caps = caps | {"vision"}
+            context_window = item.get("context_length") if isinstance(item, dict) else None
             if not self.credential_required:
                 caps = caps | {"local"}
-            routes.append(ModelRoute(f"{self.name}:{name}", str(name), self.name, str(name), priority, free_tier=is_free or not self.credential_required, timeout=self.timeout, base_url=self.base_url, capabilities=caps, metadata={"discovered": True}))
+            routes.append(ModelRoute(f"{self.name}:{name}", str(name), self.name, str(name), priority, free_tier=is_free or not self.credential_required, timeout=self.timeout, base_url=self.base_url, capabilities=caps, metadata={"discovered": True, "context_window": context_window, "supported_parameters": supported or []}))
         return routes
 
 
