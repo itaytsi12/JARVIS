@@ -85,7 +85,7 @@ all. All three are general fixes, not per-variable patches:
 | Before any change | 0 (43 collection errors) | - | - | 43 |
 | After the empty-`.env` fix alone | 2016 | 1950 | 51 | 1 |
 | After the interpreter + isolation fixes | 2016 | 1986 | 7 | 1 |
-| After the cloud-call switch | 2040 | see final report | | |
+| **Final** | **2153** | **2131** (+22 skipped) | **0** | 1 |
 
 The 7 that appeared at step three were not regressions: they were tests
 that had been making REAL, paid OpenAI calls on the user's own key during
@@ -178,6 +178,37 @@ startup/launcher.py        vault readiness + startup recovery
 tests/conftest.py          import-time isolation, vault redirected
 + 13 modules               empty-tolerant env reads
 ```
+
+## Measured results
+
+| What | Measurement |
+| --- | --- |
+| Full suite | 2131 passed, 22 skipped, 0 failed, 1 environmental error (9m27s) |
+| Vault tests added | 129 |
+| Deterministic routing | 0.01-0.10ms per command (unchanged) |
+| Priming, 418-note vault, cold | 1,660ms |
+| Priming, 418-note vault, warm | ~350ms (one filesystem scan) |
+| Scan vs full read | 57 summaries scanned, 5 notes read, 2,332 of 6,000 budgeted chars |
+| Vault content vs context | 1,544 of 505,360 characters reached the model |
+
+## Known issues
+
+1. `tests/test_multi_model_backend.py::test_registry_cache_last_known_good`
+   errors inside pytest's own `tmp_path` fixture with
+   `PermissionError: [WinError 5]` on this machine's
+   `Temp\pytest-of-Ori` directory. Its ACLs are broken at the OS level --
+   `icacls` cannot even read it. Removing that directory as Administrator
+   fixes it. Not done here: it is outside the repository, and deleting a
+   user directory is not this task's call.
+2. Ranking is lexical, not semantic. A note describing the same thing in
+   entirely different words will not rank. The note format compensates
+   (every note carries a hand-written summary and tags), and an embedding
+   stage could be added behind the same `VaultRetriever.scan` interface
+   without changing anything above it.
+3. `memory/memory_manager.py::export_obsidian` is a pre-existing,
+   separate, off-by-default one-way export of SQLite entities to
+   Markdown. It is unrelated to this vault and was left alone; do not
+   confuse the two.
 
 ## Next action
 
