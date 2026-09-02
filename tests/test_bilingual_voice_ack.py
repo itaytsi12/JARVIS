@@ -55,11 +55,11 @@ class ContextualAckComposerTests(unittest.TestCase):
 
     def test_cloud_plan_type_gets_generic_check_phrase(self):
         route = {"type": "plan", "message": "what's the weather tomorrow?"}
-        self.assertEqual(compose_contextual_ack(route), "I'll check that, sir.")
+        self.assertEqual(compose_contextual_ack(route), "Understood.")
 
     def test_unknown_tool_falls_back_to_generic_on_it(self):
         route = {"type": "tool", "tool": "some_future_tool", "arguments": {}}
-        self.assertEqual(compose_contextual_ack(route), "On it, sir.")
+        self.assertEqual(compose_contextual_ack(route), "On it.")
 
     def test_never_claims_completion(self):
         # Good: "Opening YouTube, sir." Bad: "YouTube is open, sir."

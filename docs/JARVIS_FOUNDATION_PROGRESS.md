@@ -227,3 +227,32 @@ tests/conftest.py          import-time isolation, vault redirected
 Foundation complete. The natural next step is the Clipping Job's Skills;
 the Job note, the mission machinery, the long-running loop, the restart
 recovery and the morning report are already in place.
+
+## Voice foundation polish (2026-09-02)
+
+- Local speech recognition now stays warm and produces incremental in-memory
+  partials from the existing single microphone stream. Stable partials reuse
+  the existing deterministic safe-action ledger; the final full transcript is
+  authoritative, and partials are never written to training data or the vault.
+- Safe stable commands can endpoint after 450 ms of silence. Other requests use
+  the configured 750 ms local threshold, preserving natural pauses and the
+  existing barge-in state machine.
+- `WHISPER_MODEL=` now correctly selects a language-aware default. Controlled
+  offline Windows SAPI measurements on the target machine (RTX 2060 6 GB,
+  6-core/12-thread AMD CPU, 16 GB RAM) selected `base.en`, int8, beam size 1:
+
+| Cached model | Warm latency range | Controlled-corpus result |
+| --- | ---: | --- |
+| `tiny.en` | 0.63-0.73 s | Perfect short commands; errors in a location and one long-query word |
+| `base.en` | 0.95-1.08 s | Perfect short commands and long query; same synthetic location-name ambiguity |
+| `small.en` | 3.85-4.72 s | Perfect short commands and long query; same synthetic location-name ambiguity |
+
+- NVIDIA Parakeet/Nemotron streaming models were investigated but not installed:
+  this environment has neither PyTorch nor NeMo, their Python path adds a large
+  runtime/model footprint, and available RAM was constrained. Faster-Whisper
+  `base.en` is the measured low-risk fit; Whisper remains the fallback when a
+  configured ElevenLabs realtime session fails.
+- The shared agent system prompt now defines one concise, capable personality
+  for every reasoning provider, preserves exact payloads, avoids repetitive
+  filler, and uses “sir” occasionally rather than mechanically. TTS provider
+  selection remains centralized and independent from reasoning-provider choice.

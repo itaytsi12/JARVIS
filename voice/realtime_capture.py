@@ -83,6 +83,10 @@ class RealtimeSTTController:
     def available(self) -> bool:
         return self._session is not None and self._connect_error is None and not self._send_failed
 
+    @property
+    def has_stable_partial(self) -> bool:
+        return self.ledger.has_fired_anything()
+
     def feed(self, pcm_bytes: bytes) -> None:
         if self._closed or self._send_failed:
             return

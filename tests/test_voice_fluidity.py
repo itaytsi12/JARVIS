@@ -144,7 +144,7 @@ class ProcessCaptureReconciliationTests(unittest.TestCase):
              patch("brain.agent.run_agent", side_effect=fake_run_agent), \
              patch.object(assistant, "_start_speech_task", side_effect=fake_speech):
             assistant._process_capture([np.zeros(1280, dtype="int16")])
-        self.assertEqual(call_order[0], ("speech", "I'll check that, sir."))
+        self.assertEqual(call_order[0], ("speech", "Understood."))
         self.assertIn("run_agent", call_order)
 
 

@@ -27,10 +27,10 @@ from tools.registry import WEBSITE_ALIASES
 # contextual one. Never derived from the command or response text, so it
 # can never leak foreign-language content into TTS.
 _GENERIC_ACKNOWLEDGEMENTS = (
-    "Okay, on it, sir.",
-    "Certainly, sir.",
-    "Right away, sir.",
-    "On it, sir.",
+    "On it.",
+    "Certainly.",
+    "Right away.",
+    "Understood.",
 )
 
 #: Same rule for a failed Hebrew-mode command: one short, generic, English
@@ -52,7 +52,7 @@ def generic_failure_message() -> str:
     return _GENERIC_FAILURE_MESSAGE
 
 
-_FALLBACK_ACK = "On it, sir."
+_FALLBACK_ACK = "On it."
 
 
 def _ack_for_tool(tool: str | None, args: dict) -> str | None:
@@ -133,11 +133,11 @@ def compose_contextual_ack(route: dict | None) -> str:
     if rtype == "tool":
         return _ack_for_tool(route.get("tool"), route.get("arguments") or {}) or _FALLBACK_ACK
     if rtype in ("plan", "ai"):
-        return "I'll check that, sir."
+        return "Understood."
     if rtype == "remember":
         return "I'll remember that, sir."
     if rtype == "agent_task":
-        return "I'll work on that, sir."
+        return "Understood."
     if rtype == "local_plan":
         actions = route.get("actions") or []
         if actions:

@@ -152,7 +152,7 @@ class VoiceDispatchTests(unittest.TestCase):
     def test_the_agent_answer_is_spoken_rather_than_flattened(self):
         from voice.response_formatter import compose_contextual_ack, format_spoken_response
 
-        self.assertEqual(compose_contextual_ack({"type": "agent_task"}), "I'll work on that, sir.")
+        self.assertEqual(compose_contextual_ack({"type": "agent_task"}), "Understood.")
         spoken = format_spoken_response(
             "agent: organize downloads",
             {"type": "agent_task"},

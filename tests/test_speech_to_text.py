@@ -43,7 +43,20 @@ class WhisperModelSelectionTests(unittest.TestCase):
             env.pop("WHISPER_MODEL", None)
             with patch.dict(os.environ, env, clear=True):
                 stt._get_model()
-        self.assertEqual(captured["model_size"], "small.en")
+        self.assertEqual(captured["model_size"], "base.en")
+
+    def test_blank_whisper_model_uses_language_default(self):
+        captured = {}
+
+        def fake_ctor(model_size, **kwargs):
+            captured["model_size"] = model_size
+            return MagicMock()
+
+        with patch.dict(os.environ, {"VOICE_LANGUAGE": "en", "WHISPER_MODEL": ""}, clear=False), \
+             patch.object(stt, "_AVAILABLE", True), \
+             patch.object(stt, "WhisperModel", side_effect=fake_ctor):
+            stt._get_model()
+        self.assertEqual(captured["model_size"], "base.en")
 
     def test_hebrew_mode_defaults_to_multilingual_model_not_dot_en(self):
         captured = {}

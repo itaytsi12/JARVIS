@@ -53,7 +53,7 @@ class CodingTaskDispatchTests(unittest.TestCase):
     def test_student_solved_speech(self):
         result = CodingTaskResult(task="fix this bug", candidate_id="c1", started_at="t", solved_by="student")
         calls = self._run_and_capture_speech(result)
-        self.assertEqual(calls[0], "Let me look into that, sir.")
+        self.assertEqual(calls[0], "Understood.")
         self.assertEqual(calls[1], "I fixed it myself, sir.")
 
     def test_no_active_student_still_reports_teacher_result(self):

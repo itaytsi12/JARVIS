@@ -93,7 +93,7 @@ STILL_THINKING = "I'm working through what I found, sir."
 #: How long a gap in speech may last before the heartbeat fills it. Long
 #: enough that a normally-paced task never triggers it, short enough that a
 #: minute of model reasoning is not a minute of silence.
-MAX_SILENCE_SECONDS = 12.0
+MAX_SILENCE_SECONDS = 20.0
 
 
 @dataclass
@@ -168,8 +168,12 @@ class AgentNarrator:
             if now - reference < self.max_silence:
                 return False
             phrase = STILL_RUNNING if self._tool_in_flight else STILL_THINKING
-            # A heartbeat may repeat where a progress line may not: after
-            # twelve more seconds of silence, saying it again is useful.
+            # Do not repeat identical filler. Real tool events can still
+            # produce a different, useful status update.
+            if phrase == self._last_phrase:
+                self.suppressed += 1
+                self._last_spoken_at = now
+                return False
             self._last_spoken_at = now
             self._last_phrase = phrase
             self.spoken.append(phrase)

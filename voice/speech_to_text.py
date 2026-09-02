@@ -51,8 +51,11 @@ def _create_model(model_size: Optional[str] = None):
 		# expects more than one language gets the multilingual model. Only
 		# ever loads ONE model per process (the module-level singleton below
 		# is keyed by whichever size this resolves to), never both.
-		default_model = "small.en" if expected_input_languages(voice_language) == ("en",) else "small"
-		model_size = model_size or os.getenv("WHISPER_MODEL", default_model)
+		default_model = "base.en" if expected_input_languages(voice_language) == ("en",) else "small"
+		# Treat an explicitly blank value like an unset value. `.env.example`
+		# intentionally leaves this blank so language-aware defaults apply.
+		configured_model = os.getenv("WHISPER_MODEL", "").strip()
+		model_size = (model_size or "").strip() or configured_model or default_model
 
 		# Prefer CPU by default to avoid cublas/cuda DLL errors on Windows
 		# machines that don't have CUDA configured. Users can still override
@@ -123,7 +126,7 @@ def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
 		language=whisper_language,
 		task="transcribe",
 		initial_prompt=initial_prompt,
-		beam_size=5,
+		beam_size=max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1") or "1")),
 		temperature=0.0,
 		vad_filter=True,
 		condition_on_previous_text=False,
@@ -166,7 +169,7 @@ def transcribe_audio(path: str, model_size: Optional[str] = None) -> str:
 			language=fallback_language,
 			task="transcribe",
 			initial_prompt=_ENGLISH_INITIAL_PROMPT if fallback_language == "en" else None,
-			beam_size=5,
+			beam_size=max(1, int(os.getenv("WHISPER_BEAM_SIZE", "1") or "1")),
 			temperature=0.0,
 			vad_filter=True,
 			condition_on_previous_text=False,

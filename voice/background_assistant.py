@@ -90,6 +90,7 @@ class AlwaysOnAssistant:
         self.wake_enabled = os.getenv("WAKE_WORD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         self.muted = False
         self.silence_seconds = env_float("COMMAND_SILENCE_SECONDS", 1.0)
+        self.fast_silence_seconds = env_float("COMMAND_FAST_SILENCE_SECONDS", 0.45)
         self.max_seconds = env_float("COMMAND_MAX_SECONDS", 15)
         self.no_speech_seconds = env_float("COMMAND_NO_SPEECH_SECONDS", 4)
         self.cooldown_seconds = env_float("WAKE_COOLDOWN_SECONDS", 1.25)
@@ -291,7 +292,8 @@ class AlwaysOnAssistant:
                 if rms >= self.speech_rms:
                     speech_after_wake, last_speech = True, now
                 elapsed = now - listen_started
-                finished = speech_after_wake and last_speech is not None and now - last_speech >= self.silence_seconds
+                endpoint = self.fast_silence_seconds if realtime is not None and realtime.has_stable_partial else self.silence_seconds
+                finished = speech_after_wake and last_speech is not None and now - last_speech >= endpoint
                 no_speech = not speech_after_wake and elapsed >= self.no_speech_seconds
                 if finished or no_speech or elapsed >= self.max_seconds:
                     if last_speech is not None:
@@ -312,7 +314,7 @@ class AlwaysOnAssistant:
         elevenlabs_transcript = None
         ledger = realtime.ledger if realtime is not None else None
         if realtime is not None:
-            commit_timeout = env_float("ELEVENLABS_STT_COMMIT_TIMEOUT", 5.0)
+            commit_timeout = env_float("STT_COMMIT_TIMEOUT", env_float("ELEVENLABS_STT_COMMIT_TIMEOUT", 5.0))
             elevenlabs_transcript = realtime.commit_and_close(timeout=commit_timeout)
         self._process_capture(capture, elevenlabs_transcript=elevenlabs_transcript, ledger=ledger, perf=perf)
         self._stop.wait(self.cooldown_seconds)
@@ -455,7 +457,16 @@ class AlwaysOnAssistant:
         interaction ends. Returns None (never raises) if ElevenLabs STT is
         not configured/enabled or fails to start -- the caller's existing
         Whisper-based capture path is entirely unaffected either way."""
-        if not self._elevenlabs_stt_enabled():
+        provider = os.getenv("STT_PROVIDER", "whisper").strip().lower() or "whisper"
+        if provider == "whisper" and os.getenv("WHISPER_STREAMING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}:
+            from .local_realtime_stt import LocalRealtimeSTTController
+            controller = LocalRealtimeSTTController(
+                perf=perf, on_speculative_action=self._on_speculative_action,
+                sample_rate=self.wake_engine.sample_rate,
+            )
+            controller.start()
+            return controller
+        if provider != "elevenlabs" or not self._elevenlabs_stt_enabled():
             return None
         try:
             from .realtime_capture import RealtimeSTTController
@@ -635,7 +646,7 @@ class AlwaysOnAssistant:
                     if resolve_utterance_language(transcript) == "he":
                         self._start_speech_task(generic_acknowledgement(), "en", None)
                     else:
-                        self._start_speech_task("I'll work on that, sir.", "en", None)
+                        self._start_speech_task("Understood.", "en", None)
                 self._start_cancellable_action_task(command,route,interaction_id,transcript,narrate=True)
                 return
             needs_planning = self._command_needs_planning(command, route)
@@ -1035,7 +1046,7 @@ class AlwaysOnAssistant:
             token = CancellationToken()
             self._learning_token = token
         task_id = register_interactive_task(token)
-        self._start_speech_task("Let me look into that, sir.", "en", interaction_id)
+        self._start_speech_task("Understood.", "en", interaction_id)
 
         def work() -> None:
             try:
