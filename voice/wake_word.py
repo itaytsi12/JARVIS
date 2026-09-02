@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from config.settings import env_float, env_int
 from pathlib import Path
 
 
@@ -18,7 +19,7 @@ class OpenWakeWordEngine:
     frame_samples = 1280
 
     def __init__(self, threshold: float | None = None, model_dir: Path | None = None):
-        self.threshold = threshold if threshold is not None else float(os.getenv("WAKE_WORD_THRESHOLD", "0.5"))
+        self.threshold = threshold if threshold is not None else env_float("WAKE_WORD_THRESHOLD", 0.5)
         self.model_dir = Path(model_dir or MODEL_DIR)
         self.model = None
         self.model_name = "hey_jarvis_v0.1"

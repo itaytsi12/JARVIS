@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import logging
 import os
+from config.settings import env_float, env_int
 import subprocess
 import threading
 import time
@@ -64,7 +65,7 @@ from typing import Any
 log = logging.getLogger("jarvis.browser_authenticated")
 
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = int(os.getenv("JARVIS_CDP_PORT", "9222"))
+DEFAULT_PORT = env_int("JARVIS_CDP_PORT", 9222)
 # Safe, non-secret diagnostic logging (URL transitions, popups, console/page
 # errors, failed-request status codes -- never headers/cookies/tokens/
 # request or response bodies). Off by default; see `attach_diagnostics`.

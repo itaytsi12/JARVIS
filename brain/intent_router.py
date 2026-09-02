@@ -176,7 +176,32 @@ TOOLS = [
 ]
 
 
+def cloud_intent_available() -> bool:
+    """Is the cloud intent classifier usable right now?
+
+    Same shape as every other optional layer in this codebase: the local
+    intent service degrades when it is not running, the agent runtime
+    degrades when no provider is configured, and this degrades when no
+    OpenAI call may be made.
+    """
+    from config import get_config
+
+    return get_config().openai_available
+
+
 def classify_intent(message: str):
+    if not cloud_intent_available():
+        # No paid call is possible, so say so honestly and let the caller
+        # fall through to conversational handling. Raising here would turn
+        # "no cloud credential" into a crashed command.
+        return {
+            "type": "ai",
+            "message": message,
+            "route_source": "cloud_intent_unavailable",
+            "model": None,
+            "model_calls": 0,
+            "fallback_reason": "no_openai_credential",
+        }
     # UI/status hook: brackets THIS real request with
     # started/succeeded/failed events (config/events.py). It only
     # observes -- the request below is unchanged, and a subscriber

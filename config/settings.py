@@ -72,6 +72,22 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+#: Public, empty-tolerant environment readers.
+#:
+#: A variable that is PRESENT BUT EMPTY in `.env` (`FOO=`) is what
+#: `os.getenv("FOO", "1800")` returns as `""`, not as the default -- so a
+#: bare `float(os.getenv(...))` at module scope raises
+#: `ValueError: could not convert string to float: ''` and takes the whole
+#: import down with it. That is not hypothetical: one blank line in `.env`
+#: made `brain/context_resolver.py` unimportable and every test in the
+#: suite fail to collect. Modules that still read their own environment
+#: must use these rather than a bare cast, so "unset" and "set to nothing"
+#: both mean "use the default".
+env_flag = _flag
+env_int = _int
+env_float = _float
+
+
 def _text(name: str, default: str = "") -> str:
     raw = os.getenv(name)
     return default if raw is None or raw.strip() == "" else raw.strip()
@@ -141,6 +157,21 @@ class JarvisConfig:
     max_consecutive_failures: int = field(default_factory=lambda: _int("JARVIS_MAX_CONSECUTIVE_FAILURES", 4))
     agent_task_timeout: float = field(default_factory=lambda: _float("JARVIS_AGENT_TASK_TIMEOUT", 900.0))
 
+    # ---- outbound paid calls ----------------------------------------
+    #: The single switch for "may this process make a paid cloud call".
+    #:
+    #: `openai_api_key` is read here rather than by each call site so
+    #: there is one answer to "is a cloud call possible", the same way
+    #: `providers/registry.py::agent_escalation_available` is the single
+    #: answer for the agent provider. `cloud_calls_enabled` is what the
+    #: test suite sets to false: a fake-but-non-empty key is not "absent"
+    #: to the OpenAI SDK, so before this existed the suite genuinely
+    #: reached `api.openai.com` on the user's real key during collection
+    #: (the key was captured at import time, before test isolation ran)
+    #: and spent real money on ordinary routing tests.
+    openai_api_key: str | None = field(default_factory=lambda: _secret("OPENAI_API_KEY"), repr=False)
+    cloud_calls_enabled: bool = field(default_factory=lambda: _flag("JARVIS_ALLOW_CLOUD_CALLS", True))
+
     # ---- escalation --------------------------------------------------
     agent_enabled: bool = field(default_factory=lambda: _flag("JARVIS_AGENT_ENABLED", True))
     agent_escalation_enabled: bool = field(default_factory=lambda: _flag("JARVIS_AGENT_ESCALATION", True))
@@ -200,6 +231,15 @@ class JarvisConfig:
     @property
     def has_anthropic_credentials(self) -> bool:
         return bool(self.anthropic_api_key)
+
+    @property
+    def openai_available(self) -> bool:
+        """May an OpenAI call actually be made right now?
+
+        Every OpenAI call site asks this instead of assuming a key that is
+        merely present is a key that may be used.
+        """
+        return bool(self.openai_api_key) and self.cloud_calls_enabled
 
     def describe(self) -> dict[str, object]:
         """A log-safe view: secrets become a presence flag, never a value."""

@@ -31,6 +31,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Sequence
@@ -107,6 +108,29 @@ def classify_command(command: str | Sequence[str]) -> dict:
     return {"allowed": True, "risk": "safe", "reason": None, "argv": argv, "command": raw}
 
 
+def _resolve_interpreter(argv: Sequence[str]) -> list[str]:
+    """`python ...` means the interpreter JARVIS is running under.
+
+    A bare `python` resolves through PATH to whichever interpreter happens
+    to come first, which on a developer machine is regularly not the one
+    holding JARVIS's dependencies -- so `python -m pytest` reported
+    `No module named pytest` and the agent scored a perfectly good project
+    as broken. The interpreter running JARVIS is the one with JARVIS's
+    environment, and it is the only defensible meaning of "python" here.
+
+    An explicit path (a repository's own virtualenv interpreter, say) is a
+    deliberate choice and is never rewritten.
+    """
+    if not argv:
+        return list(argv)
+    first = str(argv[0])
+    if first.lower() in {"python", "py", "python3", "python.exe", "py.exe"} and not any(
+        separator in first for separator in ("/", "\\")
+    ):
+        return [sys.executable, *[str(item) for item in argv[1:]]]
+    return [str(item) for item in argv]
+
+
 def run_command(
     command: str | Sequence[str],
     working_directory: str | None = None,
@@ -137,7 +161,7 @@ def run_command(
             "timed_out": False,
         }
 
-    argv = decision["argv"]
+    argv = _resolve_interpreter(decision["argv"])
     cwd = Path(working_directory).expanduser().resolve() if working_directory else Path.cwd()
     if not cwd.is_dir():
         return {

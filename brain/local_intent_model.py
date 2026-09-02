@@ -1,5 +1,6 @@
 import json
 import os
+from config.settings import env_float, env_int
 import re
 from typing import Optional
 from urllib.parse import quote_plus, urlparse
@@ -10,7 +11,7 @@ from config import events
 
 
 INTENT_SERVICE_URL = "http://127.0.0.1:5050/predict"
-INTENT_SERVICE_TIMEOUT = float(os.getenv("JARVIS_INTENT_SERVICE_TIMEOUT", "0.35"))
+INTENT_SERVICE_TIMEOUT = env_float("JARVIS_INTENT_SERVICE_TIMEOUT", 0.35)
 
 MIN_CONFIDENCE = 0.70
 

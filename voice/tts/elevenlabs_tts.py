@@ -16,6 +16,7 @@ ID and model are always read from `ELEVENLABS_VOICE_ID` /
 from __future__ import annotations
 
 import os
+from config.settings import env_float, env_int
 import threading
 from typing import Callable, Optional
 
@@ -32,7 +33,7 @@ _CURRENT_RESPONSE_LOCK = threading.Lock()
 
 def _sample_rate() -> int:
     try:
-        return int(os.getenv("ELEVENLABS_TTS_SAMPLE_RATE", "24000"))
+        return env_int("ELEVENLABS_TTS_SAMPLE_RATE", 24000)
     except ValueError:
         return 24000
 
@@ -78,8 +79,8 @@ def stream_pcm_chunks(text: str, *, timeout: float = 20.0, chunk_bytes: int = 40
         "text": text,
         "model_id": model_id,
         "voice_settings": {
-            "stability": float(os.getenv("ELEVENLABS_TTS_STABILITY", "0.5")),
-            "similarity_boost": float(os.getenv("ELEVENLABS_TTS_SIMILARITY", "0.75")),
+            "stability": env_float("ELEVENLABS_TTS_STABILITY", 0.5),
+            "similarity_boost": env_float("ELEVENLABS_TTS_SIMILARITY", 0.75),
         },
     }
     response = requests.post(url, headers=_headers(), params=params, json=payload, stream=True, timeout=timeout)

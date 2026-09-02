@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from config.settings import env_float, env_int
 import re
 import tempfile
 import threading
@@ -78,11 +79,11 @@ class AlwaysOnAssistant:
         self.status_detail = "Starting"
         self.wake_enabled = os.getenv("WAKE_WORD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         self.muted = False
-        self.silence_seconds = float(os.getenv("COMMAND_SILENCE_SECONDS", "1.0"))
-        self.max_seconds = float(os.getenv("COMMAND_MAX_SECONDS", "15"))
-        self.no_speech_seconds = float(os.getenv("COMMAND_NO_SPEECH_SECONDS", "4"))
-        self.cooldown_seconds = float(os.getenv("WAKE_COOLDOWN_SECONDS", "1.25"))
-        self.speech_rms = float(os.getenv("COMMAND_SPEECH_RMS", "350"))
+        self.silence_seconds = env_float("COMMAND_SILENCE_SECONDS", 1.0)
+        self.max_seconds = env_float("COMMAND_MAX_SECONDS", 15)
+        self.no_speech_seconds = env_float("COMMAND_NO_SPEECH_SECONDS", 4)
+        self.cooldown_seconds = env_float("WAKE_COOLDOWN_SECONDS", 1.25)
+        self.speech_rms = env_float("COMMAND_SPEECH_RMS", 350)
         self.debug_audio = os.getenv("JARVIS_DEBUG_AUDIO", "false").lower() in {"1", "true", "yes"}
         self.performance_debug = os.getenv("PERFORMANCE_DEBUG", "false").lower() in {"1", "true", "yes", "on"}
         self._perf_started = None
@@ -232,7 +233,7 @@ class AlwaysOnAssistant:
                 now = self.clock()
                 if self.state is AssistantState.SPEAKING:
                     detected,score=self.wake_engine.process(frame) if self.wake_enabled else (False,0.0)
-                    speaking_threshold=float(os.getenv("JARVIS_TTS_WAKE_THRESHOLD","0.8"))
+                    speaking_threshold=env_float("JARVIS_TTS_WAKE_THRESHOLD", 0.8)
                     if detected and score>=speaking_threshold:
                         from .text_to_speech import stop as stop_speech
                         stop_started=time.perf_counter();stop_speech()
@@ -301,7 +302,7 @@ class AlwaysOnAssistant:
         elevenlabs_transcript = None
         ledger = realtime.ledger if realtime is not None else None
         if realtime is not None:
-            commit_timeout = float(os.getenv("ELEVENLABS_STT_COMMIT_TIMEOUT", "5.0"))
+            commit_timeout = env_float("ELEVENLABS_STT_COMMIT_TIMEOUT", 5.0)
             elevenlabs_transcript = realtime.commit_and_close(timeout=commit_timeout)
         self._process_capture(capture, elevenlabs_transcript=elevenlabs_transcript, ledger=ledger, perf=perf)
         self._stop.wait(self.cooldown_seconds)

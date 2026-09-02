@@ -1,4 +1,5 @@
 from __future__ import annotations
+from config.settings import env_float, env_int
 import atexit,hashlib,json,logging,os,queue,shutil,sqlite3,sys,tempfile,threading,time,uuid
 from collections import deque
 from datetime import datetime,timedelta,timezone
@@ -15,7 +16,7 @@ class DatasetRecorder:
     def __init__(self,path=None,enabled=None,async_writes=True):
         self.enabled=(os.getenv("TRAINING_DATA_ENABLED","true").lower() in {"1","true","yes"}) if enabled is None else enabled
         self.path=Path(path or os.getenv("TRAINING_DATA_DB_PATH") or Path.cwd()/"data"/"training_dataset.sqlite3")
-        self.dedup=os.getenv("TRAINING_DEDUP_ENABLED","true").lower() in {"1","true","yes"}; self.max_mb=int(os.getenv("TRAINING_MAX_LOCAL_MB","512")); self.raw_days=int(os.getenv("TRAINING_RAW_RETENTION_DAYS","30")); self.capture_audio=os.getenv("TRAINING_CAPTURE_AUDIO","false").lower() in {"1","true","yes"}
+        self.dedup=os.getenv("TRAINING_DEDUP_ENABLED","true").lower() in {"1","true","yes"}; self.max_mb=env_int("TRAINING_MAX_LOCAL_MB", 512); self.raw_days=env_int("TRAINING_RAW_RETENTION_DAYS", 30); self.capture_audio=os.getenv("TRAINING_CAPTURE_AUDIO","false").lower() in {"1","true","yes"}
         self.log=logging.getLogger("jarvis.training_data"); self._seq={}; self._lock=threading.Lock(); self._db_lock=threading.RLock(); self._queue=queue.Queue(maxsize=10000);self._overflow=deque(maxlen=1000);self._overflow_lock=threading.Lock();self._dropped_events=0; self._disabled_reason=None; self._async=async_writes; self._connection=None;self._closed=False
         if self.enabled:
             try:self._open()

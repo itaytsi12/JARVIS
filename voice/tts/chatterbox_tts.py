@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+from config.settings import env_float, env_int
 import time
 import subprocess
 import threading
@@ -22,7 +23,7 @@ from urllib.error import URLError, HTTPError
 from tools.windows_process import hidden_process_kwargs
 
 # Configuration: service port and venv location
-_SERVICE_PORT = int(os.environ.get('JARVIS_CHATTERBOX_PORT', '5002'))
+_SERVICE_PORT = env_int('JARVIS_CHATTERBOX_PORT', 5002)
 _SERVICE_URL = f'http://127.0.0.1:{_SERVICE_PORT}'
 _VENV_DIR = Path(__file__).resolve().parents[2] / '.venv-chatterbox'
 _VENV_PY = _VENV_DIR / 'Scripts' / 'python.exe'

@@ -35,6 +35,7 @@ AgentRuntime with the ambiguity made explicit).
 from __future__ import annotations
 
 import os
+from config.settings import env_float, env_int
 import re
 import time
 from dataclasses import dataclass, field
@@ -43,14 +44,14 @@ from typing import Any
 from brain.session_context import SessionContext
 
 # -- configurable TTLs (section 13: "context must not live forever") -------
-APP_REFERENCE_TTL_SECONDS = float(os.getenv("JARVIS_CONTEXT_APP_TTL_SECONDS", "1800"))
-RESULT_SET_TTL_SECONDS = float(os.getenv("JARVIS_CONTEXT_RESULT_SET_TTL_SECONDS", "600"))
-TASK_CONTEXT_TTL_SECONDS = float(os.getenv("JARVIS_CONTEXT_TASK_TTL_SECONDS", "1800"))
-ERROR_CONTEXT_TTL_SECONDS = float(os.getenv("JARVIS_CONTEXT_ERROR_TTL_SECONDS", "1800"))
-COMMAND_CONTEXT_TTL_SECONDS = float(os.getenv("JARVIS_CONTEXT_COMMAND_TTL_SECONDS", "600"))
-PROJECT_CONTEXT_TTL_SECONDS = float(os.getenv("JARVIS_CONTEXT_PROJECT_TTL_SECONDS", str(24 * 3600)))
-FILE_CONTEXT_TTL_SECONDS = float(os.getenv("JARVIS_CONTEXT_FILE_TTL_SECONDS", "1800"))
-RECENCY_HALF_LIFE_SECONDS = float(os.getenv("JARVIS_CONTEXT_RECENCY_HALF_LIFE_SECONDS", "120"))
+APP_REFERENCE_TTL_SECONDS = env_float("JARVIS_CONTEXT_APP_TTL_SECONDS", 1800)
+RESULT_SET_TTL_SECONDS = env_float("JARVIS_CONTEXT_RESULT_SET_TTL_SECONDS", 600)
+TASK_CONTEXT_TTL_SECONDS = env_float("JARVIS_CONTEXT_TASK_TTL_SECONDS", 1800)
+ERROR_CONTEXT_TTL_SECONDS = env_float("JARVIS_CONTEXT_ERROR_TTL_SECONDS", 1800)
+COMMAND_CONTEXT_TTL_SECONDS = env_float("JARVIS_CONTEXT_COMMAND_TTL_SECONDS", 600)
+PROJECT_CONTEXT_TTL_SECONDS = env_float("JARVIS_CONTEXT_PROJECT_TTL_SECONDS", 24 * 3600)
+FILE_CONTEXT_TTL_SECONDS = env_float("JARVIS_CONTEXT_FILE_TTL_SECONDS", 1800)
+RECENCY_HALF_LIFE_SECONDS = env_float("JARVIS_CONTEXT_RECENCY_HALF_LIFE_SECONDS", 120)
 
 
 @dataclass

@@ -21,6 +21,13 @@ client = OpenAI(
 
 
 def create_plan(message: str) -> list[dict]:
+    from brain.intent_router import cloud_intent_available
+
+    if not cloud_intent_available():
+        # An empty plan is this function's existing "I could not plan
+        # that" answer, and every caller already handles it. Raising a
+        # 401 instead would turn a missing credential into a crash.
+        return []
     # UI/status hook: brackets THIS real request with
     # started/succeeded/failed events (config/events.py). It only
     # observes -- the request below is unchanged, and a subscriber

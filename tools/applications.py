@@ -2,6 +2,7 @@ import subprocess
 import time
 import ctypes
 import os
+from config.settings import env_float, env_int
 import shutil
 import logging
 import json
@@ -24,7 +25,7 @@ _START_APPS_LOCK=threading.Lock()
 
 def _start_apps_catalog() -> list[dict]:
     global _START_APPS_CACHE,_START_APPS_CACHE_AT
-    ttl=max(0.0,float(os.getenv("JARVIS_START_APPS_CACHE_TTL","300")));now=time.monotonic()
+    ttl=max(0.0,env_float("JARVIS_START_APPS_CACHE_TTL", 300));now=time.monotonic()
     with _START_APPS_LOCK:
         if _START_APPS_CACHE is not None and now-_START_APPS_CACHE_AT<ttl:return list(_START_APPS_CACHE)
         script="Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress"

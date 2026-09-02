@@ -1,4 +1,5 @@
 from __future__ import annotations
+from config.settings import env_float, env_int
 import atexit,json,os,re,shutil,sys,tempfile,uuid
 from dataclasses import dataclass
 from datetime import datetime,timedelta,timezone
@@ -47,7 +48,7 @@ class MemoryManager:
             self._test_root=Path(tempfile.mkdtemp(prefix="jarvis-memory-pytest-"));configured=self._test_root/"memory.sqlite3"
         self.db=MemoryDatabase(configured or Path.cwd()/"data"/"jarvis_memory.sqlite3")
         if self._test_root is not None:atexit.register(self._cleanup_test_memory)
-        self.archive=archive; self.max_local_mb=int(os.getenv("MEMORY_MAX_LOCAL_MB","1024")); self.raw_retention_days=int(os.getenv("MEMORY_RAW_RETENTION_DAYS","7")); self.session_retention_days=int(os.getenv("MEMORY_SESSION_RETENTION_DAYS","30"))
+        self.archive=archive; self.max_local_mb=env_int("MEMORY_MAX_LOCAL_MB", 1024); self.raw_retention_days=env_int("MEMORY_RAW_RETENTION_DAYS", 7); self.session_retention_days=env_int("MEMORY_SESSION_RETENTION_DAYS", 30)
     def _cleanup_test_memory(self):
         if self._test_root is None:return
         try:self.db.close()

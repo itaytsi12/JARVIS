@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+from config.settings import env_float, env_int
 import time
 
 from openai import OpenAI
@@ -21,7 +22,7 @@ client = OpenAI(
 
 
 def _bounded_image_payload(image_path):
-    raw=open(image_path,"rb").read();dimensions=None;max_dimension=max(640,int(os.getenv("JARVIS_VISION_MAX_DIMENSION","1600")))
+    raw=open(image_path,"rb").read();dimensions=None;max_dimension=max(640,env_int("JARVIS_VISION_MAX_DIMENSION", 1600))
     try:
         from PIL import Image
         with Image.open(io.BytesIO(raw)) as image:
@@ -37,6 +38,13 @@ def analyze_screen(image_path: str, question: str) -> dict:
     image_base64,image_bytes,image_dimensions=_bounded_image_payload(image_path)
 
     model=os.getenv("JARVIS_VISION_MODEL","gpt-5-mini");started=time.perf_counter()
+    from brain.intent_router import cloud_intent_available
+
+    if not cloud_intent_available():
+        # The same honest failure shape this function already returns for
+        # an empty response -- never a crash, and never a paid call the
+        # process is not allowed to make.
+        return {"success":False,"message":"I can't analyze the screen without a vision model, sir.","answer":"","model":model,"model_calls":0,"input_tokens":0,"output_tokens":0,"latency_ms":0.0,"image_input_bytes":image_bytes,"image_dimensions":image_dimensions,"screenshot_path":str(image_path),"error":"no_openai_credential"}
     # UI/status hook: brackets THIS real request with
     # started/succeeded/failed events (config/events.py). It only
     # observes -- the request below is unchanged, and a subscriber

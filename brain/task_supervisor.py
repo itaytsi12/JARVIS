@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json,os,shlex,subprocess,time,uuid,threading
+import json,os,shlex,subprocess,sys,time,uuid,threading
 from datetime import datetime,timezone
 from concurrent.futures import Future,ThreadPoolExecutor
 from dataclasses import dataclass
@@ -221,6 +221,28 @@ class TaskStore:
         for k in ("allowed_paths_json","forbidden_paths_json","allowed_commands_json","checkpoint_json"): d[k[:-5]]=json.loads(d.pop(k))
         d["requires_approval"]=bool(d["requires_approval"]); return d
 
+def _resolve_interpreter(args):
+    """Run `python ...` with the interpreter JARVIS is ACTUALLY running under.
+
+    Every caller here spells the command `["python", "-m", "pytest", ...]`,
+    which resolves through PATH to whatever `python.exe` happens to come
+    first -- on this machine, a tool runtime with no pytest installed, so
+    every real reproduction, regression check and benchmark run reported
+    `No module named pytest` and was scored as a genuine test failure. The
+    interpreter running JARVIS is the one that has JARVIS's dependencies,
+    and it is the only defensible answer to "which python".
+
+    Only a BARE `python`/`py` is substituted: an explicit path (a
+    worktree's own venv, say) is a deliberate choice and is left alone.
+    """
+    if not args:
+        return args
+    first = str(args[0])
+    if first.lower() in {"python", "py", "python3", "python.exe", "py.exe"} and not os.path.sep in first:
+        return [sys.executable, *args[1:]]
+    return list(args)
+
+
 class SafeCommandRunner:
     def run(self,command,workspace,timeout=300,allowed=None):
         args=shlex.split(command) if isinstance(command,str) else list(command); allowed=set(allowed or SAFE_COMMANDS)
@@ -231,6 +253,7 @@ class SafeCommandRunner:
         if executable=="git" and any(arg.lower()=="--ext-diff" or arg.lower().startswith(("--output","--open-files-in-pager")) for arg in args[2:]):raise PermissionError("Git option requires approval")
         joined=" ".join(args).lower()
         if any(token in joined for token in APPROVAL_TOKENS): raise PermissionError("Command requires approval")
+        args=_resolve_interpreter(args)
         started=time.perf_counter(); result=subprocess.run(args,cwd=workspace,text=True,capture_output=True,timeout=timeout,**hidden_process_kwargs())
         output=redact((result.stdout+"\n"+result.stderr).strip()); limit=12000
         return {"exit_code":result.returncode,"duration":time.perf_counter()-started,"output":output[-limit:],"truncated":len(output)>limit}

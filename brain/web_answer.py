@@ -1,4 +1,5 @@
 from __future__ import annotations
+from config.settings import env_float, env_int
 import logging,os,re,time,threading
 from collections import OrderedDict
 from dataclasses import dataclass,field
@@ -21,7 +22,7 @@ class WebAnswer:
 class WebAnswerService:
     def __init__(self,client=None,model=None,search_context=None,timeout=None):
         self.client=client;self.model=model or os.getenv("JARVIS_WEB_ANSWER_MODEL","gpt-5.4-mini");self.search_context=search_context or os.getenv("JARVIS_WEB_SEARCH_CONTEXT","low");self.timeout=float(timeout or os.getenv("JARVIS_WEB_ANSWER_TIMEOUT","12"));self.log=logging.getLogger("jarvis.web_answer")
-        self.cache_max=max(0,int(os.getenv("JARVIS_WEB_CACHE_MAX","128")));self.cache_ttl=max(0,float(os.getenv("JARVIS_WEB_CACHE_STABLE_TTL","86400")));self._cache=OrderedDict();self._cache_lock=threading.Lock()
+        self.cache_max=max(0,env_int("JARVIS_WEB_CACHE_MAX", 128));self.cache_ttl=max(0,env_float("JARVIS_WEB_CACHE_STABLE_TTL", 86400));self._cache=OrderedDict();self._cache_lock=threading.Lock()
     def answer(self,question,cancellation_token=None):
         started=time.perf_counter()
         try:
@@ -30,6 +31,13 @@ class WebAnswerService:
             if cached is not None:
                 if cancellation_token is not None:cancellation_token.raise_if_cancelled()
                 return WebAnswer(cached.answer,True,list(cached.sources),cached.model,0,0,cache_hit=True)
+            from brain.intent_router import cloud_intent_available
+
+            if not cloud_intent_available():
+                # No paid call may be made. This is the same honest
+                # failure the method already returns for an empty or
+                # errored response, so every caller handles it already.
+                return WebAnswer(FAILURE,False,[],self.model,(time.perf_counter()-started)*1000,0,"no_openai_credential")
             if self.client is None:
                 self.client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             # UI/status hook: brackets THIS real request with
