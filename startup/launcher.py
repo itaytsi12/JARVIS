@@ -233,6 +233,7 @@ class JarvisLauncher:
     def run(self) -> int:
         options = self.options
         log.info("JARVIS startup: %s", options.describe())
+        self._recover_memory()
 
         if options.ui:
             from ui.app import is_available, run_ui
@@ -250,6 +251,35 @@ class JarvisLauncher:
             return self._run_headless()
         finally:
             self.shutdown()
+
+    def _recover_memory(self) -> None:
+        """Read back what the last session left, before anything starts.
+
+        Cheap by construction -- summaries, not full notes -- and entirely
+        optional: a vault that cannot be read is logged and JARVIS comes up
+        exactly as it would have without one. It is what makes "carry on
+        with what we were doing yesterday" answerable on the FIRST request
+        of a session rather than after one that re-establishes context.
+        """
+        from config import get_config
+
+        if not get_config().vault_enabled:
+            return
+        try:
+            from vault.startup import record_session_start, recover_session
+
+            recovery = recover_session()
+            log.info("[startup] Long-term memory recovered: %s", recovery.describe())
+            if recovery.interrupted:
+                log.warning(
+                    "[startup] %d mission(s) were still active when the last process stopped and are "
+                    "marked interrupted: %s",
+                    len(recovery.interrupted),
+                    ", ".join(recovery.interrupted),
+                )
+            record_session_start(detail="Recovered context from the Obsidian vault at startup.")
+        except Exception:
+            log.exception("[startup] Long-term memory could not be recovered; starting without it")
 
     def _run_with_ui(self, run_ui) -> int:
         def on_started(ui) -> None:

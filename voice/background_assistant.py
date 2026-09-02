@@ -48,8 +48,18 @@ class AssistantState(str, Enum):
     IDLE = "IDLE"
     WAKE_DETECTED = "WAKE_DETECTED"
     LISTENING = "LISTENING"
+    #: The knowledge-vault stages of a mission, so the interface can show
+    #: what JARVIS is really doing instead of one long "processing". Every
+    #: one of these must also appear in `voice/tray_app.py::STATE_COLORS`
+    #: -- a missing colour used to raise KeyError and kill the icon
+    #: thread, which is why `state_color` now defaults instead.
+    SCANNING_MEMORY = "SCANNING_MEMORY"
+    READING_CONTEXT = "READING_CONTEXT"
+    PLANNING = "PLANNING"
     PROCESSING = "PROCESSING"
     EXECUTING = "EXECUTING"
+    VERIFYING = "VERIFYING"
+    LEARNING = "LEARNING"
     SPEAKING = "SPEAKING"
     INTERRUPTED_LISTENING = "INTERRUPTED_LISTENING"
     WAITING_FOR_LEARNING_APPROVAL = "WAITING_FOR_LEARNING_APPROVAL"

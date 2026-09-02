@@ -260,4 +260,42 @@ def log_startup_status(logger: logging.Logger | None = None, force: bool = False
         status["max_concurrent_tasks"],
         sys.executable,
     )
+    status["vault"] = _log_vault_status(logger, config)
     return status
+
+
+def _log_vault_status(logger: logging.Logger, config) -> dict[str, Any]:
+    """Say where JARVIS's long-term memory is, and whether it is usable.
+
+    Reported at startup for the same reason the provider is: a knowledge
+    system that silently is not there looks exactly like one that is
+    working but knows nothing. A vault that cannot be created is logged at
+    ERROR -- it means every mission from here will run without memory --
+    while `JARVIS_VAULT_ENABLED=0` is a normal, chosen state at INFO.
+    """
+    if not config.vault_enabled:
+        logger.info("Obsidian vault: disabled (JARVIS_VAULT_ENABLED=0). JARVIS will not read or write long-term knowledge.")
+        return {"enabled": False}
+    try:
+        from vault.bootstrap import ensure_vault_ready
+        from vault.index import get_index
+
+        vault = ensure_vault_ready()
+        summaries = get_index().refresh()
+        by_type: dict[str, int] = {}
+        for item in summaries:
+            by_type[item.note_type] = by_type.get(item.note_type, 0) + 1
+        logger.info(
+            "Obsidian vault: %s notes at %s (%s)",
+            len(summaries),
+            vault.root,
+            ", ".join(f"{count} {name}" for name, count in sorted(by_type.items())) or "empty",
+        )
+        return {"enabled": True, "root": str(vault.root), "notes": len(summaries), "by_type": by_type}
+    except Exception as exc:
+        logger.exception(
+            "The Obsidian vault could not be opened (%s). JARVIS will run WITHOUT long-term knowledge: "
+            "no Jobs, no Skills, no missions and no daily notes until this is fixed.",
+            type(exc).__name__,
+        )
+        return {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}

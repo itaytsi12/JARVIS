@@ -81,6 +81,13 @@ def run_agent(command: str, route: dict | None = None, interaction_id: str | Non
     recorder.record(EventType.TASK_STARTED, {"entrypoint": "run_agent", "input_mode": "voice" if original_user_text is not None else "text"}, iid)
     execution_meta = {}
     agent_runtime.context.last_user_message = original_user_text or command
+    # The Obsidian vault learns from a correction HERE, on the one funnel
+    # both the voice and the typed surfaces already pass through -- which
+    # is what makes "there is no voice JARVIS and text JARVIS" true of
+    # learning as well as of execution. It runs before the command is
+    # handled, because the correction usually also has to be acted on, and
+    # it never changes what is executed.
+    _observe_user_correction(original_user_text or command, execution_meta)
     try:
         response = _run_agent_impl(command, route, recorder, iid, execution_meta, cancellation_token,original_user_text,speculative_ledger,progress,on_answer_text)
         explicit_success=execution_meta.get("success")
@@ -205,6 +212,55 @@ def _cancel_agent_tasks(reason: str = "user_cancelled") -> int:
     except Exception:
         runtime_log.exception("Could not cancel agent tasks")
         return 0
+
+
+def _observe_user_correction(text: str, execution_meta: dict) -> None:
+    """Turn a durable correction into knowledge. Never raises, never blocks a command.
+
+    Only a PERSISTENT correction is written -- "from now on", "always",
+    "never", "next time", or a rule that states the situation it applies
+    in. "Make this answer shorter" changes nothing on disk, which is the
+    whole point of the distinction: a one-off instruction that became a
+    standing rule would be worse than no memory at all.
+
+    The classification is a handful of regex checks with no model call and
+    no I/O, so it costs nothing on the overwhelming majority of commands
+    that are not corrections at all.
+    """
+    body = (text or "").strip()
+    if not body:
+        return
+    try:
+        from config import get_config
+
+        config = get_config()
+        if not (config.vault_enabled and config.vault_learning_enabled):
+            return
+        from vault.learning import PERSISTENT, classify_feedback
+
+        feedback = classify_feedback(body)
+        if feedback.kind != PERSISTENT:
+            return
+        from vault.learning import get_correction_learner
+
+        outcome = get_correction_learner().apply(body, feedback=feedback)
+        execution_meta["vault_correction"] = outcome.describe()
+        if outcome.applied:
+            runtime_log.info("Vault learned from a correction: %s", outcome.describe())
+            try:
+                from vault.daily import get_journal
+
+                journal = get_journal()
+                journal.today().add_correction(
+                    f"{outcome.rule} (recorded in [[{outcome.target_title}]], section '{outcome.section}')"
+                )
+                journal.today().refresh_quick_summary()
+            except Exception:
+                runtime_log.exception("Could not record the correction in today's daily note")
+        elif outcome.protection is not None:
+            runtime_log.info("Refused a correction that would weaken a protected rule: %s", outcome.reason)
+    except Exception:
+        runtime_log.exception("Learning from the correction failed; the command itself is unaffected")
 
 
 def _agent_escalation_available() -> bool:

@@ -438,4 +438,36 @@ def _execute_tool_impl(
     if tool_name in code_tools:
         return code_tools[tool_name]()
 
+    # The Obsidian knowledge vault. Imported lazily so the vault package
+    # is never on the import path of a request that does not touch it.
+    if tool_name.startswith("vault_"):
+        from vault import tools as vault_tools
+
+        vault_dispatch = {
+            "vault_search": lambda: vault_tools.vault_search(arguments["query"], arguments.get("note_type", ""), arguments.get("limit", 8)),
+            "vault_read_note": lambda: vault_tools.vault_read_note(arguments["path"], arguments.get("section", "")),
+            "vault_write_note": lambda: vault_tools.vault_write_note(
+                arguments["path"],
+                arguments["title"],
+                arguments["note_type"],
+                arguments["summary"],
+                arguments["content"],
+                arguments.get("tags", ""),
+                arguments.get("quick_summary", ""),
+            ),
+            "vault_update_note": lambda: vault_tools.vault_update_note(
+                arguments["path"], arguments["section"], arguments["content"], arguments.get("mode", "replace")
+            ),
+            "vault_record_lesson": lambda: vault_tools.vault_record_lesson(
+                arguments["title"], arguments["summary"], arguments["lesson"], arguments.get("tags", "")
+            ),
+            "vault_record_working_method": lambda: vault_tools.vault_record_working_method(
+                arguments["skill"], arguments["method"], arguments.get("failed_attempts", "")
+            ),
+            "vault_list_jobs": vault_tools.vault_list_jobs,
+            "vault_status": vault_tools.vault_status,
+        }
+        if tool_name in vault_dispatch:
+            return vault_dispatch[tool_name]()
+
     return {"success":False,"message":f"Unknown tool: {tool_name}","error":"unknown_tool"}

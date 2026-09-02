@@ -213,6 +213,23 @@ class JarvisConfig:
     #: how JARVIS is exited and configured, so this defaults on.
     tray_enabled: bool = field(default_factory=lambda: _flag("TRAY_ENABLED", True))
 
+    # ---- the Obsidian knowledge vault --------------------------------
+    #: JARVIS's persistent long-term brain: plain Markdown notes JARVIS
+    #: reads and writes directly, and the user opens in Obsidian.
+    #: `JARVIS_VAULT_PATH` may be absolute (a real Obsidian vault anywhere
+    #: on the machine) or relative to the repository root. Resolved by
+    #: `vault/paths.py`, which is the only module that knows the layout.
+    vault_enabled: bool = field(default_factory=lambda: _flag("JARVIS_VAULT_ENABLED", True))
+    #: How many characters of vault knowledge one primed mission may load.
+    #: Spent in priority order (identity, Job, Skills, project,
+    #: preferences, lessons, continuity), so a tight budget drops the
+    #: least important knowledge rather than an arbitrary slice.
+    vault_context_chars: int = field(default_factory=lambda: _int("JARVIS_VAULT_CONTEXT_CHARS", 6000))
+    #: Learn durable rules from the user's corrections. Turning this off
+    #: leaves reading and mission recording intact; only the automatic
+    #: WRITING of new rules stops.
+    vault_learning_enabled: bool = field(default_factory=lambda: _flag("JARVIS_VAULT_LEARNING", True))
+
     # ---- memory ------------------------------------------------------
     memory_min_importance: int = field(default_factory=lambda: _int("JARVIS_MEMORY_MIN_IMPORTANCE", 2))
     memory_enabled: bool = field(default_factory=lambda: _flag("JARVIS_MEMORY_ENABLED", True))
@@ -222,6 +239,13 @@ class JarvisConfig:
     def agent_db_path(self) -> Path:
         override = _text("JARVIS_AGENT_DB_PATH")
         return Path(override) if override else self.data_dir / "jarvis_agent.sqlite3"
+
+    @property
+    def vault_path(self) -> Path:
+        """The vault root. Delegates so there is ONE resolver."""
+        from vault.paths import default_vault_path
+
+        return default_vault_path()
 
     @property
     def usage_db_path(self) -> Path:

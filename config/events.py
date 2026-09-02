@@ -62,6 +62,16 @@ JARVIS_TEXT = "assistant.jarvis_text"
 #: A free-form startup/status line for the UI. payload: {"text": str}
 STATUS_TEXT = "runtime.status"
 
+#: The knowledge-vault stages of a mission, published so the interface can
+#: show what JARVIS is actually doing rather than one undifferentiated
+#: "thinking". payload: {"detail": str, plus stage-specific counts}
+#:
+#: A subscriber that does not draw one of these ignores it quietly -- the
+#: UI already treats an unknown state as cosmetic, never as an error.
+VAULT_SCANNING = "vault.scanning"
+VAULT_READING = "vault.reading"
+VAULT_LEARNING = "vault.learning"
+
 # Vendor-neutral multi-model lifecycle events. Payloads are request-scoped
 # and safe for a UI subscriber; no credentials or message contents.
 REQUEST_STARTED = "request_started"

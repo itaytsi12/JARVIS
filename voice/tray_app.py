@@ -35,6 +35,14 @@ STATE_COLORS = {
     # distinguishable from an ordinary wake at a glance.
     AssistantState.INTERRUPTED_LISTENING: "#00c853",
     AssistantState.WAITING_FOR_LEARNING_APPROVAL: "#00a3a3",
+    # The knowledge-vault stages. Teal-to-amber, so "JARVIS is consulting
+    # its own memory" is visibly a different kind of busy from "JARVIS is
+    # acting on the desktop".
+    AssistantState.SCANNING_MEMORY: "#00b8d4",
+    AssistantState.READING_CONTEXT: "#0097a7",
+    AssistantState.PLANNING: "#ffab00",
+    AssistantState.VERIFYING: "#7cb342",
+    AssistantState.LEARNING: "#00a3a3",
     AssistantState.PROCESSING: "#f39c12",
     AssistantState.EXECUTING: "#f39c12",
     AssistantState.SPEAKING: "#8e44ad",

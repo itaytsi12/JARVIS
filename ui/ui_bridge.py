@@ -79,8 +79,29 @@ NEUTRAL_EVENT_STATES = {
 
 #: The states the voice layer maps onto the three UI flags.
 _LISTENING_STATES = {"LISTENING", "WAKE_DETECTED", "INTERRUPTED_LISTENING", "WAITING_FOR_LEARNING_APPROVAL"}
-_PROCESSING_STATES = {"PROCESSING", "EXECUTING"}
+#: Every state in which JARVIS is working rather than waiting. The
+#: knowledge-vault stages belong here: consulting long-term memory is busy
+#: time the user should see, not a silent gap before "processing".
+_PROCESSING_STATES = {
+    "PROCESSING",
+    "EXECUTING",
+    "SCANNING_MEMORY",
+    "READING_CONTEXT",
+    "PLANNING",
+    "VERIFYING",
+    "LEARNING",
+}
 _SPEAKING_STATES = {"SPEAKING"}
+
+
+#: `config/events.py`'s vault events, mapped to the assistant states the
+#: window already knows how to draw. An event this table does not name is
+#: ignored quietly, exactly like an unknown model node.
+_VAULT_EVENTS = {
+    "vault.scanning": "SCANNING_MEMORY",
+    "vault.reading": "READING_CONTEXT",
+    "vault.learning": "LEARNING",
+}
 
 
 class UiBridge(QObject):
@@ -437,6 +458,11 @@ class UiBridge(QObject):
             self.set_jarvis_text(str(payload.get("text") or ""))
         elif event == events.STATUS_TEXT:
             self.set_status_text(str(payload.get("text") or ""))
+        elif event in _VAULT_EVENTS:
+            # The knowledge vault reporting a stage of a mission. Treated
+            # as an assistant state so it lights the same "busy" affordance
+            # the rest of the runtime uses -- one concept, not two.
+            self._on_assistant_state(_VAULT_EVENTS[event], str(payload.get("detail") or ""))
 
     def _on_assistant_state(self, state: str, detail: str) -> None:
         self.set_listening(state in _LISTENING_STATES)

@@ -674,6 +674,110 @@ DEFINITIONS: tuple[ToolDefinition, ...] = (
         MEMORY,
         read_only=True,
     ),
+    # ---- the Obsidian vault: JARVIS's long-term knowledge ------------
+    #
+    # The knowledge a mission needs is already loaded before the model
+    # sees the goal (`vault/priming.py`). These tools exist for what
+    # priming could not anticipate: finding a note the request did not
+    # name, reading one in full, and -- most importantly -- WRITING back
+    # what this run learned, so a discovery outlives the run.
+    ToolDefinition(
+        "vault_search",
+        (
+            "Search JARVIS's long-term knowledge vault by scanning note SUMMARIES only -- cheap, and it "
+            "reads no note bodies. Use it to find a note the current context did not already load, then "
+            "read the promising ones with vault_read_note. Optionally restrict to one note type: "
+            "job, skill, project, lesson, user, identity, mission, daily."
+        ),
+        _schema({"query": _STRING, "note_type": _STRING, "limit": _INTEGER}, ["query"]),
+        MEMORY,
+        read_only=True,
+        timeout_seconds=15,
+    ),
+    ToolDefinition(
+        "vault_read_note",
+        (
+            "Read one note from the knowledge vault in full, by its path (for example "
+            "'skills/python-debugging.md'). Pass a section name to read only that section, which is the "
+            "right choice for a long note."
+        ),
+        _schema({"path": _STRING, "section": _STRING}, ["path"]),
+        MEMORY,
+        read_only=True,
+    ),
+    ToolDefinition(
+        "vault_write_note",
+        (
+            "Create a NEW note in the knowledge vault. The summary is required and must state in one "
+            "sentence what the note is for -- it is how the note is found again without being read. "
+            "Types: job, skill, project, lesson, user, identity. Use vault_update_note to change an "
+            "existing note instead of replacing it."
+        ),
+        _schema(
+            {
+                "path": _STRING,
+                "title": _STRING,
+                "note_type": _STRING,
+                "summary": _STRING,
+                "content": _STRING,
+                "tags": _STRING,
+                "quick_summary": _STRING,
+            },
+            ["path", "title", "note_type", "summary", "content"],
+        ),
+        MEMORY,
+        risk=ActionRisk.CAUTION,
+        retry_safe=False,
+    ),
+    ToolDefinition(
+        "vault_update_note",
+        (
+            "Change ONE section of an existing vault note. mode 'replace' rewrites that section, "
+            "'append' adds to it. Use this to correct a Job's Procedure, add to a Skill's Known "
+            "Problems, or update a project's Current State. Notes under system/ are protected and "
+            "cannot be changed this way."
+        ),
+        _schema({"path": _STRING, "section": _STRING, "content": _STRING, "mode": _STRING}, ["path", "section", "content"]),
+        MEMORY,
+        risk=ActionRisk.CAUTION,
+    ),
+    ToolDefinition(
+        "vault_record_lesson",
+        (
+            "Record something learned by experience as a Lesson note: what the situation was, what was "
+            "tried, what failed and why, and what actually works. Use it when a discovery spans several "
+            "kinds of work; use vault_record_working_method when it belongs to one Skill."
+        ),
+        _schema({"title": _STRING, "summary": _STRING, "lesson": _STRING, "tags": _STRING}, ["title", "summary", "lesson"]),
+        MEMORY,
+        risk=ActionRisk.CAUTION,
+        retry_safe=False,
+    ),
+    ToolDefinition(
+        "vault_record_working_method",
+        (
+            "Record on a Skill note the method that actually WORKED, and the approaches that did not, "
+            "so a future session does not rediscover the same sequence. Name the Skill by its note "
+            "title, for example 'Python Debugging'."
+        ),
+        _schema({"skill": _STRING, "method": _STRING, "failed_attempts": _STRING}, ["skill", "method"]),
+        MEMORY,
+        risk=ActionRisk.CAUTION,
+    ),
+    ToolDefinition(
+        "vault_list_jobs",
+        "List every Job in the knowledge vault with its one-line summary, to see what kinds of work JARVIS has a recorded procedure for.",
+        _schema({}),
+        MEMORY,
+        read_only=True,
+    ),
+    ToolDefinition(
+        "vault_status",
+        "Report where the knowledge vault is on disk, how many notes it holds of each type, and whether any note has unreadable frontmatter.",
+        _schema({}),
+        MEMORY,
+        read_only=True,
+    ),
 )
 
 BY_NAME: dict[str, ToolDefinition] = {definition.name: definition for definition in DEFINITIONS}

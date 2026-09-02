@@ -3,13 +3,23 @@
 `run_agent_task(goal)` is the single entry point for a request that needs
 real reasoning. It:
 
-  1. retrieves relevant memory (not all of it),
-  2. picks the skills that fit the goal (no model call),
-  3. builds a budgeted context,
-  4. runs the agent loop against whichever provider is configured,
-  5. records a complete episode (the training record) and any durable
+  1. PRIMES from the Obsidian vault -- scans every note summary, selects
+     the Job, the Skills, the project and the preferences that fit, and
+     deep-reads only those (`vault/session.py`),
+  2. retrieves relevant memory (not all of it),
+  3. picks the code-level skills that fit the goal (no model call),
+  4. builds a budgeted context carrying both,
+  5. runs the agent loop against whichever provider is configured,
+  6. completes the mission record, learns any method the run discovered,
+     and writes the day's entry in the Daily Note,
+  7. records a complete episode (the training record) and any durable
      memory the exchange produced,
-  6. returns a short, speech-safe answer.
+  8. returns a short, speech-safe answer.
+
+Steps 1 and 6 are the vault; everything else predates it and is
+unchanged. The vault half is wrapped so it can never break a request: a
+vault failure is logged and the task runs exactly as it did before the
+vault existed.
 
 Everything except step 4 works with no API key at all, which is why the
 no-provider case still produces a real episode and a truthful answer
@@ -57,13 +67,17 @@ class AgentOutcome:
     episode_id: str
     stop_reason: str
     run: AgentRun
+    #: The vault side of this task: which Job and Skills were primed, and
+    #: which mission note records it. `None` when the vault is disabled or
+    #: could not be reached, which every caller must tolerate.
+    vault: Any = None
 
     @property
     def used_model(self) -> bool:
         return self.run.model_calls > 0
 
     def describe(self) -> dict[str, Any]:
-        return {
+        payload = {
             "task_id": self.task_id,
             "episode_id": self.episode_id,
             "success": self.success,
@@ -71,6 +85,17 @@ class AgentOutcome:
             "stop_reason": self.stop_reason,
             **self.run.describe(),
         }
+        if self.vault is not None:
+            primed = getattr(self.vault, "primed", None)
+            mission = getattr(self.vault, "mission", None)
+            payload["vault"] = {
+                "job": getattr(primed, "job_title", "") or None,
+                "skills": getattr(primed, "skill_titles", []) or [],
+                "notes_read": getattr(primed, "notes_read", []) or [],
+                "scanned_notes": getattr(primed, "scanned", 0),
+                "mission": getattr(mission, "relative_path", None),
+            }
+        return payload
 
 
 def build_memory_handlers(memory: AgentMemory, task_id: str | None = None) -> dict[str, Callable[[dict], ToolResult]]:
@@ -168,6 +193,8 @@ def run_agent_task(
     progress: Callable[[str, dict], None] | None = None,
     on_answer_text: Callable[[str], None] | None = None,
     record_turns: bool = True,
+    use_vault: bool | None = None,
+    vault_session: Any = None,
 ) -> AgentOutcome:
     """Handle one goal end to end, synchronously.
 
@@ -181,6 +208,12 @@ def run_agent_task(
 
     if record_turns:
         memory.record_user(goal, task_id=task_id)
+
+    # -- the vault: scan summaries, select a Job and its Skills, deep-read
+    # only what fits, and open a persistent mission for real work. This
+    # happens BEFORE the context is built, because its whole purpose is to
+    # decide what the context should contain.
+    session = vault_session if vault_session is not None else _begin_vault_session(goal, task_id, use_vault)
 
     registry = get_skill_registry()
     skills = registry.select(goal)
@@ -206,6 +239,10 @@ def run_agent_task(
         tool_names=[spec.name for spec in specs],
         task_goal=task.goal if task is not None else None,
         session_context=session_context,
+        # Vault knowledge goes through the SAME budgeting, truncation and
+        # reporting machinery as memories, episodes and the conversation
+        # -- deliberately not a second, unbudgeted context path.
+        extra=_vault_extra(session),
     )
 
     base_provider = provider if provider is not None else get_agent_provider()
@@ -226,7 +263,13 @@ def run_agent_task(
     else:
         effort = select_effort(goal, skills)
         log.info("Agent effort for this task: %s (skills=%s)", effort, [skill.name for skill in skills])
-        loop = AgentLoop(tracked, catalog, progress=progress, effort=effort, on_answer_text=on_answer_text)
+        loop = AgentLoop(
+            tracked,
+            catalog,
+            progress=_mission_progress(session, progress),
+            effort=effort,
+            on_answer_text=on_answer_text,
+        )
         run = loop.run(
             goal,
             context=context,
@@ -286,7 +329,13 @@ def run_agent_task(
         episode_id=episode.episode_id,
         stop_reason=run.stop_reason,
         run=run,
+        vault=session,
     )
+    # -- the vault, closing side: complete the mission record, promote any
+    # method this run discovered onto its Skill, and write today's Daily
+    # Note entry. Wrapped, like the priming side: a note that could not be
+    # written must never turn a finished task into a failed one.
+    _finish_vault_session(session, run)
     log.info("Agent task finished: %s", outcome.describe())
     return outcome
 
@@ -331,3 +380,87 @@ def _context_summary(context) -> str:
         f"skills={described['skills']} tools={described['tool_count']} "
         f"context_chars={described['used_chars']}/{described['budget_chars']} dropped={described['dropped']}"
     )
+
+
+# --------------------------------------------------------------- the vault
+#
+# Three small helpers, each wrapped. The rule they exist to enforce is
+# that JARVIS's long-term memory is an ENHANCEMENT to a request, never a
+# dependency of it: a vault that cannot be read or written degrades the
+# assistant's memory, and must never degrade its ability to work.
+
+
+def _vault_enabled(explicit: bool | None) -> bool:
+    if explicit is not None:
+        return explicit
+    return get_config().vault_enabled
+
+
+def _begin_vault_session(goal: str, task_id: str, use_vault: bool | None):
+    """Scan the vault, prime, and open a mission for mission-shaped work."""
+    if not _vault_enabled(use_vault):
+        return None
+    try:
+        from vault.session import VaultSession
+
+        return VaultSession.begin(goal, task_id=task_id, budget_chars=get_config().vault_context_chars)
+    except Exception:
+        log.exception("The vault could not be primed; continuing without long-term knowledge")
+        return None
+
+
+def _vault_extra(session) -> dict[str, str] | None:
+    if session is None:
+        return None
+    try:
+        return session.extra_context() or None
+    except Exception:  # pragma: no cover - defensive
+        log.exception("Could not render the primed vault context")
+        return None
+
+
+def _mission_progress(session, progress: Callable[[str, dict], None] | None):
+    """Tee the loop's progress events into the mission record.
+
+    The loop already emits `tool_result` for every call with its tool,
+    success and error -- exactly what a mission note has to record -- so
+    the mission is written from real events rather than from a second,
+    parallel notion of what happened. The caller's own callback is still
+    invoked, first and unconditionally.
+    """
+    if session is None:
+        return progress
+
+    def forward(stage: str, payload: dict) -> None:
+        if progress is not None:
+            try:
+                progress(stage, payload)
+            except Exception:
+                log.exception("Agent progress callback failed")
+        if stage != "tool_result":
+            return
+        try:
+            session.observe_step(
+                str(payload.get("tool") or "?"),
+                success=bool(payload.get("success")),
+                error=str(payload.get("error") or ""),
+            )
+        except Exception:
+            log.exception("Could not record a step on the mission")
+
+    return forward
+
+
+def _finish_vault_session(session, run: AgentRun) -> None:
+    if session is None:
+        return
+    try:
+        session.finish(
+            success=run.success,
+            verified=run.verified,
+            answer=run.answer,
+            errors=list(run.errors),
+            stop_reason=run.stop_reason,
+        )
+    except Exception:
+        log.exception("Could not record the mission outcome in the vault")

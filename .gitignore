@@ -139,3 +139,14 @@ data/episodes/
 # Cached installed-application index (tools/app_index.py) -- rebuildable
 # local machine state, never something to commit.
 data/app_index_cache.json
+
+# =========================
+# The Obsidian knowledge vault
+# =========================
+# JARVIS's long-term memory: the user's own preferences, projects,
+# missions and daily history. Real personal data, kept local. The
+# structure and every seed note are regenerated deterministically by
+# `vault/bootstrap.py`, so a fresh clone rebuilds the whole vault with
+# `python -m vault bootstrap` -- nothing is lost by not committing it.
+data/vault/
+data/vault_index_cache.json
