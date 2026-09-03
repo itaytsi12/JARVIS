@@ -188,6 +188,37 @@ class RedactUrlAndDiagnosticsTests(unittest.TestCase):
         self.assertEqual(context.on.call_args.args[0], "page")
 
 
+class ProfileDirectoryIsNeverTheSourceTreeTests(unittest.TestCase):
+    """Chrome writes its entire user-data-dir tree into whatever directory
+    `--user-data-dir` names. An empty `JARVIS_AUTH_CHROME_PROFILE_DIR=` in
+    `.env` once made that directory the repository checkout itself (the
+    default never applied, `Path("")` is `Path(".")`, and `.resolve()` made
+    it the working directory), which scattered ~50 Chromium files across
+    the repo root. Both halves of that are covered here: the resolved
+    default can never be working-directory-relative, and a directory that
+    IS a source checkout is refused outright rather than used."""
+
+    def test_default_profile_dir_is_absolute_and_under_the_project_root(self):
+        self.assertTrue(ba.DEFAULT_AUTH_PROFILE_DIR.is_absolute())
+        self.assertTrue(ba.DEFAULT_AUTH_PROFILE_DIR.is_relative_to(ba.PROJECT_ROOT))
+        self.assertNotEqual(ba.DEFAULT_AUTH_PROFILE_DIR, ba.PROJECT_ROOT)
+
+    def test_project_root_and_its_ancestors_are_recognised_as_source_trees(self):
+        self.assertTrue(ba._is_source_root(ba.PROJECT_ROOT))
+        self.assertTrue(ba._is_source_root(ba.PROJECT_ROOT.parent))
+        self.assertFalse(ba._is_source_root(ba.DEFAULT_AUTH_PROFILE_DIR))
+
+    def test_resolved_dir_refuses_a_source_checkout(self):
+        with self.assertRaises(ba.ProfileRefusal) as refusal:
+            ba.resolved_auth_profile_dir(ba.PROJECT_ROOT)
+        self.assertIn("source", str(refusal.exception).lower())
+
+    def test_launch_refuses_rather_than_writing_a_profile_into_the_repo(self):
+        with patch("tools.browser._resolve_chrome", return_value=r"C:\Chrome\chrome.exe"),                 patch.object(ba.subprocess, "Popen") as popen:
+            self.assertEqual(launch_chrome_for_jarvis(user_data_dir=ba.PROJECT_ROOT), -1)
+        popen.assert_not_called()
+
+
 class DefaultUserDataDirTests(unittest.TestCase):
     def test_honors_explicit_override(self):
         with patch.dict(os.environ, {"JARVIS_CHROME_USER_DATA_DIR": "D:/custom/profile"}, clear=False):

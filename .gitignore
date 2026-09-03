@@ -157,3 +157,65 @@ data/vault_index_cache.json
 # providers this particular machine has keys for, which is not something
 # to publish.
 data/model_registry_cache.json
+
+# =========================
+# Chromium user-data-dir residue in the repository ROOT
+# =========================
+# NOT a place JARVIS writes any more. Between 2026-09-01 and 2026-09-02
+# `tools/browser_authenticated.py` read its profile directory with
+# `os.getenv("JARVIS_AUTH_CHROME_PROFILE_DIR", "data/browser_profiles/...")`,
+# and `.env` sets that variable to an EMPTY value -- so the default never
+# applied, `Path("")` became `Path(".")`, `.resolve()` made that the
+# working directory, and Chrome was launched with
+# `--user-data-dir=<the repo root>`. It duly wrote a complete browser
+# profile across the checkout. The launch path is fixed (the directory is
+# now anchored at the project root and `resolved_auth_profile_dir` refuses
+# a source checkout outright), and the live profile is, and always should
+# be, `data/browser_profiles/authenticated_chrome/` -- already ignored
+# above. These entries only keep the leftover files from showing up as
+# untracked; they are safe to delete from `.gitignore` once the residue
+# itself is removed from the working tree.
+/ActorSafetyLists/
+/AmountExtractionHeuristicRegexes/
+/BrowserMetrics/
+/BrowserMetrics-spare.pma
+/CaptchaProviders/
+/CertificateRevocation/
+/Crashpad/
+/CrashpadMetrics-active.pma
+/Crowd Deny/
+/Default/
+/FileTypePolicies/
+/FirstPartySetsPreloaded/
+/GPUPersistentCache/
+/GrShaderCache/
+/Last Browser
+/Last Version
+/Local State
+/MEIPreload/
+/OnDeviceHeadSuggestModel/
+/OptimizationGuideModelsManifest/
+/OptimizationHints/
+/OriginTrials/
+/PKIMetadata/
+/PrivacySandboxAttestationsPreloaded/
+/RecoveryImproved/
+/SSLErrorAssistant/
+/Safe Browsing/
+/SafetyTips/
+/ShaderCache/
+/Subresource Filter/
+/TrustTokenKeyCommitments/
+/Variations
+/VariationsSafeSeedV2
+/VariationsSeedV2
+/WasmTtsEngine/
+/WidevineCdm/
+/ZxcvbnData/
+/component_crx_cache/
+/extensions_crx_cache/
+/first_party_sets.db
+/first_party_sets.db-journal
+/hyphen-data/
+/optimization_guide_model_store/
+/segmentation_platform/

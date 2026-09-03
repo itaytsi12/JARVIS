@@ -52,7 +52,7 @@ from __future__ import annotations
 
 import logging
 import os
-from config.settings import env_float, env_int, env_text
+from config.settings import PROJECT_ROOT, env_float, env_int, env_text
 import subprocess
 import threading
 import time
@@ -436,7 +436,20 @@ def reset_authenticated_browser_session_for_tests(session: AuthenticatedBrowserS
 #: user's regular browsing this way, confirmed live: a fresh launch
 #: against an unused directory got a working CDP endpoint immediately
 #: even with 20+ unrelated chrome.exe processes already running.
-DEFAULT_AUTH_PROFILE_DIR = Path(env_text("JARVIS_AUTH_CHROME_PROFILE_DIR", "data/browser_profiles/authenticated_chrome"))
+_CONFIGURED_AUTH_PROFILE_DIR = Path(env_text("JARVIS_AUTH_CHROME_PROFILE_DIR", "data/browser_profiles/authenticated_chrome"))
+#: Anchored at the PROJECT ROOT, never at the current working directory.
+#: A relative default is resolved by `Path.resolve()` against wherever the
+#: process happened to be started, so the profile directory JARVIS used
+#: depended on how JARVIS was launched -- and a bare `Path("")` (what an
+#: empty `JARVIS_AUTH_CHROME_PROFILE_DIR=` in `.env` produced before
+#: `env_text` fell back to the default) is `Path(".")`, which resolved to
+#: the working directory itself and made Chrome write its entire
+#: user-data-dir tree there. See `_is_source_root` below.
+DEFAULT_AUTH_PROFILE_DIR = (
+    _CONFIGURED_AUTH_PROFILE_DIR
+    if _CONFIGURED_AUTH_PROFILE_DIR.is_absolute()
+    else PROJECT_ROOT / _CONFIGURED_AUTH_PROFILE_DIR
+)
 
 
 def default_user_data_dir() -> Path | None:
@@ -462,6 +475,26 @@ def default_user_data_dir() -> Path | None:
 
 def _normalize_dir(path: str) -> str:
     return path.rstrip("\\/").lower()
+
+
+def _is_source_root(path: Path) -> bool:
+    """Would using `path` as a `--user-data-dir` scatter a browser profile
+    over a source tree?
+
+    Chrome writes its whole user-data-dir tree -- `Default/`, `Local State`,
+    `Crashpad/`, `ShaderCache/`, `Safe Browsing/` and ~40 more entries --
+    directly into whatever directory `--user-data-dir` names. A profile
+    directory must therefore be one dedicated to that and nothing else; a
+    source checkout never is. True for the project root itself, for any
+    ANCESTOR of it (`.`, `..`, a drive root), and for any other directory
+    that is itself a git checkout.
+    """
+    try:
+        if path == PROJECT_ROOT or PROJECT_ROOT.is_relative_to(path):
+            return True
+        return (path / ".git").exists()
+    except OSError:
+        return False
 
 
 def _chrome_running_with_profile(resolved_dir: Path) -> bool:
@@ -532,6 +565,15 @@ def resolved_auth_profile_dir(user_data_dir: Path | str | None = None) -> Path:
         resolved = DEFAULT_AUTH_PROFILE_DIR
         resolved.mkdir(parents=True, exist_ok=True)
     resolved = resolved.resolve()
+
+    if _is_source_root(resolved):
+        raise ProfileRefusal(
+            f"Refusing to use {resolved} as a Chrome profile directory -- it is a source "
+            "checkout, and Chrome would write its entire user-data-dir tree (Default/, "
+            "Local State, Crashpad/, ShaderCache/, ...) straight into it. Point "
+            "JARVIS_AUTH_CHROME_PROFILE_DIR at a dedicated directory, or unset it to use "
+            f"the default ({DEFAULT_AUTH_PROFILE_DIR})."
+        )
 
     true_default = default_user_data_dir()
     if true_default is not None and _normalize_dir(str(resolved)) == _normalize_dir(str(true_default)):

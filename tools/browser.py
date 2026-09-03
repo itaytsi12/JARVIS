@@ -58,7 +58,7 @@ def open_website(url: str) -> dict:
     try:
         command=[executable,"--new-tab"]
         profile=os.getenv("JARVIS_CHROME_USER_DATA_DIR")
-        if profile:command.append(f"--user-data-dir={profile}")
+        if profile:command.append(f"--user-data-dir={Path(profile).expanduser().resolve()}")
         if os.getenv("JARVIS_CHROME_DISABLE_GPU","false").lower() in {"1","true","yes","on"}:command.append("--disable-gpu")
         command.append(url)
         process=subprocess.Popen(command)
